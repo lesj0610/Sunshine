@@ -1439,6 +1439,7 @@ namespace nvhttp {
       return;
     }
 
+    bool started_app = false;
     if (appid > 0) {
       auto err = proc::proc.execute((int) appid, launch_session);
       if (err) {
@@ -1448,6 +1449,8 @@ namespace nvhttp {
 
         return;
       }
+
+      started_app = true;
     }
 
     tree.put("root.<xmlattr>.status_code", 200);
@@ -1465,7 +1468,12 @@ namespace nvhttp {
       // never be picked up and everything done for it has to go back,
       // including the app that was just started for it.
       BOOST_LOG(error) << "Rejecting a launch while another is still waiting for its client"sv;
-      proc::proc.terminate();
+
+      // Only an app this request started. Another launch may have won the
+      // race and be running one of its own, which is not ours to stop.
+      if (started_app) {
+        proc::proc.terminate();
+      }
 
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message", "Another launch is already in progress");

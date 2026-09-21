@@ -106,10 +106,13 @@ namespace {
       std::set<std::string> removed_ids;
       virtual_display::mode_t last_mode {};
       bool fail_pings {};  ///< Set mid-test to make the driver go quiet.
+      bool hold_pings {};  ///< Set mid-test to make a ping never come back.
+      std::vector<std::string> order;  ///< Which calls happened, in order.
     };
 
     script_t script;
     std::shared_ptr<gate_t> add_gate;  ///< When set, add() waits on it.
+    std::shared_ptr<gate_t> ping_gate;  ///< When set, ping() waits on it.
 
     // The log outlives the backend, so a test can still read it after the
     // manager that owns the backend has been destroyed.
@@ -122,6 +125,7 @@ namespace {
 
     void close() override {
       log->closes += 1;
+      log->order.push_back("close");
     }
 
     bool protocol_supported() override {
@@ -133,8 +137,16 @@ namespace {
     }
 
     bool ping() override {
+      bool hold = false;
+      {
+        std::lock_guard lock {log->mutex};
+        log->pings += 1;
+        hold = log->hold_pings;
+      }
+      if (hold && ping_gate) {
+        ping_gate->wait();
+      }
       std::lock_guard lock {log->mutex};
-      log->pings += 1;
       return script.ping_succeeds && !log->fail_pings;
     }
 
@@ -147,6 +159,7 @@ namespace {
         std::lock_guard lock {log->mutex};
         log->adds += 1;
         log->last_mode = mode;
+        log->order.push_back("add");
       }
       if (add_gate) {
         add_gate->wait();
@@ -163,6 +176,7 @@ namespace {
       std::lock_guard lock {log->mutex};
       log->removes += 1;
       log->removed_ids.insert(id.string());
+      log->order.push_back("remove");
       return script.remove_succeeds;
     }
 
@@ -205,6 +219,7 @@ namespace {
   struct rig_t {
     std::shared_ptr<fake_backend_t::log_t> log;
     std::shared_ptr<gate_t> add_gate;
+    std::shared_ptr<gate_t> ping_gate;
     std::unique_ptr<virtual_display::manager_t> manager;
   };
 
@@ -224,20 +239,23 @@ namespace {
     std::shared_ptr<gate_t> add_gate = nullptr,
     virtual_display::device_id_lookup_t lookup = [](const std::string &name) {
       return name + "-id";
-    }
+    },
+    std::shared_ptr<gate_t> ping_gate = nullptr
   ) {
     auto log = std::make_shared<fake_backend_t::log_t>();
-    auto factory = [script, log, add_gate]() -> std::unique_ptr<virtual_display::backend_t> {
+    auto factory = [script, log, add_gate, ping_gate]() -> std::unique_ptr<virtual_display::backend_t> {
       auto backend = std::make_unique<fake_backend_t>();
       backend->script = script;
       backend->log = log;
       backend->add_gate = add_gate;
+      backend->ping_gate = ping_gate;
       return backend;
     };
 
     return {
       log,
       add_gate,
+      ping_gate,
       std::make_unique<virtual_display::manager_t>(std::move(factory), std::move(lookup), quick_timeouts())
     };
   }
@@ -257,7 +275,7 @@ namespace {
 class VirtualDisplayTest: public ::testing::Test {};
 
 TEST_F(VirtualDisplayTest, AcquireCreatesADisplayAndTakesTheLease) {
-  auto [log, gate, manager] = make_rig({});
+  auto [log, gate, ping_gate, manager] = make_rig({});
 
   const auto result = manager->acquire("Client", "uid", k_mode, "");
 
@@ -274,7 +292,7 @@ TEST_F(VirtualDisplayTest, RefreshRateReachesTheDriverInThousandthsOfAHertz) {
   // The driver's mode table is in thousandths of a hertz, which is how it can
   // offer 59.94Hz next to 60Hz. Sending whole hertz would ask for 0.06Hz.
   for (const auto &[fps, expected] : {std::pair {60, 60000}, std::pair {120, 120000}, std::pair {30, 30000}}) {
-    auto [log, gate, manager] = make_rig({});
+    auto [log, gate, ping_gate, manager] = make_rig({});
 
     const auto result = manager->acquire("Client", "uid", {1920, 1080, fps * 1000}, "");
 
@@ -308,7 +326,7 @@ TEST_F(VirtualDisplayTest, NoBackendMeansNoLease) {
 }
 
 TEST_F(VirtualDisplayTest, ADriverThatWillNotOpenIsNotUsed) {
-  auto [log, gate, manager] = make_rig({.open_succeeds = false});
+  auto [log, gate, ping_gate, manager] = make_rig({.open_succeeds = false});
 
   EXPECT_EQ(error_of(manager->acquire("Client", "uid", k_mode, "")), virtual_display::error_e::driver_unavailable);
   EXPECT_EQ(log->adds, 0);
@@ -316,7 +334,7 @@ TEST_F(VirtualDisplayTest, ADriverThatWillNotOpenIsNotUsed) {
 }
 
 TEST_F(VirtualDisplayTest, AnIncompatibleProtocolIsRefusedBeforeAnythingIsCreated) {
-  auto [log, gate, manager] = make_rig({.protocol_supported = false});
+  auto [log, gate, ping_gate, manager] = make_rig({.protocol_supported = false});
 
   EXPECT_EQ(error_of(manager->acquire("Client", "uid", k_mode, "")), virtual_display::error_e::protocol_mismatch);
   EXPECT_EQ(log->adds, 0);
@@ -326,21 +344,21 @@ TEST_F(VirtualDisplayTest, AnIncompatibleProtocolIsRefusedBeforeAnythingIsCreate
 TEST_F(VirtualDisplayTest, ADriverWithNoWatchdogIsRefused) {
   // Without a watchdog a display would outlive a Sunshine that crashed, with
   // nothing left able to remove it.
-  auto [log, gate, manager] = make_rig({.watchdog = std::chrono::seconds {0}});
+  auto [log, gate, ping_gate, manager] = make_rig({.watchdog = std::chrono::seconds {0}});
 
   EXPECT_EQ(error_of(manager->acquire("Client", "uid", k_mode, "")), virtual_display::error_e::watchdog_unavailable);
   EXPECT_EQ(log->adds, 0);
 }
 
 TEST_F(VirtualDisplayTest, AnUnreportedWatchdogIsRefused) {
-  auto [log, gate, manager] = make_rig({.watchdog = std::nullopt});
+  auto [log, gate, ping_gate, manager] = make_rig({.watchdog = std::nullopt});
 
   EXPECT_EQ(error_of(manager->acquire("Client", "uid", k_mode, "")), virtual_display::error_e::watchdog_unavailable);
   EXPECT_EQ(log->adds, 0);
 }
 
 TEST_F(VirtualDisplayTest, TheDriverIsPingedBeforeADisplayIsCreated) {
-  auto [log, gate, manager] = make_rig({.ping_succeeds = false});
+  auto [log, gate, ping_gate, manager] = make_rig({.ping_succeeds = false});
 
   EXPECT_EQ(error_of(manager->acquire("Client", "uid", k_mode, "")), virtual_display::error_e::heartbeat_failed);
   EXPECT_GE(log->pings, 1);
@@ -348,7 +366,7 @@ TEST_F(VirtualDisplayTest, TheDriverIsPingedBeforeADisplayIsCreated) {
 }
 
 TEST_F(VirtualDisplayTest, ARefusedCreateLeavesNoLease) {
-  auto [log, gate, manager] = make_rig({.add_result = virtual_display::creation_e::not_created});
+  auto [log, gate, ping_gate, manager] = make_rig({.add_result = virtual_display::creation_e::not_created});
 
   EXPECT_EQ(error_of(manager->acquire("Client", "uid", k_mode, "")), virtual_display::error_e::create_failed);
   EXPECT_FALSE(manager->leased());
@@ -356,7 +374,7 @@ TEST_F(VirtualDisplayTest, ARefusedCreateLeavesNoLease) {
 }
 
 TEST_F(VirtualDisplayTest, ADisplayThatNeverComesUpIsRemovedAgain) {
-  auto [log, gate, manager] = make_rig({.not_ready_calls = 1000});
+  auto [log, gate, ping_gate, manager] = make_rig({.not_ready_calls = 1000});
 
   EXPECT_EQ(error_of(manager->acquire("Client", "uid", k_mode, "")), virtual_display::error_e::not_ready);
   EXPECT_EQ(log->removes, 1);
@@ -365,7 +383,7 @@ TEST_F(VirtualDisplayTest, ADisplayThatNeverComesUpIsRemovedAgain) {
 
 TEST_F(VirtualDisplayTest, ADisplayWithoutTheRequestedModeIsRemovedAgain) {
   // A display that came up at some other size would stream at that size.
-  auto [log, gate, manager] = make_rig({.eventual_state = virtual_display::resolution_t::readiness_e::mode_missing});
+  auto [log, gate, ping_gate, manager] = make_rig({.eventual_state = virtual_display::resolution_t::readiness_e::mode_missing});
 
   EXPECT_EQ(error_of(manager->acquire("Client", "uid", k_mode, "")), virtual_display::error_e::mode_unavailable);
   EXPECT_EQ(log->removes, 1);
@@ -375,7 +393,7 @@ TEST_F(VirtualDisplayTest, ADisplayWithoutTheRequestedModeIsRemovedAgain) {
 TEST_F(VirtualDisplayTest, ADisplayMissingFromTheDeviceListIsRemovedAgain) {
   // Without an id, nothing can be pointed at the display, so a session would
   // capture some other screen.
-  auto [log, gate, manager] = make_rig({}, nullptr, [](const std::string &) {
+  auto [log, gate, ping_gate, manager] = make_rig({}, nullptr, [](const std::string &) {
     return std::string {};
   });
 
@@ -385,7 +403,7 @@ TEST_F(VirtualDisplayTest, ADisplayMissingFromTheDeviceListIsRemovedAgain) {
 }
 
 TEST_F(VirtualDisplayTest, ADisplayThatTakesAMomentIsWaitedFor) {
-  auto [log, gate, manager] = make_rig({.not_ready_calls = 3});
+  auto [log, gate, ping_gate, manager] = make_rig({.not_ready_calls = 3});
 
   const auto result = manager->acquire("Client", "uid", k_mode, "");
 
@@ -394,7 +412,7 @@ TEST_F(VirtualDisplayTest, ADisplayThatTakesAMomentIsWaitedFor) {
 }
 
 TEST_F(VirtualDisplayTest, ASecondSessionIsRefusedRatherThanSharingTheFirst) {
-  auto [log, gate, manager] = make_rig({});
+  auto [log, gate, ping_gate, manager] = make_rig({});
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("First", "uid-1", k_mode, "")));
 
   const auto second = manager->acquire("Second", "uid-2", {1280, 720, 60000}, "");
@@ -405,7 +423,7 @@ TEST_F(VirtualDisplayTest, ASecondSessionIsRefusedRatherThanSharingTheFirst) {
 }
 
 TEST_F(VirtualDisplayTest, ReleaseRemovesTheDisplayItCreated) {
-  auto [log, gate, manager] = make_rig({});
+  auto [log, gate, ping_gate, manager] = make_rig({});
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
 
   manager->release();
@@ -418,7 +436,7 @@ TEST_F(VirtualDisplayTest, ReleaseRemovesTheDisplayItCreated) {
 }
 
 TEST_F(VirtualDisplayTest, ReleaseWithoutALeaseTouchesNothing) {
-  auto [log, gate, manager] = make_rig({});
+  auto [log, gate, ping_gate, manager] = make_rig({});
 
   manager->release();
 
@@ -428,7 +446,7 @@ TEST_F(VirtualDisplayTest, ReleaseWithoutALeaseTouchesNothing) {
 TEST_F(VirtualDisplayTest, AFailedRemoveStillGivesUpTheLease) {
   // The driver's watchdog will drop the display once Sunshine stops answering,
   // so holding the lease open would only stop the next session from starting.
-  auto [log, gate, manager] = make_rig({.remove_succeeds = false});
+  auto [log, gate, ping_gate, manager] = make_rig({.remove_succeeds = false});
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
 
   manager->release();
@@ -440,7 +458,7 @@ TEST_F(VirtualDisplayTest, AFailedRemoveStillGivesUpTheLease) {
 TEST_F(VirtualDisplayTest, EachLeaseUsesAnIdentifierOfItsOwn) {
   // Reusing an identifier, or guessing the one a previous run used, risks
   // removing a display this process does not own.
-  auto [log, gate, manager] = make_rig({});
+  auto [log, gate, ping_gate, manager] = make_rig({});
 
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
   manager->release();
@@ -454,7 +472,7 @@ TEST_F(VirtualDisplayTest, EachLeaseUsesAnIdentifierOfItsOwn) {
 TEST_F(VirtualDisplayTest, NoDisplayIsRemovedBeforeOneIsCreated) {
   // A lease never removes a display it did not create, so a first acquire
   // issues no removals at all.
-  auto [log, gate, manager] = make_rig({});
+  auto [log, gate, ping_gate, manager] = make_rig({});
 
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
 
@@ -462,7 +480,7 @@ TEST_F(VirtualDisplayTest, NoDisplayIsRemovedBeforeOneIsCreated) {
 }
 
 TEST_F(VirtualDisplayTest, TheConfiguredAdapterIsPassedOn) {
-  auto [log, gate, manager] = make_rig({});
+  auto [log, gate, ping_gate, manager] = make_rig({});
 
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "Some GPU")));
 
@@ -470,7 +488,7 @@ TEST_F(VirtualDisplayTest, TheConfiguredAdapterIsPassedOn) {
 }
 
 TEST_F(VirtualDisplayTest, NoAdapterIsRequestedWhenNoneIsConfigured) {
-  auto [log, gate, manager] = make_rig({});
+  auto [log, gate, ping_gate, manager] = make_rig({});
 
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
 
@@ -478,7 +496,7 @@ TEST_F(VirtualDisplayTest, NoAdapterIsRequestedWhenNoneIsConfigured) {
 }
 
 TEST_F(VirtualDisplayTest, DestroyingTheManagerReleasesTheDisplay) {
-  auto [log, gate, manager] = make_rig({});
+  auto [log, gate, ping_gate, manager] = make_rig({});
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
 
   manager.reset();
@@ -505,7 +523,7 @@ TEST_F(VirtualDisplayTest, TwoAcquiresArrivingTogetherCreateOneDisplay) {
   // The lease is reserved before any work starts, so the second request finds
   // it taken even though the first has not finished.
   auto gate = std::make_shared<gate_t>();
-  auto [log, unused, manager] = make_rig({}, gate);
+  auto [log, unused, unused_ping, manager] = make_rig({}, gate);
 
   auto first = std::async(std::launch::async, [&manager] {
     return manager->acquire("First", "uid-1", k_mode, "");
@@ -526,7 +544,7 @@ TEST_F(VirtualDisplayTest, ACallThatDoesNotComeBackPoisonsTheDriver) {
   // Nothing may be asked of a driver that still has an earlier call, because
   // the answer to that call could arrive after whatever came next.
   auto gate = std::make_shared<gate_t>();
-  auto [log, unused, manager] = make_rig({}, gate);
+  auto [log, unused, unused_ping, manager] = make_rig({}, gate);
 
   auto stuck = std::async(std::launch::async, [&manager] {
     return manager->acquire("Client", "uid", k_mode, "");
@@ -545,7 +563,7 @@ TEST_F(VirtualDisplayTest, ACallThatDoesNotComeBackPoisonsTheDriver) {
 
 TEST_F(VirtualDisplayTest, NothingIsAskedOfTheDriverWhilePoisoned) {
   auto gate = std::make_shared<gate_t>();
-  auto [log, unused, manager] = make_rig({}, gate);
+  auto [log, unused, unused_ping, manager] = make_rig({}, gate);
 
   auto stuck = std::async(std::launch::async, [&manager] {
     return manager->acquire("Client", "uid", k_mode, "");
@@ -571,7 +589,7 @@ TEST_F(VirtualDisplayTest, NothingIsAskedOfTheDriverWhilePoisoned) {
 
 TEST_F(VirtualDisplayTest, ADriverThatAnswersLateCanBeUsedAgain) {
   auto gate = std::make_shared<gate_t>();
-  auto [log, unused, manager] = make_rig({}, gate);
+  auto [log, unused, unused_ping, manager] = make_rig({}, gate);
 
   auto stuck = std::async(std::launch::async, [&manager] {
     return manager->acquire("Client", "uid", k_mode, "");
@@ -593,7 +611,7 @@ TEST_F(VirtualDisplayTest, ADriverThatAnswersLateCanBeUsedAgain) {
 TEST_F(VirtualDisplayTest, ADisplayTheDriverCannotDescribeIsStillRemoved) {
   // The driver took the request, so something may exist under an identifier
   // we know. Forgetting it would leave a display nothing can reach.
-  auto [log, gate, manager] = make_rig({.add_result = virtual_display::creation_e::created_unverifiable});
+  auto [log, gate, ping_gate, manager] = make_rig({.add_result = virtual_display::creation_e::created_unverifiable});
 
   EXPECT_EQ(error_of(manager->acquire("Client", "uid", k_mode, "")), virtual_display::error_e::create_failed);
 
@@ -602,7 +620,7 @@ TEST_F(VirtualDisplayTest, ADisplayTheDriverCannotDescribeIsStillRemoved) {
 }
 
 TEST_F(VirtualDisplayTest, LosingTheHeartbeatAsksTheOwnerToCleanUp) {
-  auto [log, gate, manager] = make_rig({.watchdog = std::chrono::seconds {1}, .ping_succeeds = true});
+  auto [log, gate, ping_gate, manager] = make_rig({.watchdog = std::chrono::seconds {1}, .ping_succeeds = true});
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
 
   std::promise<void> called;
@@ -626,4 +644,134 @@ TEST_F(VirtualDisplayTest, LosingTheHeartbeatAsksTheOwnerToCleanUp) {
 
   std::lock_guard lock {log->mutex};
   EXPECT_EQ(log->removes, 1);
+}
+
+TEST_F(VirtualDisplayTest, AHeartbeatCallThatNeverComesBackStillReportsTheFault) {
+  // A ping that hangs is how a driver going away usually shows up. Poisoning
+  // the driver must not swallow the report: the session streaming the display
+  // still has to be told.
+  auto gate = std::make_shared<gate_t>();
+  auto [log, unused_add, ping_gate, manager] = make_rig(
+    {.watchdog = std::chrono::seconds {1}},
+    nullptr,
+    [](const std::string &name) {
+      return name + "-id";
+    },
+    gate
+  );
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
+
+  std::atomic<int> faults {0};
+  std::promise<void> reported;
+  auto handled = reported.get_future();
+  manager->set_fault_handler([&faults, &reported] {
+    if (faults.fetch_add(1) == 0) {
+      reported.set_value();
+    }
+  });
+
+  {
+    std::lock_guard lock {log->mutex};
+    log->hold_pings = true;
+  }
+
+  ASSERT_EQ(handled.wait_for(30s), std::future_status::ready);
+
+  int pings_at_fault = 0;
+  {
+    std::lock_guard lock {log->mutex};
+    pings_at_fault = log->pings;
+  }
+
+  // Nothing more is asked of a driver that has not answered.
+  EXPECT_EQ(error_of(manager->acquire("Next", "uid-2", k_mode, "")), virtual_display::error_e::busy);
+  std::this_thread::sleep_for(300ms);
+
+  {
+    std::lock_guard lock {log->mutex};
+    EXPECT_EQ(log->pings, pings_at_fault);
+  }
+  EXPECT_EQ(faults.load(), 1);
+
+  gate->release();
+}
+
+TEST_F(VirtualDisplayTest, ALateCallIsCleanedUpBeforeAnythingElseIsCreated) {
+  // The create that never answered may have made a display, and the
+  // identifier is known, so it is removed and the handle closed before a new
+  // session may have one.
+  auto gate = std::make_shared<gate_t>();
+  auto [log, unused, unused_ping, manager] = make_rig({}, gate);
+
+  auto stuck = std::async(std::launch::async, [&manager] {
+    return manager->acquire("Client", "uid", k_mode, "");
+  });
+  gate->await_arrival();
+  ASSERT_EQ(error_of(stuck.get()), virtual_display::error_e::create_failed);
+  ASSERT_EQ(manager->state(), virtual_display::state_e::poisoned);
+
+  gate->release();
+
+  for (int i = 0; i < 200 && manager->state() == virtual_display::state_e::poisoned; ++i) {
+    std::ignore = manager->acquire("Next", "uid-2", k_mode, "");
+    std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_NE(manager->state(), virtual_display::state_e::poisoned);
+
+  std::lock_guard lock {log->mutex};
+  ASSERT_GE(log->order.size(), 4u);
+  EXPECT_EQ(log->order[0], "add");
+  EXPECT_EQ(log->order[1], "remove");
+  EXPECT_EQ(log->order[2], "close");
+  EXPECT_EQ(log->order[3], "add");
+  EXPECT_TRUE(log->removed_ids.contains(*log->added_ids.begin()));
+}
+
+TEST_F(VirtualDisplayTest, ALateCreateIsRemovedWhicheverAnswerItEventuallyGives) {
+  for (const auto answer : {virtual_display::creation_e::created, virtual_display::creation_e::created_unverifiable}) {
+    auto gate = std::make_shared<gate_t>();
+    auto [log, unused, unused_ping, manager] = make_rig({.add_result = answer}, gate);
+
+    auto stuck = std::async(std::launch::async, [&manager] {
+      return manager->acquire("Client", "uid", k_mode, "");
+    });
+    gate->await_arrival();
+    ASSERT_EQ(error_of(stuck.get()), virtual_display::error_e::create_failed);
+
+    gate->release();
+    for (int i = 0; i < 200 && manager->state() == virtual_display::state_e::poisoned; ++i) {
+      std::ignore = manager->acquire("Next", "uid-2", k_mode, "");
+      std::this_thread::sleep_for(10ms);
+    }
+
+    manager->release();
+
+    std::lock_guard lock {log->mutex};
+    EXPECT_EQ(log->added_ids, log->removed_ids);
+  }
+}
+
+TEST_F(VirtualDisplayTest, ProvisioningRacingATeardownFinishesWithoutOrphans) {
+  auto gate = std::make_shared<gate_t>();
+  auto [log, unused, unused_ping, manager] = make_rig({}, gate);
+
+  auto provisioning = std::async(std::launch::async, [&manager] {
+    return manager->acquire("Client", "uid", k_mode, "");
+  });
+  gate->await_arrival();
+
+  // What /cancel does while a launch is still setting up.
+  auto teardown = std::async(std::launch::async, [&manager] {
+    manager->release();
+  });
+
+  gate->release();
+  std::ignore = provisioning.get();
+  ASSERT_EQ(teardown.wait_for(10s), std::future_status::ready);
+  teardown.get();
+
+  manager->release();
+
+  std::lock_guard lock {log->mutex};
+  EXPECT_EQ(log->added_ids, log->removed_ids);
 }

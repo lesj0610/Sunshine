@@ -796,6 +796,46 @@ namespace display_device {
      * @return True once the configuration is restored, false if it failed or
      *         had not finished in time.
      */
+    std::atomic<bool> RELEASE_PENDING {false};  ///< A retry is holding the display until it restores.
+
+    /**
+     * @brief Keep restoring in the background, and only then give the display back.
+     *
+     * Used when the awaited restore ran out of time. The display stays where
+     * it is until the configuration is back, because removing it first is
+     * what the ordering exists to prevent. Nothing else can take a lease
+     * meanwhile: the lease is still held.
+     */
+    void revert_then_release_in_background() {
+      if (RELEASE_PENDING.exchange(true)) {
+        // Already waiting on one. A second would replace the first in the
+        // scheduler and nothing would be left to give the display back.
+        return;
+      }
+
+      std::lock_guard lock {DD_DATA.mutex};
+      if (!DD_DATA.sm_instance) {
+        RELEASE_PENDING = false;
+        virtual_display::manager().release();
+        return;
+      }
+
+      DD_DATA.sm_instance->schedule([](auto &settings_iface, auto &stop_token) {
+        using enum SettingsManagerInterface::RevertResult;
+
+        if (settings_iface.revertSettings() != Ok) {
+          // Keep the display and keep trying.
+          return;
+        }
+
+        BOOST_LOG(info) << "Display device configuration restored; releasing the virtual display.";
+        stop_token.requestStop();
+        RELEASE_PENDING = false;
+        virtual_display::manager().release();
+      },
+                                    {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
+    }
+
     bool revert_configuration_and_wait(std::chrono::milliseconds timeout) {
       auto outcome {std::make_shared<std::promise<bool>>()};
       auto settled {std::make_shared<std::atomic<bool>>(false)};
@@ -1083,12 +1123,10 @@ namespace display_device {
     // revert cannot be used: it returns before doing anything. The saved
     // configuration goes back first, and only then is the display removed.
     if (!revert_configuration_and_wait(REVERT_TIMEOUT)) {
-      BOOST_LOG(warning) << "Removing the virtual display before the display configuration was restored. "
-                            "The configuration will keep being retried in the background.";
-
-      // Something has to keep trying, since the awaited attempt gave up.
-      std::lock_guard lock {DD_DATA.mutex};
-      revert_configuration_unlocked(revert_option_e::try_indefinitely);
+      BOOST_LOG(warning) << "The display configuration is not restored yet, so the virtual display stays "
+                            "until it is. No session can start in the meantime.";
+      revert_then_release_in_background();
+      return;
     }
 
     virtual_display::manager().release();

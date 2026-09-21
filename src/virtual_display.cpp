@@ -251,10 +251,21 @@ namespace virtual_display {
     std::shared_ptr<backend_t> backend;
     std::shared_ptr<worker_t> worker;
     uuid_util::uuid_t id {};
+
+    /**
+     * @brief Whether a display may exist under id, and so has to be removed.
+     *
+     * Set the moment a create is submitted rather than when one succeeds. A
+     * create that never came back may well have made a display, and the
+     * identifier for it is known, so the obligation to remove it outlives
+     * being unable to.
+     */
+    bool display_may_exist {false};
     display_t display {};
     std::uint64_t generation {0};
     std::shared_ptr<heartbeat_t> heartbeat;
     std::function<void()> fault_handler;
+    bool fault_reported {false};  ///< One report per lease, however it is noticed.
 
     /**
      * @brief Ask the driver something, and poison it if it does not answer.
@@ -287,21 +298,68 @@ namespace virtual_display {
     }
 
     /**
-     * @brief Throw away a driver that stopped answering, once it has finished.
+     * @brief Finish what a driver that stopped answering left behind.
      *
-     * Called with the lock held.
+     * Being poisoned is not permission to forget: the call that never came
+     * back may have created a display, and this process knows the identifier
+     * for it. So the handle and the identifier are kept, and when the overdue
+     * call finally returns the display is removed and the handle closed,
+     * in that order, before anything else may use the driver again.
+     *
+     * A driver that never answers stays poisoned, which keeps every session
+     * refused rather than letting one start on top of an unknown state.
+     *
+     * Must be called without the lock held.
      */
-    void recover_if_drained_unlocked() {
-      if (state != state_e::poisoned || (worker && worker->busy())) {
+    void try_recover() {
+      std::shared_ptr<worker_t> worker_ref;
+      std::shared_ptr<backend_t> backend_ref;
+      uuid_util::uuid_t stale {};
+      bool remove_first = false;
+
+      {
+        std::lock_guard lock {mutex};
+        if (state != state_e::poisoned || !worker || worker->busy()) {
+          return;
+        }
+        worker_ref = worker;
+        backend_ref = backend;
+        stale = id;
+        remove_first = display_may_exist;
+      }
+
+      // Run on the same worker, in order, so the removal cannot overtake
+      // whatever the driver was still doing.
+      if (backend_ref) {
+        if (remove_first) {
+          if (!worker_ref->run_bounded<bool>([backend_ref, stale] {
+                                       return backend_ref->remove(stale);
+                                     },
+                                             timeouts.call)) {
+            return;
+          }
+        }
+
+        if (!worker_ref->run_bounded<bool>([backend_ref] {
+                                     backend_ref->close();
+                                     return true;
+                                   },
+                                           timeouts.call)) {
+          return;
+        }
+      }
+
+      std::lock_guard lock {mutex};
+      if (state != state_e::poisoned) {
         return;
       }
 
-      // Whatever the old handle was doing is over. Any display it made is the
-      // driver's problem now: the heartbeat stopped, so the watchdog drops it.
-      BOOST_LOG(info) << "Virtual display driver answered again; starting over with a new handle"sv;
+      BOOST_LOG(info) << "Virtual display driver answered again, and what it was holding is cleaned up"sv;
       worker.reset();
       backend.reset();
+      heartbeat.reset();
       display = {};
+      display_may_exist = false;
       state = state_e::idle;
     }
 
@@ -314,10 +372,20 @@ namespace virtual_display {
       std::function<void()> handler;
       {
         std::lock_guard lock {mutex};
-        if (state != state_e::active || generation != lost_generation) {
-          // A heartbeat belonging to a lease that has already ended.
+        if (generation != lost_generation || fault_reported) {
+          // A heartbeat belonging to a lease that has already ended, or one
+          // whose loss has already been reported.
           return;
         }
+
+        // Poisoned counts: a ping that never came back is how the driver
+        // going away usually shows up, and the session streaming the display
+        // still has to be told.
+        if (state != state_e::active && state != state_e::poisoned) {
+          return;
+        }
+
+        fault_reported = true;
         handler = fault_handler;
       }
 
@@ -361,11 +429,14 @@ namespace virtual_display {
     auto &impl = *m_impl;
     std::shared_ptr<backend_t> backend;
 
+    // Anything an earlier driver left behind is finished first, and only a
+    // driver that has been cleaned up is handed to a new session.
+    impl.try_recover();
+
     // Reserved before anything is done, so two requests arriving together
     // cannot both find the lease free.
     {
       std::lock_guard lock {impl.mutex};
-      impl.recover_if_drained_unlocked();
 
       switch (impl.state) {
         case state_e::idle:
@@ -386,6 +457,7 @@ namespace virtual_display {
 
       backend = impl.backend;
       impl.state = state_e::provisioning;
+      impl.fault_reported = false;
     }
 
     // Copies, because a call the caller gives up on keeps running with them.
@@ -402,6 +474,13 @@ namespace virtual_display {
         impl.call<bool>([backend, id] {
           return backend->remove(id);
         });
+
+        std::lock_guard lock {impl.mutex};
+        // Removed, so nothing is owed for it any more. If the removal itself
+        // did not come back, the poisoned recovery still has the identifier.
+        if (impl.state != state_e::poisoned) {
+          impl.display_may_exist = false;
+        }
       }
       impl.call<bool>([backend] {
         backend->close();
@@ -454,10 +533,24 @@ namespace virtual_display {
     // A driver that accepted the request but did not describe the result may
     // still have created something, and the identifier is known either way,
     // so that case is removed rather than forgotten.
+    // Noted before the request goes out, not after it comes back: a create
+    // that never answers may still have made a display, and this is where
+    // the identifier for it is recorded.
+    {
+      std::lock_guard lock {impl.mutex};
+      impl.id = id;
+      impl.display_may_exist = true;
+    }
+
     const auto created = impl.call<creation_e>([backend, id, name, uid, wanted] {
                                return backend->add(id, name, uid, wanted);
                              })
                            .value_or(creation_e::created_unverifiable);
+
+    if (created == creation_e::not_created) {
+      std::lock_guard lock {impl.mutex};
+      impl.display_may_exist = false;
+    }
 
     if (created != creation_e::created) {
       return give_up(error_e::create_failed, created == creation_e::created_unverifiable);
@@ -500,12 +593,26 @@ namespace virtual_display {
     // A third of the driver's patience, so two pings can be lost before it
     // decides Sunshine is gone.
     heartbeat->interval = std::chrono::duration_cast<std::chrono::milliseconds>(**watchdog) / 3;
-    heartbeat->ping = [weak = m_impl->weak_from_this(), backend] {
+    heartbeat->ping = [weak = m_impl->weak_from_this(), backend, generation = m_impl->generation + 1] {
       auto impl = weak.lock();
-      return impl && impl->call<bool>([backend] {
-                           return backend->ping();
-                         })
-                       .value_or(false);
+      if (!impl) {
+        return false;
+      }
+
+      {
+        // Nothing is asked of a driver that has not answered an earlier
+        // call, or of one this lease no longer owns. Otherwise a late answer
+        // could keep the driver's watchdog alive for a display nobody holds.
+        std::lock_guard lock {impl->mutex};
+        if (impl->state != state_e::active || impl->generation != generation) {
+          return false;
+        }
+      }
+
+      return impl->call<bool>([backend] {
+                       return backend->ping();
+                     })
+        .value_or(false);
     };
     heartbeat->on_lost = [weak = m_impl->weak_from_this()](std::uint64_t generation) {
       if (auto impl = weak.lock()) {
@@ -513,19 +620,24 @@ namespace virtual_display {
       }
     };
 
+    bool stolen = false;
     {
       std::lock_guard lock {impl.mutex};
       if (impl.state != state_e::provisioning) {
-        // Something tore the lease down while it was being set up.
-        return give_up(error_e::already_leased, true);
+        // Something tore the lease down while it was being set up. Decided
+        // here, acted on below: give_up() takes this same lock.
+        stolen = true;
+      } else {
+        impl.generation += 1;
+        heartbeat->generation = impl.generation;
+        impl.state = state_e::active;
+        impl.display = display;
+        impl.heartbeat = heartbeat;
       }
+    }
 
-      impl.generation += 1;
-      heartbeat->generation = impl.generation;
-      impl.state = state_e::active;
-      impl.id = id;
-      impl.display = display;
-      impl.heartbeat = heartbeat;
+    if (stolen) {
+      return give_up(error_e::already_leased, true);
     }
 
     std::thread {run_heartbeat, heartbeat}.detach();
@@ -543,10 +655,14 @@ namespace virtual_display {
     std::shared_ptr<backend_t> backend;
     uuid_util::uuid_t id {};
     bool had_display = false;
+    bool poisoned = false;
 
     {
       std::lock_guard lock {impl.mutex};
-      if (impl.state == state_e::idle || impl.state == state_e::poisoned) {
+      if (impl.state == state_e::poisoned) {
+        // What this owes is the recovery's to finish, not this call's.
+        poisoned = true;
+      } else if (impl.state == state_e::idle) {
         return;
       }
 
@@ -559,6 +675,13 @@ namespace virtual_display {
 
     if (heartbeat) {
       heartbeat->request_stop();
+    }
+
+    if (poisoned) {
+      // Nothing may be asked of the driver until the call it has not answered
+      // comes back. Tried now in case it already has.
+      impl.try_recover();
+      return;
     }
 
     if (backend) {
@@ -583,6 +706,7 @@ namespace virtual_display {
     std::lock_guard lock {impl.mutex};
     impl.display = {};
     if (impl.state == state_e::reverting) {
+      impl.display_may_exist = false;
       impl.state = state_e::idle;
     }
   }
