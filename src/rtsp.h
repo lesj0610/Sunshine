@@ -51,7 +51,14 @@ namespace rtsp_stream {
    *
    * @param launch_session Session state prepared by the GameStream launch handler.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  /**
+   * @brief Queue a launch session for the RTSP handshake.
+   *
+   * @param launch_session Session to queue.
+   * @return False if a launch is already pending, in which case this one was
+   *         not queued and the caller must undo whatever it prepared.
+   */
+  [[nodiscard]] bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
 
   /**
    * @brief Clear state for the specified launch session.

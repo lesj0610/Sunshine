@@ -1388,10 +1388,32 @@ namespace nvhttp {
       // The display should be restored in case something fails as there are no other sessions.
       revert_display_configuration = true;
 
+      // A session configured to stream a virtual display gets one before
+      // anything looks at the displays, so both the configuration and the
+      // encoder probe below act on the display it will actually stream. If it
+      // cannot be had the session is refused: falling back to a monitor would
+      // then change that monitor's resolution, which is what the option is
+      // there to avoid.
+      if (const auto reason {display_device::prepare_virtual_display(*launch_session)}) {
+        BOOST_LOG(error) << "Refusing to start a session: "sv << *reason;
+
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Could not prepare a virtual display: " + *reason);
+        tree.put("root.gamesession", 0);
+
+        return;
+      }
+
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      if (!display_device::configure_display(config::video, *launch_session)) {
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Failed to configure the display for this session");
+        tree.put("root.gamesession", 0);
+
+        return;
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1438,9 +1460,19 @@ namespace nvhttp {
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
-    tree.put("root.gamesession", 1);
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      // Another launch is already waiting for its client, so this one will
+      // never be picked up and whatever was prepared for it has to go back.
+      BOOST_LOG(error) << "Rejecting a launch while another is still waiting for its client"sv;
 
-    rtsp_stream::launch_session_raise(launch_session);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another launch is already in progress");
+      tree.put("root.gamesession", 0);
+
+      return;
+    }
+
+    tree.put("root.gamesession", 1);
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
@@ -1457,6 +1489,7 @@ namespace nvhttp {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
+    bool revert_display_configuration {false};
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -1467,6 +1500,12 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+
+      // Same guard the launch path has. Without it, a resume that prepared a
+      // display and then failed would leave it prepared.
+      if (revert_display_configuration) {
+        display_device::revert_configuration();
+      }
     });
 
     auto current_appid = proc::proc.running();
@@ -1500,10 +1539,30 @@ namespace nvhttp {
     const auto launch_session = make_launch_session(host_audio, args);
 
     if (no_active_sessions) {
+      revert_display_configuration = true;
+
+      // See the launch path: the virtual display comes first, and the session
+      // is refused rather than served from a monitor.
+      if (const auto reason {display_device::prepare_virtual_display(*launch_session)}) {
+        BOOST_LOG(error) << "Refusing to resume a session: "sv << *reason;
+
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Could not prepare a virtual display: " + *reason);
+
+        return;
+      }
+
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      if (!display_device::configure_display(config::video, *launch_session)) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Failed to configure the display for this session");
+
+        return;
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1539,9 +1598,20 @@ namespace nvhttp {
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      BOOST_LOG(error) << "Rejecting a resume while a launch is still waiting for its client"sv;
+
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another launch is already in progress");
+
+      return;
+    }
+
     tree.put("root.resume", 1);
 
-    rtsp_stream::launch_session_raise(launch_session);
+    // Handed off successfully, so teardown is the session's business now.
+    revert_display_configuration = false;
   }
 
   /**

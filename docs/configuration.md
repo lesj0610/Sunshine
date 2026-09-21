@@ -1134,6 +1134,39 @@ supported on the current platform.
     </tr>
 </table>
 
+### dd_virtual_display
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Stream a display created for the session instead of one of the displays attached to the host.
+
+            The resolution the client asks for does not have to be a mode any attached monitor supports, and
+            what is on those monitors is left untouched for the duration of the stream. The display is removed
+            when the session ends.
+
+            @note{Requires the SudoVDA virtual display driver, which the Windows installer sets up. If the
+            driver is missing, Sunshine streams the configured display instead.}
+            @note{Has no effect while `dd_configuration_option` is `disabled`, since nothing would then set
+            the new display's resolution.}
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_virtual_display = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### dd_resolution_option
 
 <table>
