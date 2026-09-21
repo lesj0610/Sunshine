@@ -104,6 +104,7 @@ namespace {
       std::vector<std::string> render_adapters;
       std::set<std::string> added_ids;
       std::set<std::string> removed_ids;
+      std::vector<std::string> added_order;  ///< Insertion order, which a set does not keep.
       virtual_display::mode_t last_mode {};
       bool fail_pings {};  ///< Set mid-test to make the driver go quiet.
       bool hold_pings {};  ///< Set mid-test to make a ping never come back.
@@ -169,6 +170,7 @@ namespace {
       }
       std::lock_guard lock {log->mutex};
       log->added_ids.insert(id.string());
+      log->added_order.push_back(id.string());
       return script.add_result;
     }
 
@@ -724,7 +726,10 @@ TEST_F(VirtualDisplayTest, ALateCallIsCleanedUpBeforeAnythingElseIsCreated) {
   EXPECT_EQ(log->order[1], "remove");
   EXPECT_EQ(log->order[2], "close");
   EXPECT_EQ(log->order[3], "add");
-  EXPECT_TRUE(log->removed_ids.contains(*log->added_ids.begin()));
+  // The display the timed-out create left behind, not whichever identifier
+  // happens to sort first.
+  ASSERT_FALSE(log->added_order.empty());
+  EXPECT_TRUE(log->removed_ids.contains(log->added_order.front()));
 }
 
 TEST_F(VirtualDisplayTest, ALateCreateIsRemovedWhicheverAnswerItEventuallyGives) {
@@ -774,4 +779,341 @@ TEST_F(VirtualDisplayTest, ProvisioningRacingATeardownFinishesWithoutOrphans) {
 
   std::lock_guard lock {log->mutex};
   EXPECT_EQ(log->added_ids, log->removed_ids);
+}
+
+TEST_F(VirtualDisplayTest, AHungHeartbeatIsCleanedUpOnceTheDriverAnswers) {
+  // The whole fault path, with the handler doing what the real one does.
+  auto gate = std::make_shared<gate_t>();
+  auto [log, unused_add, ping_gate, manager] = make_rig(
+    {.watchdog = std::chrono::seconds {1}},
+    nullptr,
+    [](const std::string &name) {
+      return name + "-id";
+    },
+    gate
+  );
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
+
+  std::promise<void> released;
+  auto done = released.get_future();
+  std::atomic<int> faults {0};
+  manager->set_fault_handler([&manager, &faults, &released] {
+    manager->release();
+    if (faults.fetch_add(1) == 0) {
+      released.set_value();
+    }
+  });
+
+  {
+    std::lock_guard lock {log->mutex};
+    log->hold_pings = true;
+  }
+  ASSERT_EQ(done.wait_for(30s), std::future_status::ready);
+
+  // The driver has not answered, so nothing may be asked of it.
+  EXPECT_EQ(manager->state(), virtual_display::state_e::poisoned);
+  EXPECT_EQ(error_of(manager->acquire("Next", "uid-2", k_mode, "")), virtual_display::error_e::busy);
+  {
+    std::lock_guard lock {log->mutex};
+    EXPECT_EQ(log->removes, 0);
+  }
+
+  {
+    std::lock_guard lock {log->mutex};
+    log->hold_pings = false;
+  }
+  gate->release();
+
+  std::variant<virtual_display::display_t, virtual_display::error_e> next = virtual_display::error_e::busy;
+  for (int i = 0; i < 400; ++i) {
+    next = manager->acquire("Next", "uid-2", k_mode, "");
+    if (std::holds_alternative<virtual_display::display_t>(next)) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+
+  EXPECT_TRUE(std::holds_alternative<virtual_display::display_t>(next));
+  EXPECT_EQ(faults.load(), 1);
+
+  std::lock_guard lock {log->mutex};
+  EXPECT_EQ(log->removes, 1);
+  EXPECT_EQ(log->closes, 1);
+}
+
+TEST_F(VirtualDisplayTest, TwoRecoveriesAtOnceCleanUpOnce) {
+  auto gate = std::make_shared<gate_t>();
+  auto [log, unused, unused_ping, manager] = make_rig({}, gate);
+
+  auto stuck = std::async(std::launch::async, [&manager] {
+    return manager->acquire("Client", "uid", k_mode, "");
+  });
+  gate->await_arrival();
+  ASSERT_EQ(error_of(stuck.get()), virtual_display::error_e::create_failed);
+  gate->release();
+
+  // Both of these drive the recovery.
+  auto first = std::async(std::launch::async, [&manager] {
+    for (int i = 0; i < 200 && manager->state() == virtual_display::state_e::poisoned; ++i) {
+      std::ignore = manager->acquire("A", "uid-a", k_mode, "");
+      std::this_thread::sleep_for(5ms);
+    }
+  });
+  auto second = std::async(std::launch::async, [&manager] {
+    for (int i = 0; i < 200 && manager->state() == virtual_display::state_e::poisoned; ++i) {
+      std::ignore = manager->acquire("B", "uid-b", k_mode, "");
+      std::this_thread::sleep_for(5ms);
+    }
+  });
+  first.get();
+  second.get();
+  ASSERT_NE(manager->state(), virtual_display::state_e::poisoned);
+
+  std::lock_guard lock {log->mutex};
+  // The stale display is removed once and the handle closed once, however
+  // many callers noticed the driver had come back.
+  EXPECT_EQ(std::count(log->order.begin(), log->order.end(), "remove"), 1);
+  EXPECT_EQ(std::count(log->order.begin(), log->order.end(), "close"), 1);
+}
+
+TEST_F(VirtualDisplayTest, ARefusedCleanupKeepsTheDriverOutOfUse) {
+  // A removal the driver said no to leaves a display behind. Saying the
+  // cleanup is done would let the next session start on top of it.
+  auto gate = std::make_shared<gate_t>();
+  auto [log, unused, unused_ping, manager] = make_rig({.remove_succeeds = false}, gate);
+
+  auto stuck = std::async(std::launch::async, [&manager] {
+    return manager->acquire("Client", "uid", k_mode, "");
+  });
+  gate->await_arrival();
+  ASSERT_EQ(error_of(stuck.get()), virtual_display::error_e::create_failed);
+  gate->release();
+
+  int adds_before = 0;
+  {
+    std::lock_guard lock {log->mutex};
+    adds_before = log->adds;
+  }
+
+  for (int i = 0; i < 40; ++i) {
+    EXPECT_EQ(error_of(manager->acquire("Next", "uid-2", k_mode, "")), virtual_display::error_e::busy);
+    std::this_thread::sleep_for(5ms);
+  }
+
+  EXPECT_EQ(manager->state(), virtual_display::state_e::poisoned);
+
+  std::lock_guard lock {log->mutex};
+  EXPECT_EQ(log->adds, adds_before);
+}
+
+namespace {
+
+  /**
+   * @brief A display stack that does what a test tells it to.
+   */
+  struct fake_restore_t {
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    int attempts {};
+    int schedules {};
+    int releases {};
+    std::vector<std::uint64_t> released_generations;
+    bool scheduler_gone {};
+
+    /// What try_restore() answers. Empty means "busy, try again".
+    std::optional<bool> answer {true};
+
+    /// Retries are held here until the test runs them.
+    std::vector<std::function<void()>> queued;
+
+    std::optional<bool> try_restore() {
+      std::lock_guard lock {mutex};
+      attempts += 1;
+      cv.notify_all();
+      return answer;
+    }
+
+    bool schedule(std::function<void()> work) {
+      std::lock_guard lock {mutex};
+      if (scheduler_gone) {
+        return false;
+      }
+      schedules += 1;
+      queued.push_back(std::move(work));
+      cv.notify_all();
+      return true;
+    }
+
+    bool release(std::uint64_t generation) {
+      std::lock_guard lock {mutex};
+      releases += 1;
+      released_generations.push_back(generation);
+      return true;
+    }
+
+    /// Run whatever retries are waiting.
+    void drain() {
+      std::vector<std::function<void()>> work;
+      {
+        std::lock_guard lock {mutex};
+        work.swap(queued);
+      }
+      for (auto &fn : work) {
+        fn();
+      }
+    }
+
+    void await_attempts(int at_least) {
+      std::unique_lock lock {mutex};
+      cv.wait_for(lock, 10s, [this, at_least] {
+        return attempts >= at_least;
+      });
+    }
+  };
+
+  /**
+   * @brief Build a transaction over a fake display stack.
+   */
+  std::unique_ptr<virtual_display::restore_transaction_t> make_transaction(std::shared_ptr<fake_restore_t> fake) {
+    return std::make_unique<virtual_display::restore_transaction_t>(
+      [fake] {
+        return fake->try_restore();
+      },
+      [fake](std::function<void()> work) {
+        return fake->schedule(std::move(work));
+      },
+      [fake](std::uint64_t generation) {
+        return fake->release(generation);
+      }
+    );
+  }
+
+}  // namespace
+
+class RestoreTransactionTest: public ::testing::Test {};
+
+TEST_F(RestoreTransactionTest, ARestoreThatWorksReleasesTheDisplayOnce) {
+  auto fake = std::make_shared<fake_restore_t>();
+  auto transaction = make_transaction(fake);
+
+  EXPECT_TRUE(transaction->run(7, 5s));
+
+  std::lock_guard lock {fake->mutex};
+  EXPECT_EQ(fake->releases, 1);
+  EXPECT_EQ(fake->released_generations, std::vector<std::uint64_t> {7});
+}
+
+TEST_F(RestoreTransactionTest, TheDisplayIsHeldUntilTheRestoreSucceeds) {
+  auto fake = std::make_shared<fake_restore_t>();
+  fake->answer = false;
+  auto transaction = make_transaction(fake);
+
+  EXPECT_FALSE(transaction->run(1, 200ms));
+  EXPECT_TRUE(transaction->pending());
+  {
+    std::lock_guard lock {fake->mutex};
+    EXPECT_EQ(fake->releases, 0);
+  }
+
+  {
+    std::lock_guard lock {fake->mutex};
+    fake->answer = true;
+  }
+  fake->drain();
+
+  EXPECT_FALSE(transaction->pending());
+  std::lock_guard lock {fake->mutex};
+  EXPECT_EQ(fake->releases, 1);
+}
+
+TEST_F(RestoreTransactionTest, TwoRestoresAtOnceScheduleOneRetryAndReleaseOnce) {
+  auto fake = std::make_shared<fake_restore_t>();
+  fake->answer = false;
+  auto transaction = make_transaction(fake);
+
+  EXPECT_FALSE(transaction->run(3, 100ms));
+  const auto schedules_after_first = [&] {
+    std::lock_guard lock {fake->mutex};
+    return fake->schedules;
+  }();
+
+  // A second caller joins rather than starting a competing restore.
+  EXPECT_FALSE(transaction->run(3, 100ms));
+  {
+    std::lock_guard lock {fake->mutex};
+    EXPECT_EQ(fake->schedules, schedules_after_first);
+    EXPECT_EQ(fake->releases, 0);
+  }
+
+  {
+    std::lock_guard lock {fake->mutex};
+    fake->answer = true;
+  }
+  fake->drain();
+
+  std::lock_guard lock {fake->mutex};
+  EXPECT_EQ(fake->releases, 1);
+}
+
+TEST_F(RestoreTransactionTest, ALateRestoreDoesNotReleaseTheNextLease) {
+  auto fake = std::make_shared<fake_restore_t>();
+  fake->answer = false;
+  auto transaction = make_transaction(fake);
+
+  ASSERT_FALSE(transaction->run(5, 100ms));
+
+  {
+    std::lock_guard lock {fake->mutex};
+    fake->answer = true;
+  }
+  fake->drain();
+
+  // It names the lease it was started for, so a manager on a later one can
+  // tell the release is stale and ignore it.
+  std::lock_guard lock {fake->mutex};
+  ASSERT_EQ(fake->released_generations.size(), 1u);
+  EXPECT_EQ(fake->released_generations.front(), 5u);
+}
+
+TEST_F(RestoreTransactionTest, ASchedulerGoingAwayDoesNotStrandTheDisplay) {
+  auto fake = std::make_shared<fake_restore_t>();
+  fake->answer = false;
+  auto transaction = make_transaction(fake);
+
+  ASSERT_FALSE(transaction->run(9, 100ms));
+  ASSERT_TRUE(transaction->pending());
+
+  {
+    std::lock_guard lock {fake->mutex};
+    fake->scheduler_gone = true;
+  }
+  transaction->abandon();
+
+  EXPECT_FALSE(transaction->pending());
+  std::lock_guard lock {fake->mutex};
+  EXPECT_EQ(fake->releases, 1);
+  EXPECT_EQ(fake->released_generations.front(), 9u);
+}
+
+TEST_F(RestoreTransactionTest, ABusyApiIsRetriedRatherThanTreatedAsFailure) {
+  auto fake = std::make_shared<fake_restore_t>();
+  fake->answer = std::nullopt;
+  auto transaction = make_transaction(fake);
+
+  EXPECT_FALSE(transaction->run(2, 100ms));
+  {
+    std::lock_guard lock {fake->mutex};
+    EXPECT_GE(fake->schedules, 1);
+    EXPECT_EQ(fake->releases, 0);
+  }
+
+  {
+    std::lock_guard lock {fake->mutex};
+    fake->answer = true;
+  }
+  fake->drain();
+
+  std::lock_guard lock {fake->mutex};
+  EXPECT_EQ(fake->releases, 1);
 }

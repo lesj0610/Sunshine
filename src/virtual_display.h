@@ -17,6 +17,7 @@
 
 // standard includes
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -59,7 +60,8 @@ namespace virtual_display {
     provisioning,  ///< A session is in the middle of taking one.
     active,  ///< A session holds a display.
     reverting,  ///< The display is being given back.
-    poisoned  ///< A driver call never came back; nothing may be asked of the driver.
+    poisoned,  ///< A driver call never came back; nothing may be asked of the driver.
+    recovering  ///< One caller is finishing what the unanswered call left behind.
   };
 
   /**
@@ -310,6 +312,24 @@ namespace virtual_display {
     [[nodiscard]] state_e state() const;
 
     /**
+     * @brief Which lease is current.
+     *
+     * Work that outlives a lease, such as a restore that had to be retried,
+     * uses this to check it is still acting on the lease it started for.
+     *
+     * @return A number that changes with every lease taken.
+     */
+    [[nodiscard]] std::uint64_t generation() const;
+
+    /**
+     * @brief Give up the lease, but only if it is still the expected one.
+     *
+     * @param generation The lease the caller means to end.
+     * @return True if that lease was the current one and has been given up.
+     */
+    bool release_generation(std::uint64_t generation);
+
+    /**
      * @brief Say what to do when the driver stops answering mid-session.
      *
      * The display is gone at that point, so the session streaming it cannot
@@ -336,6 +356,70 @@ namespace virtual_display {
   private:
     // Shared rather than unique: the heartbeat thread cannot be joined, so it
     // has to be able to outlive the manager without touching freed memory.
+    std::shared_ptr<impl_t> m_impl;
+  };
+
+  /**
+   * @brief Restores the display configuration, then gives the display back.
+   *
+   * Removing the virtual display before the saved configuration is restored
+   * leaves the restore working against a display that is no longer there, so
+   * the two are ordered here and nowhere else.
+   *
+   * There is at most one restore in progress. A second caller joins the one
+   * already running rather than replacing it, because the display stack only
+   * holds one retry at a time and replacing it would leave nothing to give
+   * the display back.
+   *
+   * Everything it needs is handed in, so the ordering can be tested without a
+   * display stack.
+   */
+  class restore_transaction_t {
+  public:
+    /// Try to restore now. Nothing means the API was busy and it is worth
+    /// another go; false means it failed and is also worth another go.
+    using restore_fn_t = std::function<std::optional<bool>()>;
+
+    /// Arrange for the given work to run again later. False if there is no
+    /// longer anything that can run it.
+    using schedule_fn_t = std::function<bool(std::function<void()>)>;
+
+    /// Give the display back, if the lease is still the expected one.
+    using release_fn_t = std::function<bool(std::uint64_t)>;
+
+    restore_transaction_t(restore_fn_t restore, schedule_fn_t schedule, release_fn_t release);
+    ~restore_transaction_t();
+
+    restore_transaction_t(const restore_transaction_t &) = delete;
+    restore_transaction_t &operator=(const restore_transaction_t &) = delete;
+
+    /**
+     * @brief Restore for a lease and wait for it, joining one already running.
+     *
+     * @param generation The lease this is being done for.
+     * @param timeout How long to wait for a final answer.
+     * @return True once restored. False means it is still being retried, and
+     *         the display stays where it is until it succeeds.
+     */
+    bool run(std::uint64_t generation, std::chrono::milliseconds timeout);
+
+    /**
+     * @brief Whether a restore is still being retried.
+     */
+    [[nodiscard]] bool pending() const;
+
+    /**
+     * @brief Nothing can retry any more, so stop expecting one.
+     *
+     * Used when the display stack is torn down or replaced. One last restore
+     * is attempted, and the display is given back either way, since leaving a
+     * lease held by a transaction that can no longer finish would keep every
+     * later session out.
+     */
+    void abandon();
+
+  private:
+    struct impl_t;
     std::shared_ptr<impl_t> m_impl;
   };
 

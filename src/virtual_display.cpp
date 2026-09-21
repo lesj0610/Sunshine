@@ -320,8 +320,13 @@ namespace virtual_display {
       {
         std::lock_guard lock {mutex};
         if (state != state_e::poisoned || !worker || worker->busy()) {
+          // Not ours to do: either nothing is owed, someone else already
+          // claimed it, or the driver is still holding the overdue call.
           return;
         }
+
+        // Claimed, so two callers cannot both run the same cleanup.
+        state = state_e::recovering;
         worker_ref = worker;
         backend_ref = backend;
         stale = id;
@@ -329,28 +334,40 @@ namespace virtual_display {
       }
 
       // Run on the same worker, in order, so the removal cannot overtake
-      // whatever the driver was still doing.
+      // whatever the driver was still doing. Both have to actually succeed:
+      // a removal the driver refused leaves a display behind, and saying
+      // otherwise would let the next session start on top of it.
+      bool cleaned = true;
       if (backend_ref) {
         if (remove_first) {
-          if (!worker_ref->run_bounded<bool>([backend_ref, stale] {
-                                       return backend_ref->remove(stale);
-                                     },
-                                             timeouts.call)) {
-            return;
-          }
+          const auto removed = worker_ref->run_bounded<bool>([backend_ref, stale] {
+            return backend_ref->remove(stale);
+          },
+                                                             timeouts.call);
+          cleaned = removed.value_or(false);
         }
 
-        if (!worker_ref->run_bounded<bool>([backend_ref] {
-                                     backend_ref->close();
-                                     return true;
-                                   },
-                                           timeouts.call)) {
-          return;
+        if (cleaned) {
+          const auto closed = worker_ref->run_bounded<bool>([backend_ref] {
+            backend_ref->close();
+            return true;
+          },
+                                                            timeouts.call);
+          cleaned = closed.value_or(false);
         }
       }
 
       std::lock_guard lock {mutex};
-      if (state != state_e::poisoned) {
+      if (state != state_e::recovering) {
+        return;
+      }
+
+      if (!cleaned) {
+        // Still owed. display_may_exist and the identifier stay as they are,
+        // and no session may start until this comes good.
+        BOOST_LOG(warning) << "The virtual display driver has not let go of what it was holding; "
+                              "no session can use it yet."sv;
+        state = state_e::poisoned;
         return;
       }
 
@@ -442,6 +459,7 @@ namespace virtual_display {
         case state_e::idle:
           break;
         case state_e::poisoned:
+        case state_e::recovering:
           return error_e::busy;
         default:
           return error_e::already_leased;
@@ -659,18 +677,22 @@ namespace virtual_display {
 
     {
       std::lock_guard lock {impl.mutex};
-      if (impl.state == state_e::poisoned) {
-        // What this owes is the recovery's to finish, not this call's.
-        poisoned = true;
-      } else if (impl.state == state_e::idle) {
+      if (impl.state == state_e::idle) {
         return;
       }
 
-      had_display = impl.state == state_e::active;
       heartbeat = std::exchange(impl.heartbeat, nullptr);
       backend = impl.backend;
       id = impl.id;
-      impl.state = state_e::reverting;
+
+      if (impl.state == state_e::poisoned || impl.state == state_e::recovering) {
+        // What this owes belongs to the recovery. Moving it to reverting
+        // would take the cleanup away from the only thing that can do it.
+        poisoned = true;
+      } else {
+        had_display = impl.state == state_e::active;
+        impl.state = state_e::reverting;
+      }
     }
 
     if (heartbeat) {
@@ -721,6 +743,24 @@ namespace virtual_display {
     return m_impl->state;
   }
 
+  std::uint64_t manager_t::generation() const {
+    std::lock_guard lock {m_impl->mutex};
+    return m_impl->generation;
+  }
+
+  bool manager_t::release_generation(std::uint64_t generation) {
+    {
+      std::lock_guard lock {m_impl->mutex};
+      if (m_impl->generation != generation) {
+        // A restore that took so long the lease it was for has already gone.
+        return false;
+      }
+    }
+
+    release();
+    return true;
+  }
+
   void manager_t::set_fault_handler(std::function<void()> handler) {
     std::lock_guard lock {m_impl->mutex};
     m_impl->fault_handler = std::move(handler);
@@ -732,6 +772,141 @@ namespace virtual_display {
       return std::nullopt;
     }
     return m_impl->display.device_id;
+  }
+
+  /**
+   * @brief The one restore in progress, and who it is for.
+   */
+  struct restore_transaction_t::impl_t {
+    restore_fn_t restore;
+    schedule_fn_t schedule;
+    release_fn_t release;
+
+    std::mutex mutex;
+    bool running {false};
+    std::uint64_t generation {0};
+    std::shared_ptr<std::promise<bool>> outcome;
+    std::shared_future<bool> result;
+
+    /**
+     * @brief Finish, at most once.
+     *
+     * @param restored Whether the configuration went back.
+     */
+    void settle(bool restored) {
+      std::shared_ptr<std::promise<bool>> done;
+      {
+        std::lock_guard lock {mutex};
+        if (!running) {
+          return;
+        }
+        running = false;
+        done = std::exchange(outcome, nullptr);
+      }
+      if (done) {
+        done->set_value(restored);
+      }
+    }
+
+    /**
+     * @brief One go at restoring, arranging another if it did not take.
+     */
+    void attempt() {
+      const auto restored = restore ? restore() : std::optional<bool> {true};
+
+      if (restored.value_or(false)) {
+        // The order the whole class exists for: back first, then let go.
+        std::uint64_t gen = 0;
+        {
+          std::lock_guard lock {mutex};
+          gen = generation;
+        }
+        if (release) {
+          release(gen);
+        }
+        settle(true);
+        return;
+      }
+
+      auto self = this;
+      if (!schedule || !schedule([self] {
+            self->attempt();
+          })) {
+        // Nothing left that can try again.
+        BOOST_LOG(error) << "Nothing can retry restoring the display configuration"sv;
+        settle(false);
+      }
+    }
+  };
+
+  restore_transaction_t::restore_transaction_t(restore_fn_t restore, schedule_fn_t schedule, release_fn_t release):
+      m_impl {std::make_shared<impl_t>()} {
+    m_impl->restore = std::move(restore);
+    m_impl->schedule = std::move(schedule);
+    m_impl->release = std::move(release);
+  }
+
+  restore_transaction_t::~restore_transaction_t() = default;
+
+  bool restore_transaction_t::run(std::uint64_t generation, std::chrono::milliseconds timeout) {
+    std::shared_future<bool> waiting;
+    bool mine = false;
+
+    {
+      std::lock_guard lock {m_impl->mutex};
+      if (m_impl->running) {
+        // Joining rather than starting a second: the display stack holds one
+        // retry at a time, and replacing it would leave nothing to give the
+        // display back.
+        waiting = m_impl->result;
+      } else {
+        m_impl->running = true;
+        m_impl->generation = generation;
+        m_impl->outcome = std::make_shared<std::promise<bool>>();
+        m_impl->result = m_impl->outcome->get_future().share();
+        waiting = m_impl->result;
+        mine = true;
+      }
+    }
+
+    if (mine) {
+      m_impl->attempt();
+    }
+
+    if (waiting.wait_for(timeout) != std::future_status::ready) {
+      return false;
+    }
+    return waiting.get();
+  }
+
+  bool restore_transaction_t::pending() const {
+    std::lock_guard lock {m_impl->mutex};
+    return m_impl->running;
+  }
+
+  void restore_transaction_t::abandon() {
+    std::uint64_t gen = 0;
+    {
+      std::lock_guard lock {m_impl->mutex};
+      if (!m_impl->running) {
+        return;
+      }
+      gen = m_impl->generation;
+      // Nothing can arrange another attempt from here.
+      m_impl->schedule = nullptr;
+    }
+
+    BOOST_LOG(warning) << "The display stack is going away while a restore is outstanding. "
+                          "One last attempt, then the virtual display is given back either way, "
+                          "since holding it would keep every later session out."sv;
+
+    if (m_impl->restore) {
+      std::ignore = m_impl->restore();
+    }
+    if (m_impl->release) {
+      m_impl->release(gen);
+    }
+    m_impl->settle(false);
   }
 
   manager_t &manager() {

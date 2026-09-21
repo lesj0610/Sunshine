@@ -1384,6 +1384,22 @@ namespace nvhttp {
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args);
 
+    // Claimed before anything with a side effect happens. A request that is
+    // going to lose the race for the pending slot must find out before it
+    // starts an app or takes a display, not after: starting an app stops
+    // whichever one is already running, so a loser that got that far would
+    // take the winner's app down with it.
+    auto reservation {rtsp_stream::reserve_launch_session()};
+    if (!reservation) {
+      BOOST_LOG(error) << "Rejecting a launch while another is still waiting for its client"sv;
+
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another launch is already in progress");
+      tree.put("root.gamesession", 0);
+
+      return;
+    }
+
     // Checked whether or not other sessions exist. There is one capture
     // output, so a second session cannot be given a display of its own, and
     // handing it the first session's would silently give it that session's
@@ -1463,20 +1479,18 @@ namespace nvhttp {
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
-    if (!rtsp_stream::launch_session_raise(launch_session)) {
-      // Another launch is already waiting for its client, so this one will
-      // never be picked up and everything done for it has to go back,
-      // including the app that was just started for it.
-      BOOST_LOG(error) << "Rejecting a launch while another is still waiting for its client"sv;
+    if (!reservation.commit(launch_session)) {
+      // The slot was claimed above, so this should not happen. If it somehow
+      // does, the app this request started is this request's to stop: holding
+      // the claim is what made it the only one allowed to start one.
+      BOOST_LOG(error) << "Could not hand the launch session over to the RTSP server"sv;
 
-      // Only an app this request started. Another launch may have won the
-      // race and be running one of its own, which is not ours to stop.
       if (started_app) {
         proc::proc.terminate();
       }
 
       tree.put("root.<xmlattr>.status_code", 503);
-      tree.put("root.<xmlattr>.status_message", "Another launch is already in progress");
+      tree.put("root.<xmlattr>.status_message", "Could not start the session");
       tree.put("root.gamesession", 0);
 
       return;
@@ -1548,6 +1562,17 @@ namespace nvhttp {
     }
     const auto launch_session = make_launch_session(host_audio, args);
 
+    auto reservation {rtsp_stream::reserve_launch_session()};
+    if (!reservation) {
+      BOOST_LOG(error) << "Rejecting a resume while a launch is still waiting for its client"sv;
+
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another launch is already in progress");
+
+      return;
+    }
+
     // See the launch path: checked whether or not other sessions exist.
     if (const auto reason {display_device::prepare_virtual_display(*launch_session)}) {
       BOOST_LOG(error) << "Refusing to resume a session: "sv << *reason;
@@ -1608,12 +1633,12 @@ namespace nvhttp {
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
-    if (!rtsp_stream::launch_session_raise(launch_session)) {
-      BOOST_LOG(error) << "Rejecting a resume while a launch is still waiting for its client"sv;
+    if (!reservation.commit(launch_session)) {
+      BOOST_LOG(error) << "Could not hand the resumed session over to the RTSP server"sv;
 
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 503);
-      tree.put("root.<xmlattr>.status_message", "Another launch is already in progress");
+      tree.put("root.<xmlattr>.status_message", "Could not resume the session");
 
       return;
     }

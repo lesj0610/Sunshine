@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <regex>
@@ -796,91 +798,72 @@ namespace display_device {
      * @return True once the configuration is restored, false if it failed or
      *         had not finished in time.
      */
-    std::atomic<bool> RELEASE_PENDING {false};  ///< A retry is holding the display until it restores.
-
     /**
-     * @brief Keep restoring in the background, and only then give the display back.
+     * @brief Ask the display stack to restore now.
      *
-     * Used when the awaited restore ran out of time. The display stays where
-     * it is until the configuration is back, because removing it first is
-     * what the ordering exists to prevent. Nothing else can take a lease
-     * meanwhile: the lease is still held.
+     * @return Nothing while the API is busy, otherwise whether it restored.
      */
-    void revert_then_release_in_background() {
-      if (RELEASE_PENDING.exchange(true)) {
-        // Already waiting on one. A second would replace the first in the
-        // scheduler and nothing would be left to give the display back.
-        return;
-      }
-
+    std::optional<bool> restore_once() {
       std::lock_guard lock {DD_DATA.mutex};
       if (!DD_DATA.sm_instance) {
-        RELEASE_PENDING = false;
-        virtual_display::manager().release();
-        return;
+        // Platform is not supported, so there was nothing to restore.
+        return true;
       }
 
-      DD_DATA.sm_instance->schedule([](auto &settings_iface, auto &stop_token) {
-        using enum SettingsManagerInterface::RevertResult;
+      using enum SettingsManagerInterface::RevertResult;
+      const auto result {DD_DATA.sm_instance->execute([](auto &settings_iface) {
+        return settings_iface.revertSettings();
+      })};
 
-        if (settings_iface.revertSettings() != Ok) {
-          // Keep the display and keep trying.
-          return;
-        }
-
-        BOOST_LOG(info) << "Display device configuration restored; releasing the virtual display.";
-        stop_token.requestStop();
-        RELEASE_PENDING = false;
-        virtual_display::manager().release();
-      },
-                                    {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
+      if (result == ApiTemporarilyUnavailable) {
+        return std::nullopt;
+      }
+      if (result != Ok) {
+        BOOST_LOG(error) << "Failed to revert display device configuration.";
+        return false;
+      }
+      return true;
     }
 
-    bool revert_configuration_and_wait(std::chrono::milliseconds timeout) {
-      auto outcome {std::make_shared<std::promise<bool>>()};
-      auto settled {std::make_shared<std::atomic<bool>>(false)};
-      auto reverted {outcome->get_future()};
-
-      {
-        std::lock_guard lock {DD_DATA.mutex};
-        if (!DD_DATA.sm_instance) {
-          // Platform is not supported, so there was nothing to restore.
-          return true;
-        }
-
-        // No delay and no waiting for devices to change: something is holding
-        // on for this answer.
-        DD_DATA.sm_instance->schedule([outcome, settled](auto &settings_iface, auto &stop_token) {
-          using enum SettingsManagerInterface::RevertResult;
-
-          const auto result {settings_iface.revertSettings()};
-          if (result == ApiTemporarilyUnavailable) {
-            // Do nothing and retry next time
-            return;
-          }
-
-          if (result != Ok) {
-            BOOST_LOG(error) << "Failed to revert display device configuration.";
-          }
-
-          if (!settled->exchange(true)) {
-            outcome->set_value(result == Ok);
-          }
-          stop_token.requestStop();
-        },
-                                      {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
-      }
-
-      // Waited on outside the lock: retries run on the scheduler's own thread,
-      // which needs the interface this lock guards.
-      if (reverted.wait_for(timeout) != std::future_status::ready) {
-        BOOST_LOG(error) << "Display device configuration was not restored within "
-                         << timeout.count() << "ms.";
+    /**
+     * @brief Arrange for something to run again after the retry interval.
+     *
+     * @param work What to run.
+     * @return False if there is no longer a scheduler to run it.
+     */
+    bool schedule_restore_retry(std::function<void()> work) {
+      std::lock_guard lock {DD_DATA.mutex};
+      if (!DD_DATA.sm_instance) {
         return false;
       }
 
-      return reverted.get();
+      DD_DATA.sm_instance->schedule([work](auto &, auto &stop_token) {
+        stop_token.requestStop();
+        work();
+      },
+                                    {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL},
+                                     .m_execution = SchedulerOptions::Execution::ScheduledOnly});
+      return true;
     }
+
+    /**
+     * @brief The one restore that orders itself against the virtual display.
+     */
+    virtual_display::restore_transaction_t &restore_transaction() {
+      static virtual_display::restore_transaction_t instance {
+        [] {
+          return restore_once();
+        },
+        [](std::function<void()> work) {
+          return schedule_restore_retry(std::move(work));
+        },
+        [](std::uint64_t generation) {
+          return virtual_display::manager().release_generation(generation);
+        }
+      };
+      return instance;
+    }
+
   }  // namespace
 
   std::unique_ptr<platf::deinit_t> init(const std::filesystem::path &persistence_filepath, const config::video_t &video_config) {
@@ -898,6 +881,11 @@ namespace display_device {
       // order, so nothing can take a new one until this has finished.
       revert_configuration();
     });
+
+    // A restore still being retried belongs to a scheduler that is about to
+    // be replaced, so it is settled before that happens rather than being
+    // left waiting for a retry that can never come.
+    restore_transaction().abandon();
 
     std::lock_guard lock {DD_DATA.mutex};
     // We can support re-init without any issues, however we should make sure to clean up first!
@@ -1120,16 +1108,14 @@ namespace display_device {
     }
 
     // A virtual display is involved, so the order matters and the ordinary
-    // revert cannot be used: it returns before doing anything. The saved
-    // configuration goes back first, and only then is the display removed.
-    if (!revert_configuration_and_wait(REVERT_TIMEOUT)) {
+    // revert cannot be used: it returns before doing anything. The transaction
+    // restores first and gives the display back only once that has worked,
+    // and a second caller joins it rather than starting a competing one.
+    const auto generation {virtual_display::manager().generation()};
+    if (!restore_transaction().run(generation, REVERT_TIMEOUT)) {
       BOOST_LOG(warning) << "The display configuration is not restored yet, so the virtual display stays "
                             "until it is. No session can start in the meantime.";
-      revert_then_release_in_background();
-      return;
     }
-
-    virtual_display::manager().release();
   }
 
   bool reset_persistence() {

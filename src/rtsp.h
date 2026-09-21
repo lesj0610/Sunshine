@@ -52,13 +52,57 @@ namespace rtsp_stream {
    * @param launch_session Session state prepared by the GameStream launch handler.
    */
   /**
-   * @brief Queue a launch session for the RTSP handshake.
+   * @brief A claim on the one pending-launch slot.
    *
-   * @param launch_session Session to queue.
-   * @return False if a launch is already pending, in which case this one was
-   *         not queued and the caller must undo whatever it prepared.
+   * Taken before anything with a side effect happens, so a request that is
+   * going to lose the race finds out before it starts an app or takes a
+   * display rather than after. Releasing without committing gives the slot
+   * back.
    */
-  [[nodiscard]] bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  class launch_reservation_t {
+  public:
+    launch_reservation_t() = default;
+    explicit launch_reservation_t(bool held);
+    ~launch_reservation_t();
+
+    launch_reservation_t(launch_reservation_t &&other) noexcept;
+    launch_reservation_t &operator=(launch_reservation_t &&other) noexcept;
+
+    launch_reservation_t(const launch_reservation_t &) = delete;
+    launch_reservation_t &operator=(const launch_reservation_t &) = delete;
+
+    /**
+     * @brief Whether the slot was claimed.
+     */
+    explicit operator bool() const {
+      return m_held;
+    }
+
+    /**
+     * @brief Hand the session over and keep the slot.
+     *
+     * @param launch_session Session the client will connect for.
+     * @return True if the session was queued.
+     */
+    bool commit(std::shared_ptr<launch_session_t> launch_session);
+
+  private:
+    bool m_held {false};
+  };
+
+  /**
+   * @brief Claim the pending-launch slot.
+   *
+   * @return A claim, which is false if another launch already holds it.
+   *
+   * @examples
+   * auto reservation { reserve_launch_session() };
+   * if (!reservation) {
+   *   // refuse, without having started anything
+   * }
+   * @examples_end
+   */
+  [[nodiscard]] launch_reservation_t reserve_launch_session();
 
   /**
    * @brief Clear state for the specified launch session.
