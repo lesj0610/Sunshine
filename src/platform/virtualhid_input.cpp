@@ -21,6 +21,7 @@
 // local includes
 #include "src/config.h"
 #include "src/logging.h"
+#include "src/platform/keyboard_lang_keys.h"
 #include "virtualhid_input.h"
 
 using namespace std::literals;
@@ -313,6 +314,14 @@ namespace platf::virtualhid {
 #ifdef _WIN32
       event.uses_normalized_key_code = (static_cast<std::byte>(flags) & static_cast<std::byte>(SS_KBE_FLAG_NON_NORMALIZED)) == std::byte {};
       event.prefer_native_scan_code = config::input.always_send_scancodes;
+
+      // The Korean IME keys share their virtual key codes with the Japanese ones,
+      // so the active keyboard layout cannot tell them apart. When the client
+      // tagged the event with a LANG flag, submit the Korean scan code directly
+      // instead of letting the layout translate the ambiguous key code.
+      if (const auto scan_code = platf::keyboard::lang_scan_code(modcode, flags)) {
+        event.scan_code = *scan_code;
+      }
 #else
       (void) flags;
 #endif
