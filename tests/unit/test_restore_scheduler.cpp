@@ -182,3 +182,118 @@ TEST_F(RestoreSchedulerTest, AbandoningWhileTheSchedulerRetriesDoesNotStrandTheL
 
   scheduler->stop();
 }
+
+namespace {
+
+  /**
+   * @brief Lets a test hold a release open and let it go on demand.
+   */
+  struct release_gate_t {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool open {false};
+    int arrived {};
+
+    void wait() {
+      std::unique_lock lock {mutex};
+      arrived += 1;
+      cv.notify_all();
+      cv.wait(lock, [this] {
+        return open;
+      });
+    }
+
+    void await_arrival() {
+      std::unique_lock lock {mutex};
+      cv.wait(lock, [this] {
+        return arrived > 0;
+      });
+    }
+
+    void release() {
+      {
+        std::lock_guard lock {mutex};
+        open = true;
+      }
+      cv.notify_all();
+    }
+  };
+
+}  // namespace
+
+TEST_F(RestoreSchedulerTest, ASecondRunJoinsOneThatIsStillReleasing) {
+  // While the release is in progress the run is still current, so a second
+  // caller waits on it rather than starting a restore of its own.
+  auto settings = std::make_unique<fake_settings_t>();
+  auto *settings_raw = settings.get();
+  auto scheduler = std::make_shared<scheduler_t>(std::move(settings));
+
+  auto gate = std::make_shared<release_gate_t>();
+  std::atomic<int> releases {0};
+  auto transaction = make_transaction(scheduler, [gate, &releases](std::uint64_t) {
+    releases += 1;
+    gate->wait();
+    return true;
+  });
+
+  auto first = std::async(std::launch::async, [&transaction] {
+    return transaction->run(7, 10s);
+  });
+  gate->await_arrival();
+
+  // Called from here rather than another thread, so it definitely happens
+  // while the release is still in progress. It joins the run that is already
+  // going, which cannot settle until the gate opens, so it times out rather
+  // than starting a restore of its own.
+  EXPECT_FALSE(transaction->run(7, 50ms));
+  EXPECT_EQ(releases.load(), 1);
+  EXPECT_EQ(settings_raw->attempts(), 1);
+
+  gate->release();
+
+  EXPECT_TRUE(first.get());
+  EXPECT_EQ(releases.load(), 1);
+  EXPECT_EQ(settings_raw->attempts(), 1);
+
+  // And once it is over, the next caller gets a run of its own.
+  EXPECT_FALSE(transaction->pending());
+}
+
+TEST_F(RestoreSchedulerTest, ASucceedingRetryAndAbandonFinishTheRunOnce) {
+  // The retry succeeds while a teardown is trying to give up. Exactly one of
+  // them releases the lease and settles the run.
+  auto settings = std::make_unique<fake_settings_t>();
+  settings->fail_first = 1;
+  auto scheduler = std::make_shared<scheduler_t>(std::move(settings));
+
+  auto gate = std::make_shared<release_gate_t>();
+  std::atomic<int> releases {0};
+  auto transaction = make_transaction(
+    scheduler,
+    [gate, &releases](std::uint64_t) {
+      releases += 1;
+      gate->wait();
+      return true;
+    },
+    50ms
+  );
+
+  ASSERT_FALSE(transaction->run(12, 20ms));
+
+  // The retry gets there first and is held inside the release.
+  gate->await_arrival();
+
+  auto abandoning = std::async(std::launch::async, [&transaction] {
+    transaction->abandon();
+  });
+  std::this_thread::sleep_for(20ms);
+  gate->release();
+
+  ASSERT_EQ(abandoning.wait_for(10s), std::future_status::ready);
+  abandoning.get();
+
+  EXPECT_EQ(releases.load(), 1);
+  EXPECT_FALSE(transaction->pending());
+
+  scheduler->stop();
+}

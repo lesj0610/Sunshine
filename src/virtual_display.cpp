@@ -703,6 +703,12 @@ namespace virtual_display {
         return true;
       }
 
+      if (impl.state == state_e::reverting) {
+        // Another caller is already giving this lease back. Joining in would
+        // mean a second removal and a second close for one display.
+        return true;
+      }
+
       heartbeat = std::exchange(impl.heartbeat, nullptr);
       backend = impl.backend;
       id = impl.id;
@@ -810,11 +816,16 @@ namespace virtual_display {
     std::uint64_t generation {};
     std::shared_ptr<std::promise<bool>> outcome;
     std::shared_future<bool> result;
+
+    /// Whether someone has taken on finishing this run. Guarded by the
+    /// transaction's mutex, so deciding to finish and being allowed to are
+    /// the same step and only one caller can win.
+    bool completion_claimed {false};
+
     std::atomic<bool> settled {false};
-    std::atomic<bool> cancelled {false};
 
     /**
-     * @brief Finish, at most once.
+     * @brief Hand the answer to whoever is waiting, at most once.
      *
      * @param restored Whether the configuration went back.
      */
@@ -842,22 +853,43 @@ namespace virtual_display {
      * @brief Whether a run still speaks for the transaction.
      *
      * @param run The run to check.
-     * @return True if it is the current one and has not been cancelled.
+     * @return True if it is the current one.
      */
     bool is_current(const std::shared_ptr<restore_run_t> &run) const {
-      if (run->cancelled) {
-        return false;
-      }
       std::lock_guard lock {mutex};
       return current && current->epoch == run->epoch;
     }
 
     /**
-     * @brief Stop calling a run finished, whatever happens to it next.
+     * @brief Take on finishing a run, if nobody else has.
      *
-     * @param run The run to retire.
+     * A retry that has just restored and a teardown that wants to give up
+     * both arrive here, and they must not both go on to release the lease.
+     * Checking that the run is current and claiming it happen together, so
+     * exactly one of them wins.
+     *
+     * @param run The run to finish.
+     * @return True if this caller is now the one that must release and settle.
      */
-    void retire(const std::shared_ptr<restore_run_t> &run) {
+    bool claim_completion(const std::shared_ptr<restore_run_t> &run) {
+      std::lock_guard lock {mutex};
+      if (!current || current->epoch != run->epoch || run->completion_claimed) {
+        return false;
+      }
+      run->completion_claimed = true;
+      return true;
+    }
+
+    /**
+     * @brief Let go of a run, once it has been released and settled.
+     *
+     * Last, not first: while a run is still current a second caller joins
+     * its result rather than starting a restore of its own, which is what
+     * keeps two of them from running while one is mid-release.
+     *
+     * @param run The run that is finished.
+     */
+    void finish(const std::shared_ptr<restore_run_t> &run) {
       std::lock_guard lock {mutex};
       if (current && current->epoch == run->epoch) {
         current.reset();
@@ -902,8 +934,8 @@ namespace virtual_display {
       auto impl = m_impl;
       const auto finish = [impl, run](const attempt_fn_t &attempt) {
         if (!impl->is_current(run)) {
-          // Queued for a run that has been retired. Doing anything here
-          // would act on a lease this callback knows nothing about.
+          // Queued for a run that is over. Doing anything here would act on
+          // a lease this callback knows nothing about.
           return true;
         }
 
@@ -911,15 +943,17 @@ namespace virtual_display {
           return false;
         }
 
-        if (!impl->is_current(run)) {
+        if (!impl->claim_completion(run)) {
+          // Someone else is finishing this run. Two releases for one lease
+          // is the thing the claim exists to prevent.
           return true;
         }
 
-        impl->retire(run);
         if (impl->release) {
           impl->release(run->generation);
         }
         run->settle(true);
+        impl->finish(run);
         return true;
       };
 
@@ -932,8 +966,10 @@ namespace virtual_display {
               return finish(attempt);
             })) {
           BOOST_LOG(error) << "Nothing can retry restoring the display configuration"sv;
-          m_impl->retire(run);
-          run->settle(false);
+          if (m_impl->claim_completion(run)) {
+            run->settle(false);
+            m_impl->finish(run);
+          }
         }
       }
     }
@@ -953,15 +989,19 @@ namespace virtual_display {
     std::shared_ptr<restore_run_t> run;
     {
       std::lock_guard lock {m_impl->mutex};
-      run = std::exchange(m_impl->current, nullptr);
+      run = m_impl->current;
     }
     if (!run) {
       return;
     }
 
-    // Retired first, so a retry already queued for it finds it is no longer
-    // current and leaves the next transaction alone.
-    run->cancelled = true;
+    if (!m_impl->claim_completion(run)) {
+      // A retry got there first and is finishing the run. Waiting for it
+      // means this returns with the transaction actually over, and without
+      // a second release for the same lease.
+      run->result.wait();
+      return;
+    }
 
     BOOST_LOG(warning) << "The display stack is going away while a restore is outstanding. "
                           "One last attempt, then the virtual display is given back either way, "
@@ -974,6 +1014,7 @@ namespace virtual_display {
       m_impl->release(run->generation);
     }
     run->settle(false);
+    m_impl->finish(run);
   }
 
   manager_t &manager() {
