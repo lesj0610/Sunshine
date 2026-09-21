@@ -165,7 +165,7 @@ namespace virtual_display {
         factory->Release();
       }
 
-      bool add(const uuid_util::uuid_t &id, const std::string &client_name, const std::string &client_uid, const mode_t &mode) override {
+      creation_e add(const uuid_util::uuid_t &id, const std::string &client_name, const std::string &client_uid, const mode_t &mode) override {
         SUDOVDA::VIRTUAL_DISPLAY_ADD_PARAMS params {
           static_cast<UINT>(mode.width),
           static_cast<UINT>(mode.height),
@@ -181,19 +181,21 @@ namespace virtual_display {
         const auto result = call(IOCTL_ADD_VIRTUAL_DISPLAY, &params, sizeof(params), &out, sizeof(out));
         if (!result.ok) {
           BOOST_LOG(error) << "Virtual display driver refused to add a display (error "sv << result.error << ')';
-          return false;
+          return creation_e::not_created;
         }
         if (result.bytes_returned != sizeof(out)) {
-          // Without a complete answer there is no adapter or target to find
-          // the display by, so it is treated as not created.
+          // The driver took the request, so a display may well exist, but the
+          // answer is too short to hold the adapter and target needed to find
+          // it. Reported as created so the caller removes it rather than
+          // leaving a display nothing can reach.
           BOOST_LOG(error) << "Virtual display driver answered the add request with "sv
                            << result.bytes_returned << " bytes instead of "sv << sizeof(out);
-          return false;
+          return creation_e::created_unverifiable;
         }
 
         std::lock_guard lock {m_mutex};
         m_targets[id.string()] = out;
-        return true;
+        return creation_e::created;
       }
 
       bool remove(const uuid_util::uuid_t &id) override {
@@ -227,10 +229,10 @@ namespace virtual_display {
         }
 
         if (!mode_offered(identity->gdi_name_w, mode)) {
-          return {resolution_t::state_e::mode_missing, {}};
+          return {resolution_t::readiness_e::mode_missing, {}};
         }
 
-        return {resolution_t::state_e::ready, {{}, identity->gdi_name}};
+        return {resolution_t::readiness_e::ready, {{}, identity->gdi_name}};
       }
 
     private:

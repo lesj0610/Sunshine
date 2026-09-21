@@ -1384,25 +1384,25 @@ namespace nvhttp {
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args);
 
+    // Checked whether or not other sessions exist. There is one capture
+    // output, so a second session cannot be given a display of its own, and
+    // handing it the first session's would silently give it that session's
+    // resolution.
+    if (const auto reason {display_device::prepare_virtual_display(*launch_session)}) {
+      BOOST_LOG(error) << "Refusing to start a session: "sv << *reason;
+
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Could not prepare a virtual display: " + *reason);
+      tree.put("root.gamesession", 0);
+
+      return;
+    }
+
+    // Set as soon as anything has been prepared, whether or not the block
+    // below runs, so the guard undoes a lease taken just now.
+    revert_display_configuration = true;
+
     if (rtsp_stream::session_count() == 0) {
-      // The display should be restored in case something fails as there are no other sessions.
-      revert_display_configuration = true;
-
-      // A session configured to stream a virtual display gets one before
-      // anything looks at the displays, so both the configuration and the
-      // encoder probe below act on the display it will actually stream. If it
-      // cannot be had the session is refused: falling back to a monitor would
-      // then change that monitor's resolution, which is what the option is
-      // there to avoid.
-      if (const auto reason {display_device::prepare_virtual_display(*launch_session)}) {
-        BOOST_LOG(error) << "Refusing to start a session: "sv << *reason;
-
-        tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", "Could not prepare a virtual display: " + *reason);
-        tree.put("root.gamesession", 0);
-
-        return;
-      }
 
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
@@ -1462,8 +1462,10 @@ namespace nvhttp {
     );
     if (!rtsp_stream::launch_session_raise(launch_session)) {
       // Another launch is already waiting for its client, so this one will
-      // never be picked up and whatever was prepared for it has to go back.
+      // never be picked up and everything done for it has to go back,
+      // including the app that was just started for it.
       BOOST_LOG(error) << "Rejecting a launch while another is still waiting for its client"sv;
+      proc::proc.terminate();
 
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message", "Another launch is already in progress");
@@ -1538,20 +1540,20 @@ namespace nvhttp {
     }
     const auto launch_session = make_launch_session(host_audio, args);
 
+    // See the launch path: checked whether or not other sessions exist.
+    if (const auto reason {display_device::prepare_virtual_display(*launch_session)}) {
+      BOOST_LOG(error) << "Refusing to resume a session: "sv << *reason;
+
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Could not prepare a virtual display: " + *reason);
+
+      return;
+    }
+
+    revert_display_configuration = true;
+
     if (no_active_sessions) {
-      revert_display_configuration = true;
-
-      // See the launch path: the virtual display comes first, and the session
-      // is refused rather than served from a monitor.
-      if (const auto reason {display_device::prepare_virtual_display(*launch_session)}) {
-        BOOST_LOG(error) << "Refusing to resume a session: "sv << *reason;
-
-        tree.put("root.resume", 0);
-        tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", "Could not prepare a virtual display: " + *reason);
-
-        return;
-      }
 
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could

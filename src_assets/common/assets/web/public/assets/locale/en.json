@@ -231,7 +231,7 @@
     "dd_refresh_rate_option_disabled": "Do not change refresh rate",
     "dd_refresh_rate_option_manual": "Use manually entered refresh rate",
     "dd_virtual_display": "Use a virtual display",
-    "dd_virtual_display_desc": "Stream a display created for the session instead of one of your monitors. The resolution the client asks for does not have to be one your monitors support, and what is on them is left alone. Requires the SudoVDA virtual display driver, which the Sunshine installer sets up.",
+    "dd_virtual_display_desc": "Stream a display created for the session instead of one of your monitors. The resolution the client asks for does not have to be one your monitors support. Whether your monitors are left alone depends on \"Device configuration\": \"Verify\" and \"Activate\" leave them as they are, while \"Make primary\" and \"Only display\" change them. Requires the SudoVDA virtual display driver, which the Sunshine installer sets up; without it the session is refused rather than streamed from a monitor. One session at a time.",
     "dd_resolution_option": "Resolution",
     "dd_resolution_option_auto": "Use resolution provided by the client (default)",
     "dd_resolution_option_disabled": "Do not change resolution",

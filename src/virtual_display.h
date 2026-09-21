@@ -44,7 +44,22 @@ namespace virtual_display {
     create_failed,  ///< The driver refused to create the display.
     not_ready,  ///< Windows did not bring the display up in time.
     mode_unavailable,  ///< The display came up but does not offer the requested mode.
-    already_leased  ///< Another session already holds the lease.
+    already_leased,  ///< Another session already holds the lease.
+    busy  ///< A driver call has not come back, so nothing may be asked of it yet.
+  };
+
+  /**
+   * @brief What the lease is doing.
+   *
+   * Reserved under one lock at the start of an acquire, so two requests
+   * arriving together cannot both decide the lease is free.
+   */
+  enum class state_e {
+    idle,  ///< No display, and a session may take one.
+    provisioning,  ///< A session is in the middle of taking one.
+    active,  ///< A session holds a display.
+    reverting,  ///< The display is being given back.
+    poisoned  ///< A driver call never came back; nothing may be asked of the driver.
   };
 
   /**
@@ -91,17 +106,26 @@ namespace virtual_display {
   /**
    * @brief What a readiness check found.
    */
+  /**
+   * @brief How an attempt to create a display turned out.
+   */
+  enum class creation_e {
+    not_created,  ///< The driver refused. Nothing exists.
+    created,  ///< The display exists and the driver described it.
+    created_unverifiable  ///< The driver accepted it but did not describe it, so it may well exist.
+  };
+
   struct resolution_t {
     /**
      * @brief How far along the display is.
      */
-    enum class state_e {
+    enum class readiness_e {
       not_ready,  ///< Windows has not brought the display up, or it is missing an identity.
       mode_missing,  ///< The display is up but does not offer the requested mode.
       ready  ///< Usable.
     };
 
-    state_e state {state_e::not_ready};
+    readiness_e state {readiness_e::not_ready};
     display_t display {};  ///< Meaningful only when state is ready.
   };
 
@@ -167,9 +191,12 @@ namespace virtual_display {
      * @param client_name Client name, stamped into the monitor name.
      * @param client_uid Client identifier, stamped into the monitor serial.
      * @param mode Mode the display should offer.
-     * @return True if the driver accepted it.
+     * @return Whether a display was created, and whether the driver said
+     *         enough about it to find it again. An answer that cannot be
+     *         trusted still means a display may exist, so it has to be
+     *         removable rather than forgotten.
      */
-    virtual bool add(const uuid_util::uuid_t &id, const std::string &client_name, const std::string &client_uid, const mode_t &mode) = 0;
+    virtual creation_e add(const uuid_util::uuid_t &id, const std::string &client_name, const std::string &client_uid, const mode_t &mode) = 0;
 
     /**
      * @brief Remove a display this process created.
@@ -202,6 +229,15 @@ namespace virtual_display {
   [[nodiscard]] std::unique_ptr<backend_t> make_backend();
 
   /**
+   * @brief Makes a backend on demand.
+   *
+   * A driver that stopped answering is thrown away rather than reused, so the
+   * lease needs to be able to ask for a new one rather than being handed a
+   * single instance up front.
+   */
+  using backend_factory_t = std::function<std::unique_ptr<backend_t>()>;
+
+  /**
    * @brief How long the lease waits for things that are not instant.
    */
   struct timeouts_t {
@@ -220,11 +256,12 @@ namespace virtual_display {
   class manager_t {
   public:
     /**
-     * @param backend Driver backend. May be null, which makes every acquire fail.
-     * @param device_id_lookup Translates a GDI name to the id Sunshine uses.
+     * @param make Makes the driver backend. May return null, or be null
+     *             itself, which makes every acquire fail.
+     * @param device_id_lookup Translates a platform display name to the id Sunshine uses.
      * @param timeouts Waits to apply.
      */
-    manager_t(std::unique_ptr<backend_t> backend, device_id_lookup_t device_id_lookup, timeouts_t timeouts = {});
+    manager_t(backend_factory_t make, device_id_lookup_t device_id_lookup, timeouts_t timeouts = {});
     ~manager_t();
 
     manager_t(const manager_t &) = delete;
@@ -266,6 +303,26 @@ namespace virtual_display {
      * @brief Whether a session currently holds the lease.
      */
     [[nodiscard]] bool leased() const;
+
+    /**
+     * @brief What the lease is doing.
+     */
+    [[nodiscard]] state_e state() const;
+
+    /**
+     * @brief Say what to do when the driver stops answering mid-session.
+     *
+     * The display is gone at that point, so the session streaming it cannot
+     * continue, and the host is left configured for a display that no longer
+     * exists. Putting that right means stopping the stream and reverting,
+     * which is not this class's business, so it is handed out instead.
+     *
+     * The handler runs on its own thread and must return before a new lease
+     * can be taken.
+     *
+     * @param handler What to run. Replaces any previous handler.
+     */
+    void set_fault_handler(std::function<void()> handler);
 
     /**
      * @brief The display Sunshine should be configuring and capturing.

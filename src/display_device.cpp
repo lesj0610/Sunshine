@@ -58,6 +58,16 @@ namespace display_device {
     constexpr std::chrono::milliseconds APPLY_TIMEOUT {15000};
 
     /**
+     * @brief How long a caller waits for a configuration to be restored.
+     *
+     * Only used where the answer matters, which is when a virtual display is
+     * waiting to be removed. Removing it first would take away the display
+     * the restore works against, so the restore has to finish, and the usual
+     * revert delay would mean holding the display for no reason.
+     */
+    constexpr std::chrono::milliseconds REVERT_TIMEOUT {15000};
+
+    /**
      * @brief A global for the settings manager interface and other settings whose lifetime is managed by `display_device::init(...)`.
      */
     struct {
@@ -771,9 +781,84 @@ namespace display_device {
       },
                                     scheduler_option);
     }
+
+    /**
+     * @brief Restore the saved configuration and wait to hear whether it took.
+     *
+     * The ordinary revert is deliberately unhurried: it waits out a delay and
+     * then keeps retrying in the background, and never tells anyone how it
+     * went. That is fine when nothing is waiting on it. It is not fine when a
+     * virtual display is being taken away, because removing the display
+     * before the restore has run leaves the restore working against a display
+     * that is no longer there.
+     *
+     * @param timeout How long to wait for a final answer.
+     * @return True once the configuration is restored, false if it failed or
+     *         had not finished in time.
+     */
+    bool revert_configuration_and_wait(std::chrono::milliseconds timeout) {
+      auto outcome {std::make_shared<std::promise<bool>>()};
+      auto settled {std::make_shared<std::atomic<bool>>(false)};
+      auto reverted {outcome->get_future()};
+
+      {
+        std::lock_guard lock {DD_DATA.mutex};
+        if (!DD_DATA.sm_instance) {
+          // Platform is not supported, so there was nothing to restore.
+          return true;
+        }
+
+        // No delay and no waiting for devices to change: something is holding
+        // on for this answer.
+        DD_DATA.sm_instance->schedule([outcome, settled](auto &settings_iface, auto &stop_token) {
+          using enum SettingsManagerInterface::RevertResult;
+
+          const auto result {settings_iface.revertSettings()};
+          if (result == ApiTemporarilyUnavailable) {
+            // Do nothing and retry next time
+            return;
+          }
+
+          if (result != Ok) {
+            BOOST_LOG(error) << "Failed to revert display device configuration.";
+          }
+
+          if (!settled->exchange(true)) {
+            outcome->set_value(result == Ok);
+          }
+          stop_token.requestStop();
+        },
+                                      {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
+      }
+
+      // Waited on outside the lock: retries run on the scheduler's own thread,
+      // which needs the interface this lock guards.
+      if (reverted.wait_for(timeout) != std::future_status::ready) {
+        BOOST_LOG(error) << "Display device configuration was not restored within "
+                         << timeout.count() << "ms.";
+        return false;
+      }
+
+      return reverted.get();
+    }
   }  // namespace
 
   std::unique_ptr<platf::deinit_t> init(const std::filesystem::path &persistence_filepath, const config::video_t &video_config) {
+    // When the driver drops a display mid-session, whatever is streaming it
+    // is streaming nothing, and the host is left configured for a display
+    // that no longer exists. Neither is the lease's to put right, so it asks.
+    virtual_display::manager().set_fault_handler([] {
+      BOOST_LOG(error) << "The virtual display being streamed is gone. Ending the session.";
+
+      // Ended first: a session capturing a display that no longer exists
+      // cannot be left running while the host is reconfigured underneath it.
+      rtsp_stream::terminate_sessions();
+
+      // Restores the configuration and then gives up the lease, in that
+      // order, so nothing can take a new one until this has finished.
+      revert_configuration();
+    });
+
     std::lock_guard lock {DD_DATA.mutex};
     // We can support re-init without any issues, however we should make sure to clean up first!
     revert_configuration_unlocked(revert_option_e::try_once);
@@ -890,6 +975,14 @@ namespace display_device {
       return std::nullopt;
     }
 
+    // There is one capture output, so a virtual display can only be used by a
+    // session that has the host to itself. Sharing the first session's
+    // display would silently give this one that session's resolution, and
+    // taking a new one would move the running session's capture.
+    if (rtsp_stream::session_count() != 0 && !virtual_display::manager().leased()) {
+      return "another session is already streaming, and a virtual display cannot be shared";
+    }
+
     const auto mode {virtual_display::requested_mode(session)};
     auto result {virtual_display::manager().acquire(
       session.client_name,
@@ -980,15 +1073,24 @@ namespace display_device {
   }
 
   void revert_configuration() {
-    // The saved configuration is restored first. Removing the virtual display
-    // before that would take away the display the restore is working against.
-    {
+    if (virtual_display::manager().state() == virtual_display::state_e::idle) {
       std::lock_guard lock {DD_DATA.mutex};
       revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
+      return;
     }
 
-    // Releasing after the revert, and unconditionally, so a lease is never
-    // left holding a display that no session is using.
+    // A virtual display is involved, so the order matters and the ordinary
+    // revert cannot be used: it returns before doing anything. The saved
+    // configuration goes back first, and only then is the display removed.
+    if (!revert_configuration_and_wait(REVERT_TIMEOUT)) {
+      BOOST_LOG(warning) << "Removing the virtual display before the display configuration was restored. "
+                            "The configuration will keep being retried in the background.";
+
+      // Something has to keep trying, since the awaited attempt gave up.
+      std::lock_guard lock {DD_DATA.mutex};
+      revert_configuration_unlocked(revert_option_e::try_indefinitely);
+    }
+
     virtual_display::manager().release();
   }
 

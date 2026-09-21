@@ -13,6 +13,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -594,6 +595,11 @@ namespace rtsp_stream {
      * @param launch_session Streaming session information.
      */
     bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      // Held across the check and the raise. Two requests arriving together
+      // would otherwise both find the slot empty and the second would
+      // silently replace the first.
+      std::lock_guard raise_lock {raise_mutex};
+
       // If a launch event is still pending, don't overwrite it.
       if (launch_event.view(0s)) {
         return false;
@@ -650,6 +656,7 @@ namespace rtsp_stream {
       return (int) _session_slots->size();
     }
 
+    std::mutex raise_mutex;  ///< Makes claiming the launch slot a single step.
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
 
     /**
