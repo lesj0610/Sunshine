@@ -445,16 +445,20 @@ TEST_F(VirtualDisplayTest, ReleaseWithoutALeaseTouchesNothing) {
   EXPECT_EQ(log->removes, 0);
 }
 
-TEST_F(VirtualDisplayTest, AFailedRemoveStillGivesUpTheLease) {
-  // The driver's watchdog will drop the display once Sunshine stops answering,
-  // so holding the lease open would only stop the next session from starting.
+TEST_F(VirtualDisplayTest, ARefusedRemoveOnTeardownKeepsTheDriverOutOfUse) {
+  // A removal the driver said no to leaves a display behind, so the lease
+  // cannot be called finished: the next session would start on top of it.
   auto [log, gate, ping_gate, manager] = make_rig({.remove_succeeds = false});
   ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
 
   manager->release();
 
   EXPECT_FALSE(manager->leased());
-  EXPECT_EQ(log->removes, 1);
+  EXPECT_EQ(manager->state(), virtual_display::state_e::poisoned);
+  EXPECT_EQ(error_of(manager->acquire("Next", "uid-2", k_mode, "")), virtual_display::error_e::busy);
+
+  std::lock_guard lock {log->mutex};
+  EXPECT_EQ(log->adds, 1);
 }
 
 TEST_F(VirtualDisplayTest, EachLeaseUsesAnIdentifierOfItsOwn) {
@@ -925,7 +929,7 @@ namespace {
     std::optional<bool> answer {true};
 
     /// Retries are held here until the test runs them.
-    std::vector<std::function<void()>> queued;
+    std::vector<std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)>> queued;
 
     std::optional<bool> try_restore() {
       std::lock_guard lock {mutex};
@@ -934,13 +938,13 @@ namespace {
       return answer;
     }
 
-    bool schedule(std::function<void()> work) {
+    bool start_retries(std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)> finish) {
       std::lock_guard lock {mutex};
       if (scheduler_gone) {
         return false;
       }
       schedules += 1;
-      queued.push_back(std::move(work));
+      queued.push_back(std::move(finish));
       cv.notify_all();
       return true;
     }
@@ -952,15 +956,21 @@ namespace {
       return true;
     }
 
-    /// Run whatever retries are waiting.
+    /// Run whatever retries are waiting, the way the scheduler would.
     void drain() {
-      std::vector<std::function<void()>> work;
+      std::vector<std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)>> work;
       {
         std::lock_guard lock {mutex};
         work.swap(queued);
       }
       for (auto &fn : work) {
-        fn();
+        const bool done = fn([this] {
+          return try_restore();
+        });
+        if (!done) {
+          std::lock_guard lock {mutex};
+          queued.push_back(fn);
+        }
       }
     }
 
@@ -980,8 +990,8 @@ namespace {
       [fake] {
         return fake->try_restore();
       },
-      [fake](std::function<void()> work) {
-        return fake->schedule(std::move(work));
+      [fake](std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)> finish) {
+        return fake->start_retries(std::move(finish));
       },
       [fake](std::uint64_t generation) {
         return fake->release(generation);
@@ -1116,4 +1126,78 @@ TEST_F(RestoreTransactionTest, ABusyApiIsRetriedRatherThanTreatedAsFailure) {
 
   std::lock_guard lock {fake->mutex};
   EXPECT_EQ(fake->releases, 1);
+}
+
+TEST_F(RestoreTransactionTest, AQueuedRetryDoesNotTouchTheNextTransaction) {
+  // A retry left over from an abandoned run must not act on the lease that
+  // came after it.
+  auto fake = std::make_shared<fake_restore_t>();
+  fake->answer = false;
+  auto transaction = make_transaction(fake);
+
+  ASSERT_FALSE(transaction->run(10, 100ms));
+  ASSERT_TRUE(transaction->pending());
+
+  // Keep the queued retry, but retire the run it belongs to.
+  std::vector<std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)>> stale;
+  {
+    std::lock_guard lock {fake->mutex};
+    stale.swap(fake->queued);
+    fake->scheduler_gone = true;
+  }
+  transaction->abandon();
+
+  const auto releases_after_abandon = [&] {
+    std::lock_guard lock {fake->mutex};
+    return fake->releases;
+  }();
+
+  // A new transaction for the next lease.
+  {
+    std::lock_guard lock {fake->mutex};
+    fake->scheduler_gone = false;
+    fake->answer = true;
+  }
+  ASSERT_TRUE(transaction->run(11, 5s));
+
+  // Now the leftover retry finally runs.
+  for (auto &fn : stale) {
+    EXPECT_TRUE(fn([fake] {
+      return fake->try_restore();
+    }));
+  }
+
+  std::lock_guard lock {fake->mutex};
+  // One release for the abandoned run, one for the new one, and nothing from
+  // the leftover retry.
+  EXPECT_EQ(fake->releases, releases_after_abandon + 1);
+  EXPECT_EQ(fake->released_generations.back(), 11u);
+  EXPECT_EQ(std::count(fake->released_generations.begin(), fake->released_generations.end(), 11u), 1);
+}
+
+TEST_F(RestoreTransactionTest, AbandonRacingARunningRetryEndsCleanly) {
+  auto fake = std::make_shared<fake_restore_t>();
+  fake->answer = false;
+  auto transaction = make_transaction(fake);
+
+  ASSERT_FALSE(transaction->run(4, 100ms));
+
+  auto retrying = std::async(std::launch::async, [&fake] {
+    for (int i = 0; i < 50; ++i) {
+      fake->drain();
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+  auto abandoning = std::async(std::launch::async, [&transaction] {
+    std::this_thread::sleep_for(5ms);
+    transaction->abandon();
+  });
+
+  retrying.get();
+  abandoning.get();
+
+  EXPECT_FALSE(transaction->pending());
+  std::lock_guard lock {fake->mutex};
+  // The lease is given back exactly once however the two interleave.
+  EXPECT_EQ(std::count(fake->released_generations.begin(), fake->released_generations.end(), 4u), 1);
 }

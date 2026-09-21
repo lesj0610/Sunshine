@@ -667,6 +667,24 @@ namespace virtual_display {
   }
 
   void manager_t::release() {
+    std::ignore = release_impl(std::nullopt);
+  }
+
+  bool manager_t::release_generation(std::uint64_t generation) {
+    return release_impl(generation);
+  }
+
+  /**
+   * @brief Give the display back, optionally only if the lease is still the expected one.
+   *
+   * The check and the claim happen together. Doing them in separate critical
+   * sections would let a lease change hands in between, and a restore that
+   * outlived its lease would end the next one.
+   *
+   * @param expected_generation The lease the caller means to end, or nothing for whichever is current.
+   * @return False only when the lease had already moved on.
+   */
+  bool manager_t::release_impl(std::optional<std::uint64_t> expected_generation) {
     auto &impl = *m_impl;
 
     std::shared_ptr<heartbeat_t> heartbeat;
@@ -677,8 +695,12 @@ namespace virtual_display {
 
     {
       std::lock_guard lock {impl.mutex};
+      if (expected_generation && *expected_generation != impl.generation) {
+        return false;
+      }
+
       if (impl.state == state_e::idle) {
-        return;
+        return true;
       }
 
       heartbeat = std::exchange(impl.heartbeat, nullptr);
@@ -703,7 +725,7 @@ namespace virtual_display {
       // Nothing may be asked of the driver until the call it has not answered
       // comes back. Tried now in case it already has.
       impl.try_recover();
-      return;
+      return true;
     }
 
     if (backend) {
@@ -713,10 +735,23 @@ namespace virtual_display {
         const auto removed = impl.call<bool>([backend, id] {
           return backend->remove(id);
         });
+
         if (!removed.value_or(false)) {
-          BOOST_LOG(warning) << "Could not remove the virtual display. The driver drops it once Sunshine "
-                                "stops answering its watchdog."sv;
+          // The display may well still be there. Calling this done would let
+          // the next session start on top of it, so the lease keeps the
+          // identifier and stays out of use until a removal succeeds.
+          BOOST_LOG(warning) << "The virtual display driver did not remove the display. No session can "
+                                "use it until it does."sv;
+
+          std::lock_guard lock {impl.mutex};
+          if (impl.state == state_e::reverting) {
+            impl.state = state_e::poisoned;
+          }
+          return true;
         }
+
+        std::lock_guard lock {impl.mutex};
+        impl.display_may_exist = false;
       }
 
       impl.call<bool>([backend] {
@@ -731,6 +766,7 @@ namespace virtual_display {
       impl.display_may_exist = false;
       impl.state = state_e::idle;
     }
+    return true;
   }
 
   bool manager_t::leased() const {
@@ -748,19 +784,6 @@ namespace virtual_display {
     return m_impl->generation;
   }
 
-  bool manager_t::release_generation(std::uint64_t generation) {
-    {
-      std::lock_guard lock {m_impl->mutex};
-      if (m_impl->generation != generation) {
-        // A restore that took so long the lease it was for has already gone.
-        return false;
-      }
-    }
-
-    release();
-    return true;
-  }
-
   void manager_t::set_fault_handler(std::function<void()> handler) {
     std::lock_guard lock {m_impl->mutex};
     m_impl->fault_handler = std::move(handler);
@@ -775,18 +798,20 @@ namespace virtual_display {
   }
 
   /**
-   * @brief The one restore in progress, and who it is for.
+   * @brief One run of a restore, fixed at the moment it starts.
+   *
+   * Callbacks hold this by value rather than reading the transaction, so a
+   * retry that was queued for one run can tell it no longer speaks for the
+   * transaction and do nothing, instead of acting on whichever lease happens
+   * to be current when it finally executes.
    */
-  struct restore_transaction_t::impl_t {
-    restore_fn_t restore;
-    schedule_fn_t schedule;
-    release_fn_t release;
-
-    std::mutex mutex;
-    bool running {false};
-    std::uint64_t generation {0};
+  struct restore_run_t {
+    std::uint64_t epoch {};
+    std::uint64_t generation {};
     std::shared_ptr<std::promise<bool>> outcome;
     std::shared_future<bool> result;
+    std::atomic<bool> settled {false};
+    std::atomic<bool> cancelled {false};
 
     /**
      * @brief Finish, at most once.
@@ -794,119 +819,161 @@ namespace virtual_display {
      * @param restored Whether the configuration went back.
      */
     void settle(bool restored) {
-      std::shared_ptr<std::promise<bool>> done;
-      {
-        std::lock_guard lock {mutex};
-        if (!running) {
-          return;
-        }
-        running = false;
-        done = std::exchange(outcome, nullptr);
+      if (settled.exchange(true)) {
+        return;
       }
-      if (done) {
-        done->set_value(restored);
+      outcome->set_value(restored);
+    }
+  };
+
+  /**
+   * @brief The one restore in progress, and who it is for.
+   */
+  struct restore_transaction_t::impl_t {
+    attempt_fn_t attempt;
+    start_retries_fn_t start_retries;
+    release_fn_t release;
+
+    mutable std::mutex mutex;  ///< Only ever held for bookkeeping, never across a callback.
+    std::uint64_t next_epoch {1};
+    std::shared_ptr<restore_run_t> current;
+
+    /**
+     * @brief Whether a run still speaks for the transaction.
+     *
+     * @param run The run to check.
+     * @return True if it is the current one and has not been cancelled.
+     */
+    bool is_current(const std::shared_ptr<restore_run_t> &run) const {
+      if (run->cancelled) {
+        return false;
       }
+      std::lock_guard lock {mutex};
+      return current && current->epoch == run->epoch;
     }
 
     /**
-     * @brief One go at restoring, arranging another if it did not take.
+     * @brief Stop calling a run finished, whatever happens to it next.
+     *
+     * @param run The run to retire.
      */
-    void attempt() {
-      const auto restored = restore ? restore() : std::optional<bool> {true};
-
-      if (restored.value_or(false)) {
-        // The order the whole class exists for: back first, then let go.
-        std::uint64_t gen = 0;
-        {
-          std::lock_guard lock {mutex};
-          gen = generation;
-        }
-        if (release) {
-          release(gen);
-        }
-        settle(true);
-        return;
-      }
-
-      auto self = this;
-      if (!schedule || !schedule([self] {
-            self->attempt();
-          })) {
-        // Nothing left that can try again.
-        BOOST_LOG(error) << "Nothing can retry restoring the display configuration"sv;
-        settle(false);
+    void retire(const std::shared_ptr<restore_run_t> &run) {
+      std::lock_guard lock {mutex};
+      if (current && current->epoch == run->epoch) {
+        current.reset();
       }
     }
   };
 
-  restore_transaction_t::restore_transaction_t(restore_fn_t restore, schedule_fn_t schedule, release_fn_t release):
+  restore_transaction_t::restore_transaction_t(attempt_fn_t attempt, start_retries_fn_t start_retries, release_fn_t release):
       m_impl {std::make_shared<impl_t>()} {
-    m_impl->restore = std::move(restore);
-    m_impl->schedule = std::move(schedule);
+    m_impl->attempt = std::move(attempt);
+    m_impl->start_retries = std::move(start_retries);
     m_impl->release = std::move(release);
   }
 
   restore_transaction_t::~restore_transaction_t() = default;
 
   bool restore_transaction_t::run(std::uint64_t generation, std::chrono::milliseconds timeout) {
-    std::shared_future<bool> waiting;
+    std::shared_ptr<restore_run_t> run;
     bool mine = false;
 
     {
       std::lock_guard lock {m_impl->mutex};
-      if (m_impl->running) {
+      if (m_impl->current) {
         // Joining rather than starting a second: the display stack holds one
         // retry at a time, and replacing it would leave nothing to give the
         // display back.
-        waiting = m_impl->result;
+        run = m_impl->current;
       } else {
-        m_impl->running = true;
-        m_impl->generation = generation;
-        m_impl->outcome = std::make_shared<std::promise<bool>>();
-        m_impl->result = m_impl->outcome->get_future().share();
-        waiting = m_impl->result;
+        run = std::make_shared<restore_run_t>();
+        run->epoch = m_impl->next_epoch++;
+        run->generation = generation;
+        run->outcome = std::make_shared<std::promise<bool>>();
+        run->result = run->outcome->get_future().share();
+        m_impl->current = run;
         mine = true;
       }
     }
 
     if (mine) {
-      m_impl->attempt();
+      // Outside the lock: everything below can call back into the display
+      // stack, which takes locks of its own.
+      auto impl = m_impl;
+      const auto finish = [impl, run](const attempt_fn_t &attempt) {
+        if (!impl->is_current(run)) {
+          // Queued for a run that has been retired. Doing anything here
+          // would act on a lease this callback knows nothing about.
+          return true;
+        }
+
+        if (!attempt().value_or(false)) {
+          return false;
+        }
+
+        if (!impl->is_current(run)) {
+          return true;
+        }
+
+        impl->retire(run);
+        if (impl->release) {
+          impl->release(run->generation);
+        }
+        run->settle(true);
+        return true;
+      };
+
+      if (!finish(m_impl->attempt ? m_impl->attempt : attempt_fn_t {[] {
+                    return true;
+                  }})) {
+        // Not restored yet, so it keeps being retried inside the display
+        // stack until it is.
+        if (!m_impl->start_retries || !m_impl->start_retries([finish](attempt_fn_t attempt) {
+              return finish(attempt);
+            })) {
+          BOOST_LOG(error) << "Nothing can retry restoring the display configuration"sv;
+          m_impl->retire(run);
+          run->settle(false);
+        }
+      }
     }
 
-    if (waiting.wait_for(timeout) != std::future_status::ready) {
+    if (run->result.wait_for(timeout) != std::future_status::ready) {
       return false;
     }
-    return waiting.get();
+    return run->result.get();
   }
 
   bool restore_transaction_t::pending() const {
     std::lock_guard lock {m_impl->mutex};
-    return m_impl->running;
+    return m_impl->current != nullptr;
   }
 
   void restore_transaction_t::abandon() {
-    std::uint64_t gen = 0;
+    std::shared_ptr<restore_run_t> run;
     {
       std::lock_guard lock {m_impl->mutex};
-      if (!m_impl->running) {
-        return;
-      }
-      gen = m_impl->generation;
-      // Nothing can arrange another attempt from here.
-      m_impl->schedule = nullptr;
+      run = std::exchange(m_impl->current, nullptr);
     }
+    if (!run) {
+      return;
+    }
+
+    // Retired first, so a retry already queued for it finds it is no longer
+    // current and leaves the next transaction alone.
+    run->cancelled = true;
 
     BOOST_LOG(warning) << "The display stack is going away while a restore is outstanding. "
                           "One last attempt, then the virtual display is given back either way, "
                           "since holding it would keep every later session out."sv;
 
-    if (m_impl->restore) {
-      std::ignore = m_impl->restore();
+    if (m_impl->attempt) {
+      std::ignore = m_impl->attempt();
     }
     if (m_impl->release) {
-      m_impl->release(gen);
+      m_impl->release(run->generation);
     }
-    m_impl->settle(false);
+    run->settle(false);
   }
 
   manager_t &manager() {

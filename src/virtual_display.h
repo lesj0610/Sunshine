@@ -354,6 +354,14 @@ namespace virtual_display {
     struct impl_t;
 
   private:
+    /**
+     * @brief Shared by release() and release_generation().
+     *
+     * @param expected_generation The lease to end, or nothing for whichever is current.
+     * @return False only when the lease had already moved on.
+     */
+    bool release_impl(std::optional<std::uint64_t> expected_generation);
+
     // Shared rather than unique: the heartbeat thread cannot be joined, so it
     // has to be able to outlive the manager without touching freed memory.
     std::shared_ptr<impl_t> m_impl;
@@ -376,18 +384,27 @@ namespace virtual_display {
    */
   class restore_transaction_t {
   public:
-    /// Try to restore now. Nothing means the API was busy and it is worth
-    /// another go; false means it failed and is also worth another go.
-    using restore_fn_t = std::function<std::optional<bool>()>;
+    /// One attempt at restoring. Nothing means the API was busy and it is
+    /// worth another go; false means it failed and is also worth another go.
+    using attempt_fn_t = std::function<std::optional<bool>()>;
 
-    /// Arrange for the given work to run again later. False if there is no
-    /// longer anything that can run it.
-    using schedule_fn_t = std::function<bool(std::function<void()>)>;
+    /**
+     * @brief Start retrying, handing each attempt back to the transaction.
+     *
+     * The retry runs inside the display stack's own scheduler, which holds
+     * its lock while it does. Asking that scheduler for anything from in
+     * there would deadlock, so the attempt is handed in instead, already
+     * bound to the interface the scheduler supplied.
+     *
+     * The callback returns true when the transaction is finished and the
+     * retries should stop.
+     */
+    using start_retries_fn_t = std::function<bool(std::function<bool(attempt_fn_t)>)>;
 
     /// Give the display back, if the lease is still the expected one.
     using release_fn_t = std::function<bool(std::uint64_t)>;
 
-    restore_transaction_t(restore_fn_t restore, schedule_fn_t schedule, release_fn_t release);
+    restore_transaction_t(attempt_fn_t attempt, start_retries_fn_t start_retries, release_fn_t release);
     ~restore_transaction_t();
 
     restore_transaction_t(const restore_transaction_t &) = delete;

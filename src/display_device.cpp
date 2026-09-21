@@ -799,22 +799,13 @@ namespace display_device {
      *         had not finished in time.
      */
     /**
-     * @brief Ask the display stack to restore now.
+     * @brief Turn a revert result into what the transaction expects.
      *
+     * @param result What the display stack said.
      * @return Nothing while the API is busy, otherwise whether it restored.
      */
-    std::optional<bool> restore_once() {
-      std::lock_guard lock {DD_DATA.mutex};
-      if (!DD_DATA.sm_instance) {
-        // Platform is not supported, so there was nothing to restore.
-        return true;
-      }
-
+    std::optional<bool> to_attempt_result(SettingsManagerInterface::RevertResult result) {
       using enum SettingsManagerInterface::RevertResult;
-      const auto result {DD_DATA.sm_instance->execute([](auto &settings_iface) {
-        return settings_iface.revertSettings();
-      })};
-
       if (result == ApiTemporarilyUnavailable) {
         return std::nullopt;
       }
@@ -826,20 +817,46 @@ namespace display_device {
     }
 
     /**
-     * @brief Arrange for something to run again after the retry interval.
+     * @brief Restore now, from a caller that holds none of the display stack's locks.
      *
-     * @param work What to run.
-     * @return False if there is no longer a scheduler to run it.
+     * @return Nothing while the API is busy, otherwise whether it restored.
      */
-    bool schedule_restore_retry(std::function<void()> work) {
+    std::optional<bool> restore_once() {
+      std::lock_guard lock {DD_DATA.mutex};
+      if (!DD_DATA.sm_instance) {
+        // Platform is not supported, so there was nothing to restore.
+        return true;
+      }
+
+      return to_attempt_result(DD_DATA.sm_instance->execute([](auto &settings_iface) {
+        return settings_iface.revertSettings();
+      }));
+    }
+
+    /**
+     * @brief Keep retrying inside the display stack until the caller is done.
+     *
+     * The scheduler holds its own lock while it runs this, so the attempt is
+     * built from the interface it hands over rather than by asking the
+     * scheduler again, which would deadlock on that same lock.
+     *
+     * @param finish Called with one attempt. Returns true when it wants no more.
+     * @return False if there is no scheduler to retry on.
+     */
+    bool start_restore_retries(std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)> finish) {
       std::lock_guard lock {DD_DATA.mutex};
       if (!DD_DATA.sm_instance) {
         return false;
       }
 
-      DD_DATA.sm_instance->schedule([work](auto &, auto &stop_token) {
-        stop_token.requestStop();
-        work();
+      DD_DATA.sm_instance->schedule([finish](auto &settings_iface, auto &stop_token) {
+        const bool done {finish([&settings_iface] {
+          return to_attempt_result(settings_iface.revertSettings());
+        })};
+
+        if (done) {
+          stop_token.requestStop();
+        }
       },
                                     {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL},
                                      .m_execution = SchedulerOptions::Execution::ScheduledOnly});
@@ -854,8 +871,8 @@ namespace display_device {
         [] {
           return restore_once();
         },
-        [](std::function<void()> work) {
-          return schedule_restore_retry(std::move(work));
+        [](std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)> finish) {
+          return start_restore_retries(std::move(finish));
         },
         [](std::uint64_t generation) {
           return virtual_display::manager().release_generation(generation);
