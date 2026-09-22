@@ -1026,9 +1026,21 @@ namespace virtual_display {
                   }})) {
         // Not restored yet, so it keeps being retried inside the display
         // stack until it is.
-        if (!m_impl->start_retries || !m_impl->start_retries([finish](attempt_fn_t attempt) {
-              return finish(attempt);
-            })) {
+        bool retrying = false;
+        try {
+          retrying = m_impl->start_retries && m_impl->start_retries([finish](attempt_fn_t attempt) {
+                       return finish(attempt);
+                     });
+        } catch (const std::exception &ex) {
+          // Failing to install the retry is failing to install it, however
+          // it failed. What must not happen is the run being left unfinished
+          // with callers waiting on a promise nothing will fulfil.
+          BOOST_LOG(error) << "Arranging to retry the display restore threw: "sv << ex.what();
+        } catch (...) {
+          BOOST_LOG(error) << "Arranging to retry the display restore threw"sv;
+        }
+
+        if (!retrying) {
           BOOST_LOG(error) << "Nothing can retry restoring the display configuration"sv;
           if (m_impl->claim_completion(run)) {
             m_impl->complete(run, false, false);

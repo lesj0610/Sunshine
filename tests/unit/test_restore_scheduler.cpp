@@ -380,3 +380,36 @@ TEST_F(RestoreSchedulerTest, TheNextGenerationDoesNotJoinAFinishedRun) {
   std::lock_guard lock {generations_mutex};
   EXPECT_EQ(generations, (std::vector<std::uint64_t> {40, 41}));
 }
+
+TEST_F(RestoreSchedulerTest, ArrangingARetryThatThrowsStillFinishesTheRun) {
+  std::atomic<int> attempts {0};
+  std::atomic<int> releases {0};
+
+  auto transaction = std::make_unique<virtual_display::restore_transaction_t>(
+    [&attempts]() -> std::optional<bool> {
+      attempts += 1;
+      return false;
+    },
+    [](std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)>) -> bool {
+      throw std::runtime_error {"the scheduler would not take it"};
+    },
+    [&releases](std::uint64_t) {
+      releases += 1;
+      return true;
+    }
+  );
+
+  // Not restored, and nothing could be arranged to try again, but the run
+  // still ends rather than leaving callers on an unfulfilled promise.
+  EXPECT_FALSE(transaction->run(50, 5s));
+  EXPECT_FALSE(transaction->pending());
+
+  // The display is kept, since nothing restored the configuration.
+  EXPECT_EQ(releases.load(), 0);
+  EXPECT_EQ(attempts.load(), 1);
+
+  // And the next lease gets a run of its own rather than the old result.
+  EXPECT_FALSE(transaction->run(51, 5s));
+  EXPECT_EQ(attempts.load(), 2);
+  EXPECT_EQ(releases.load(), 0);
+}
