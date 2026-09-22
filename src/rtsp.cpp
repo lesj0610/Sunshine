@@ -596,7 +596,6 @@ namespace rtsp_stream {
      */
     /**
      * @brief Claim the pending-launch slot without filling it yet.
-     *
      * @return True if this caller now holds it.
      */
     bool reserve_launch() {
@@ -616,6 +615,12 @@ namespace rtsp_stream {
       launch_reserved = false;
     }
 
+    /**
+     * @brief Put a launch session in the slot for the client to connect to.
+     *
+     * @param launch_session Session to queue.
+     * @return False if one was already waiting, in which case nothing changed.
+     */
     bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
       // Held across the check and the raise. Two requests arriving together
       // would otherwise both find the slot empty and the second would
@@ -785,6 +790,12 @@ namespace rtsp_stream {
 
   /**
    * @brief Queue a launch session until the RTSP client connects.
+   */
+  /**
+   * @brief Queue a launch session for the RTSP handshake.
+   *
+   * @param launch_session Session to queue.
+   * @return False if a launch is already pending.
    */
   bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
     return server.session_raise(std::move(launch_session));

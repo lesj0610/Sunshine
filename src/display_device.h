@@ -130,6 +130,8 @@ namespace display_device {
    *
    * @param video_config User's video related configuration.
    * @param session Session information.
+   * @return True once the configuration has taken, false if it failed or did
+   *         not settle in time.
    *
    * @examples
    * const std::shared_ptr<rtsp_stream::launch_session_t> launch_session;
@@ -147,11 +149,14 @@ namespace display_device {
    * we will keep trying every 5 seconds, even if the stream has already started as there was
    * no possibility to apply settings before the stream start.
    *
-   * Therefore, there is no return value as we still want to continue with the stream, so that
-   * the users can do something about it once they are connected. Otherwise, we might
-   * prevent users from logging in at all if we keep failing to apply configuration.
+   * The caller is told whether it took, because some of them have to know
+   * before they go on to capture the display. A transient failure keeps being
+   * retried in the background either way, so that users can do something
+   * about it once they are connected rather than being kept out entirely.
    *
    * @param config Configuration for the display.
+   * @return True once the configuration has taken, false if it failed or did
+   *         not settle in time.
    *
    * @examples
    * const SingleDisplayConfiguration valid_config { };

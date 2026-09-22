@@ -254,15 +254,15 @@ namespace virtual_display {
    * @brief Everything one manager owns, shared so a heartbeat can reach it.
    */
   struct manager_t::impl_t: std::enable_shared_from_this<manager_t::impl_t> {
-    backend_factory_t make;
-    device_id_lookup_t device_id_lookup;
-    timeouts_t timeouts;
+    backend_factory_t make;  ///< Makes a driver backend when one is needed.
+    device_id_lookup_t device_id_lookup;  ///< Turns a platform display name into the id Sunshine uses.
+    timeouts_t timeouts;  ///< How long to wait for things that are not instant.
 
     mutable std::mutex mutex;  ///< Guards everything below it.
-    state_e state {state_e::idle};
-    std::shared_ptr<backend_t> backend;
-    std::shared_ptr<worker_t> worker;
-    uuid_util::uuid_t id {};
+    state_e state {state_e::idle};  ///< What the lease is doing.
+    std::shared_ptr<backend_t> backend;  ///< The driver, once one has been opened.
+    std::shared_ptr<worker_t> worker;  ///< The only thread allowed to touch that driver.
+    uuid_util::uuid_t id {};  ///< Identifies the display this lease created.
 
     /**
      * @brief Whether a display may exist under id, and so has to be removed.
@@ -273,10 +273,10 @@ namespace virtual_display {
      * being unable to.
      */
     bool display_may_exist {false};
-    display_t display {};
-    std::uint64_t generation {0};
-    std::shared_ptr<heartbeat_t> heartbeat;
-    std::function<void()> fault_handler;
+    display_t display {};  ///< The display being streamed, while one is held.
+    std::uint64_t generation {0};  ///< Changes with every lease taken.
+    std::shared_ptr<heartbeat_t> heartbeat;  ///< Keeps the driver aware of us while a lease is held.
+    std::function<void()> fault_handler;  ///< What to run when the driver stops answering.
     bool fault_reported {false};  ///< One report per lease, however it is noticed.
 
     /**
@@ -827,10 +827,10 @@ namespace virtual_display {
    * to be current when it finally executes.
    */
   struct restore_run_t {
-    std::uint64_t epoch {};
-    std::uint64_t generation {};
-    std::shared_ptr<std::promise<bool>> outcome;
-    std::shared_future<bool> result;
+    std::uint64_t epoch {};  ///< Tells this run apart from the ones before and after it.
+    std::uint64_t generation {};  ///< The lease this run is being done for.
+    std::shared_ptr<std::promise<bool>> outcome;  ///< Where the answer is put.
+    std::shared_future<bool> result;  ///< What callers wait on, including ones that joined.
 
     /// Whether someone has taken on finishing this run. Guarded by the
     /// transaction's mutex, so deciding to finish and being allowed to are
@@ -846,13 +846,13 @@ namespace virtual_display {
    * @brief The one restore in progress, and who it is for.
    */
   struct restore_transaction_t::impl_t {
-    attempt_fn_t attempt;
-    start_retries_fn_t start_retries;
-    release_fn_t release;
+    attempt_fn_t attempt;  ///< One try at restoring, from a caller holding no display stack locks.
+    start_retries_fn_t start_retries;  ///< Starts retrying inside the display stack.
+    release_fn_t release;  ///< Gives the display back, if the lease is still the expected one.
 
     mutable std::mutex mutex;  ///< Only ever held for bookkeeping, never across a callback.
-    std::uint64_t next_epoch {1};
-    std::shared_ptr<restore_run_t> current;
+    std::uint64_t next_epoch {1};  ///< Handed to the next run that starts.
+    std::shared_ptr<restore_run_t> current;  ///< The run in progress, if there is one.
 
     /**
      * @brief Whether a run still speaks for the transaction.

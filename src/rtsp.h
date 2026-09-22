@@ -62,10 +62,26 @@ namespace rtsp_stream {
   class launch_reservation_t {
   public:
     launch_reservation_t() = default;
+
+    /**
+     * @param held Whether the slot was actually claimed.
+     */
     explicit launch_reservation_t(bool held);
+
+    /**
+     * @brief Gives the slot back unless it was committed.
+     */
     ~launch_reservation_t();
 
+    /**
+     * @param other The claim to take over. It is left holding nothing.
+     */
     launch_reservation_t(launch_reservation_t &&other) noexcept;
+
+    /**
+     * @param other The claim to take over. It is left holding nothing.
+     * @return This claim.
+     */
     launch_reservation_t &operator=(launch_reservation_t &&other) noexcept;
 
     launch_reservation_t(const launch_reservation_t &) = delete;
@@ -73,6 +89,8 @@ namespace rtsp_stream {
 
     /**
      * @brief Whether the slot was claimed.
+     *
+     * @return True while this holds it.
      */
     explicit operator bool() const {
       return m_held;

@@ -80,6 +80,13 @@ namespace virtual_display {
     int height {};  ///< Height in pixels.
     int refresh_rate_millihz {};  ///< Refresh rate in thousandths of a hertz, which is the unit the driver uses.
 
+    /**
+     * @brief Whether two modes ask for the same thing.
+     *
+     * @param lhs One mode.
+     * @param rhs The other.
+     * @return True if they match in every field.
+     */
     friend bool operator==(const mode_t &lhs, const mode_t &rhs) = default;
   };
 
@@ -117,6 +124,9 @@ namespace virtual_display {
     created_unverifiable  ///< The driver accepted it but did not describe it, so it may well exist.
   };
 
+  /**
+   * @brief What a readiness check found out about a display.
+   */
   struct resolution_t {
     /**
      * @brief How far along the display is.
@@ -127,7 +137,7 @@ namespace virtual_display {
       ready  ///< Usable.
     };
 
-    readiness_e state {readiness_e::not_ready};
+    readiness_e state {readiness_e::not_ready};  ///< How far along the display is.
     display_t display {};  ///< Meaningful only when state is ready.
   };
 
@@ -303,11 +313,15 @@ namespace virtual_display {
 
     /**
      * @brief Whether a session currently holds the lease.
+     *
+     * @return True while a session has a display.
      */
     [[nodiscard]] bool leased() const;
 
     /**
      * @brief What the lease is doing.
+     *
+     * @return The current state.
      */
     [[nodiscard]] state_e state() const;
 
@@ -404,6 +418,11 @@ namespace virtual_display {
     /// Give the display back, if the lease is still the expected one.
     using release_fn_t = std::function<bool(std::uint64_t)>;
 
+    /**
+     * @param attempt One try at restoring, from a caller holding no display stack locks.
+     * @param start_retries Starts retrying inside the display stack, handing each attempt back.
+     * @param release Gives the display back, if the lease is still the expected one.
+     */
     restore_transaction_t(attempt_fn_t attempt, start_retries_fn_t start_retries, release_fn_t release);
     ~restore_transaction_t();
 
@@ -422,6 +441,8 @@ namespace virtual_display {
 
     /**
      * @brief Whether a restore is still being retried.
+     *
+     * @return True while one is outstanding.
      */
     [[nodiscard]] bool pending() const;
 
