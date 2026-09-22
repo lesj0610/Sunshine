@@ -297,3 +297,86 @@ TEST_F(RestoreSchedulerTest, ASucceedingRetryAndAbandonFinishTheRunOnce) {
 
   scheduler->stop();
 }
+
+TEST_F(RestoreSchedulerTest, AnAttemptThatThrowsDoesNotStrandTheTransaction) {
+  auto settings = std::make_unique<fake_settings_t>();
+  auto scheduler = std::make_shared<scheduler_t>(std::move(settings));
+
+  std::atomic<int> releases {0};
+  auto transaction = std::make_unique<virtual_display::restore_transaction_t>(
+    []() -> std::optional<bool> {
+      throw std::runtime_error {"the display API fell over"};
+    },
+    [](std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)>) {
+      // Nothing can retry, so the run has to finish here.
+      return false;
+    },
+    [&releases](std::uint64_t) {
+      releases += 1;
+      return true;
+    }
+  );
+
+  EXPECT_FALSE(transaction->run(1, 5s));
+  EXPECT_FALSE(transaction->pending());
+
+  // A throw is a failed attempt, so the display is kept rather than given
+  // back on the strength of nothing.
+  EXPECT_EQ(releases.load(), 0);
+
+  // And abandoning it returns rather than waiting on a promise nothing will
+  // ever fulfil.
+  auto abandoning = std::async(std::launch::async, [&transaction] {
+    transaction->abandon();
+  });
+  EXPECT_EQ(abandoning.wait_for(5s), std::future_status::ready);
+  abandoning.get();
+}
+
+TEST_F(RestoreSchedulerTest, AReleaseThatThrowsStillFinishesTheRun) {
+  auto settings = std::make_unique<fake_settings_t>();
+  auto scheduler = std::make_shared<scheduler_t>(std::move(settings));
+
+  std::atomic<int> releases {0};
+  auto transaction = make_transaction(scheduler, [&releases](std::uint64_t) -> bool {
+    releases += 1;
+    throw std::runtime_error {"the lease could not be given back"};
+  });
+
+  // The run finishes, reporting that it did not work.
+  EXPECT_FALSE(transaction->run(2, 5s));
+  EXPECT_FALSE(transaction->pending());
+  EXPECT_EQ(releases.load(), 1);
+
+  // And the next one starts rather than joining the one that threw.
+  EXPECT_FALSE(transaction->run(3, 5s));
+  EXPECT_EQ(releases.load(), 2);
+}
+
+TEST_F(RestoreSchedulerTest, TheNextGenerationDoesNotJoinAFinishedRun) {
+  // A caller woken by one run's result may go straight on to the next. It
+  // must not find the finished run still there to join.
+  auto settings = std::make_unique<fake_settings_t>();
+  auto *settings_raw = settings.get();
+  auto scheduler = std::make_shared<scheduler_t>(std::move(settings));
+
+  std::atomic<int> releases {0};
+  std::vector<std::uint64_t> generations;
+  std::mutex generations_mutex;
+  auto transaction = make_transaction(scheduler, [&](std::uint64_t generation) {
+    releases += 1;
+    std::lock_guard lock {generations_mutex};
+    generations.push_back(generation);
+    return true;
+  });
+
+  ASSERT_TRUE(transaction->run(40, 5s));
+  // Straight on, with no pause: the previous run has to be gone already.
+  ASSERT_TRUE(transaction->run(41, 5s));
+
+  EXPECT_EQ(releases.load(), 2);
+  EXPECT_EQ(settings_raw->attempts(), 2);
+
+  std::lock_guard lock {generations_mutex};
+  EXPECT_EQ(generations, (std::vector<std::uint64_t> {40, 41}));
+}

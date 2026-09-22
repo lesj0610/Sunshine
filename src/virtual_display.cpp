@@ -117,7 +117,19 @@ namespace virtual_display {
         if (result.wait_for(deadline) != std::future_status::ready) {
           return std::nullopt;
         }
-        return result.get();
+
+        try {
+          return result.get();
+        } catch (const std::exception &ex) {
+          // A driver call that threw told us nothing, so it is treated like
+          // one that did not answer: the caller poisons the driver and keeps
+          // whatever cleanup is owed.
+          BOOST_LOG(error) << "Virtual display driver call threw: "sv << ex.what();
+          return std::nullopt;
+        } catch (...) {
+          BOOST_LOG(error) << "Virtual display driver call threw"sv;
+          return std::nullopt;
+        }
       }
 
     private:
@@ -822,19 +834,9 @@ namespace virtual_display {
     /// the same step and only one caller can win.
     bool completion_claimed {false};
 
-    std::atomic<bool> settled {false};
-
-    /**
-     * @brief Hand the answer to whoever is waiting, at most once.
-     *
-     * @param restored Whether the configuration went back.
-     */
-    void settle(bool restored) {
-      if (settled.exchange(true)) {
-        return;
-      }
-      outcome->set_value(restored);
-    }
+    /// Whether the answer has been handed over. Guarded by the
+    /// transaction's mutex, like completion_claimed.
+    bool settled {false};
   };
 
   /**
@@ -881,19 +883,85 @@ namespace virtual_display {
     }
 
     /**
-     * @brief Let go of a run, once it has been released and settled.
+     * @brief Finish a run: stop calling it current and hand over the answer.
      *
-     * Last, not first: while a run is still current a second caller joins
-     * its result rather than starting a restore of its own, which is what
-     * keeps two of them from running while one is mid-release.
+     * One step, in that order. A waiter woken by the answer may go straight
+     * on to start the next restore, and it must not find the finished run
+     * still sitting there to join.
+     *
+     * While a run is current a second caller joins its result rather than
+     * starting a restore of its own, which is what keeps two of them from
+     * running while one is mid-release.
      *
      * @param run The run that is finished.
+     * @param restored Whether the configuration went back.
      */
-    void finish(const std::shared_ptr<restore_run_t> &run) {
-      std::lock_guard lock {mutex};
-      if (current && current->epoch == run->epoch) {
-        current.reset();
+    void publish(const std::shared_ptr<restore_run_t> &run, bool restored) {
+      std::shared_ptr<std::promise<bool>> answer;
+      {
+        std::lock_guard lock {mutex};
+        if (current && current->epoch == run->epoch) {
+          current.reset();
+        }
+        if (run->settled) {
+          return;
+        }
+        run->settled = true;
+        answer = run->outcome;
       }
+
+      // Outside the lock, and only once the run is no longer current, so
+      // whoever this wakes cannot join a run that is over.
+      answer->set_value(restored);
+    }
+
+    /**
+     * @brief Release the lease and finish the run, whatever goes wrong.
+     *
+     * Only ever called by whoever won the completion claim. A release that
+     * throws still has to finish the run: leaving it unsettled would park
+     * every later caller on a promise nothing will ever fulfil.
+     *
+     * @param run The run being finished.
+     * @param give_back Whether the display should be handed back.
+     * @param restored What to tell whoever is waiting.
+     */
+    void complete(const std::shared_ptr<restore_run_t> &run, bool give_back, bool restored) {
+      bool answer = restored;
+      try {
+        if (give_back && release) {
+          release(run->generation);
+        }
+      } catch (const std::exception &ex) {
+        BOOST_LOG(error) << "Giving the virtual display back threw: "sv << ex.what();
+        answer = false;
+      } catch (...) {
+        BOOST_LOG(error) << "Giving the virtual display back threw"sv;
+        answer = false;
+      }
+
+      publish(run, answer);
+    }
+
+    /**
+     * @brief One attempt at restoring, treating a throw as a failed attempt.
+     *
+     * @param attempt What to try.
+     * @return Whether the configuration went back.
+     */
+    static bool try_attempt(const attempt_fn_t &attempt) {
+      if (!attempt) {
+        return true;
+      }
+
+      try {
+        return attempt().value_or(false);
+      } catch (const std::exception &ex) {
+        BOOST_LOG(error) << "Restoring the display configuration threw: "sv << ex.what();
+      } catch (...) {
+        BOOST_LOG(error) << "Restoring the display configuration threw"sv;
+      }
+      return false;
     }
   };
 
@@ -939,7 +1007,7 @@ namespace virtual_display {
           return true;
         }
 
-        if (!attempt().value_or(false)) {
+        if (!impl_t::try_attempt(attempt)) {
           return false;
         }
 
@@ -949,11 +1017,7 @@ namespace virtual_display {
           return true;
         }
 
-        if (impl->release) {
-          impl->release(run->generation);
-        }
-        run->settle(true);
-        impl->finish(run);
+        impl->complete(run, true, true);
         return true;
       };
 
@@ -967,8 +1031,7 @@ namespace virtual_display {
             })) {
           BOOST_LOG(error) << "Nothing can retry restoring the display configuration"sv;
           if (m_impl->claim_completion(run)) {
-            run->settle(false);
-            m_impl->finish(run);
+            m_impl->complete(run, false, false);
           }
         }
       }
@@ -1007,14 +1070,11 @@ namespace virtual_display {
                           "One last attempt, then the virtual display is given back either way, "
                           "since holding it would keep every later session out."sv;
 
-    if (m_impl->attempt) {
-      std::ignore = m_impl->attempt();
-    }
-    if (m_impl->release) {
-      m_impl->release(run->generation);
-    }
-    run->settle(false);
-    m_impl->finish(run);
+    // Given back whatever the last attempt says, since holding the lease
+    // for a transaction that can no longer finish would keep every later
+    // session out.
+    std::ignore = impl_t::try_attempt(m_impl->attempt);
+    m_impl->complete(run, true, false);
   }
 
   manager_t &manager() {

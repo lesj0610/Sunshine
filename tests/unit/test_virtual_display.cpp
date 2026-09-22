@@ -14,6 +14,7 @@
 #include <future>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -83,6 +84,7 @@ namespace {
       bool ping_succeeds {true};
       creation_e_alias add_result {virtual_display::creation_e::created};
       bool remove_succeeds {true};
+      bool throw_on_remove {};  ///< Make remove() throw, the way a driver wrapper might.
 
       /// How many resolve() calls report "not up yet" before the real answer.
       int not_ready_calls {0};
@@ -184,6 +186,9 @@ namespace {
       }
       if (remove_gate) {
         remove_gate->wait();
+      }
+      if (script.throw_on_remove) {
+        throw std::runtime_error {"the driver refused to talk"};
       }
       return script.remove_succeeds;
     }
@@ -1264,4 +1269,30 @@ TEST_F(VirtualDisplayTest, AStaleGenerationDoesNotEndTheCurrentLease) {
   std::lock_guard lock {log->mutex};
   // One removal, for the first lease. The second is still held.
   EXPECT_EQ(log->removes, 1);
+}
+
+TEST_F(VirtualDisplayTest, ADriverThatThrowsOnRemovalKeepsTheLeaseOutOfUse) {
+  // A throw says nothing about whether the display went away, so the
+  // obligation stands and no session may start.
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({.throw_on_remove = true});
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
+
+  manager->release();
+
+  EXPECT_EQ(manager->state(), virtual_display::state_e::poisoned);
+  EXPECT_FALSE(manager->leased());
+  EXPECT_FALSE(manager->output_override());
+
+  int adds_before = 0;
+  {
+    std::lock_guard lock {log->mutex};
+    adds_before = log->adds;
+  }
+
+  for (int i = 0; i < 20; ++i) {
+    EXPECT_EQ(error_of(manager->acquire("Next", "uid-2", k_mode, "")), virtual_display::error_e::busy);
+  }
+
+  std::lock_guard lock {log->mutex};
+  EXPECT_EQ(log->adds, adds_before);
 }
