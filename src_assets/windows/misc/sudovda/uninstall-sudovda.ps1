@@ -12,9 +12,7 @@
 #>
 
 [CmdletBinding()]
-param(
-    [switch] $Silent
-)
+param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
