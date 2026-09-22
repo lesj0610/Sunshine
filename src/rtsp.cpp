@@ -589,12 +589,6 @@ namespace rtsp_stream {
     }
 
     /**
-     * @brief Launch a new streaming session.
-     * @note If the client does not begin streaming within the ping_timeout,
-     *       the session will be discarded.
-     * @param launch_session Streaming session information.
-     */
-    /**
      * @brief Claim the pending-launch slot without filling it yet.
      * @return True if this caller now holds it.
      */
@@ -616,9 +610,10 @@ namespace rtsp_stream {
     }
 
     /**
-     * @brief Put a launch session in the slot for the client to connect to.
-     *
-     * @param launch_session Session to queue.
+     * @brief Launch a new streaming session.
+     * @note If the client does not begin streaming within the ping_timeout,
+     *       the session will be discarded.
+     * @param launch_session Streaming session information.
      * @return False if one was already waiting, in which case nothing changed.
      */
     bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
