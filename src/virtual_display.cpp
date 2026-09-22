@@ -525,14 +525,16 @@ namespace virtual_display {
     };
 
     if (!impl.call<bool>([backend] {
-           return backend->open();
-         }).value_or(false)) {
+               return backend->open();
+             })
+           .value_or(false)) {
       return give_up(error_e::driver_unavailable, false);
     }
 
     if (!impl.call<bool>([backend] {
-           return backend->protocol_supported();
-         }).value_or(false)) {
+               return backend->protocol_supported();
+             })
+           .value_or(false)) {
       return give_up(error_e::protocol_mismatch, false);
     }
 
@@ -548,8 +550,9 @@ namespace virtual_display {
     // The driver has to answer before it is asked for anything, so a display
     // is never created for one that cannot be kept alive.
     if (!impl.call<bool>([backend] {
-           return backend->ping();
-         }).value_or(false)) {
+               return backend->ping();
+             })
+           .value_or(false)) {
       return give_up(error_e::heartbeat_failed, false);
     }
 
@@ -640,8 +643,8 @@ namespace virtual_display {
       }
 
       return impl->call<bool>([backend] {
-                       return backend->ping();
-                     })
+                   return backend->ping();
+                 })
         .value_or(false);
     };
     heartbeat->on_lost = [weak = m_impl->weak_from_this()](std::uint64_t generation) {
@@ -1022,15 +1025,15 @@ namespace virtual_display {
       };
 
       if (!finish(m_impl->attempt ? m_impl->attempt : attempt_fn_t {[] {
-                    return true;
-                  }})) {
+            return true;
+          }})) {
         // Not restored yet, so it keeps being retried inside the display
         // stack until it is.
         bool retrying = false;
         try {
           retrying = m_impl->start_retries && m_impl->start_retries([finish](attempt_fn_t attempt) {
-                       return finish(attempt);
-                     });
+            return finish(attempt);
+          });
         } catch (const std::exception &ex) {
           // Failing to install the retry is failing to install it, however
           // it failed. What must not happen is the run being left unfinished

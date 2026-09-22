@@ -858,8 +858,7 @@ namespace display_device {
           stop_token.requestStop();
         }
       },
-                                    {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL},
-                                     .m_execution = SchedulerOptions::Execution::ScheduledOnly});
+                                    {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}, .m_execution = SchedulerOptions::Execution::ScheduledOnly});
       return true;
     }
 

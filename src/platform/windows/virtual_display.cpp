@@ -349,9 +349,7 @@ namespace virtual_display {
         paths.resize(path_count);
 
         for (const auto &path : paths) {
-          if (path.targetInfo.adapterId.LowPart != luid.LowPart ||
-              path.targetInfo.adapterId.HighPart != luid.HighPart ||
-              path.targetInfo.id != target_id) {
+          if (path.targetInfo.adapterId.LowPart != luid.LowPart || path.targetInfo.adapterId.HighPart != luid.HighPart || path.targetInfo.id != target_id) {
             continue;
           }
 
@@ -412,8 +410,7 @@ namespace virtual_display {
         dev_mode.dmSize = sizeof(dev_mode);
 
         for (DWORD i = 0; EnumDisplaySettingsW(gdi_name.c_str(), i, &dev_mode); ++i) {
-          if (static_cast<int>(dev_mode.dmPelsWidth) != mode.width ||
-              static_cast<int>(dev_mode.dmPelsHeight) != mode.height) {
+          if (static_cast<int>(dev_mode.dmPelsWidth) != mode.width || static_cast<int>(dev_mode.dmPelsHeight) != mode.height) {
             continue;
           }
 

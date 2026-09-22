@@ -28,7 +28,6 @@ extern "C" {
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
-#include "virtual_display.h"
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
@@ -37,6 +36,7 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+#include "virtual_display.h"
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.

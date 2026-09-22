@@ -1419,7 +1419,6 @@ namespace nvhttp {
     revert_display_configuration = true;
 
     if (rtsp_stream::session_count() == 0) {
-
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
@@ -1587,7 +1586,6 @@ namespace nvhttp {
     revert_display_configuration = true;
 
     if (no_active_sessions) {
-
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.

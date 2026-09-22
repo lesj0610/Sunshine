@@ -82,8 +82,7 @@ namespace {
             stop_token.requestStop();
           }
         },
-                            {.m_sleep_durations = {retry_after},
-                             .m_execution = display_device::SchedulerOptions::Execution::ScheduledOnly});
+                            {.m_sleep_durations = {retry_after}, .m_execution = display_device::SchedulerOptions::Execution::ScheduledOnly});
         return true;
       },
       std::move(release)
