@@ -18,6 +18,7 @@
 #include <dxgi.h>
 
 // lib includes
+#include <display_device/windows/win_api_layer.h>
 #include <sudovda-ioctl.h>
 
 // local includes
@@ -233,6 +234,37 @@ namespace virtual_display {
         }
 
         return {resolution_t::readiness_e::ready, {{}, identity->gdi_name}};
+      }
+
+      std::string device_id(const uuid_util::uuid_t &id) override {
+        SUDOVDA::VIRTUAL_DISPLAY_ADD_OUT target {};
+        {
+          std::lock_guard lock {m_mutex};
+          const auto found = m_targets.find(id.string());
+          if (found == m_targets.end()) {
+            return {};
+          }
+          target = found->second;
+        }
+
+        // Asked of libdisplaydevice, so the id is the one the display
+        // configuration will look the display up by. Every path is searched,
+        // since the display may not be on the desktop yet.
+        const display_device::WinApiLayer api;
+        const auto data = api.queryDisplayConfig(display_device::QueryType::All);
+        if (!data) {
+          return {};
+        }
+
+        for (const auto &path : data->m_paths) {
+          if (path.targetInfo.adapterId.LowPart != target.AdapterLuid.LowPart || path.targetInfo.adapterId.HighPart != target.AdapterLuid.HighPart || path.targetInfo.id != target.TargetId || !path.targetInfo.targetAvailable) {
+            continue;
+          }
+
+          return api.getDeviceId(path);
+        }
+
+        return {};
       }
 
     private:

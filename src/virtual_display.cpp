@@ -65,6 +65,7 @@ namespace virtual_display {
           m_state->stopping = true;
         }
         m_state->wake.notify_all();
+        m_state->idle_cv.notify_all();
 
         if (m_state->busy) {
           // A call is still inside the driver. Joining would wait for exactly
@@ -90,11 +91,18 @@ namespace virtual_display {
       /**
        * @brief Run something on the worker and wait for it.
        *
+       * Calls never overlap. A call another caller is still waiting on is
+       * waited for, since it answers in its own time: the heartbeat pings
+       * while a session resizes, and one call arriving during the other is
+       * no reason to think the driver has stopped answering. A call its
+       * caller gave up on may never answer, so that one is not waited for.
+       *
        * @param work What to run. Must capture by value: the caller can walk
        *             away from it, so nothing of the caller's may be referenced.
-       * @param deadline How long to wait before giving up on it.
-       * @return The result, or nothing if the deadline passed or the worker
-       *         was already stuck on an earlier call.
+       * @param deadline How long to wait for the worker to be free, and then
+       *                 as long again for the work.
+       * @return The result, or nothing if a deadline passed or the worker is
+       *         stuck on a call its caller gave up on.
        */
       template<class R>
       std::optional<R> run_bounded(std::function<R()> work, std::chrono::milliseconds deadline) {
@@ -111,11 +119,15 @@ namespace virtual_display {
         auto idle = finished->get_future();
 
         {
-          std::lock_guard lock {m_state->mutex};
-          if (m_state->stopping || m_state->busy) {
+          std::unique_lock lock {m_state->mutex};
+          const bool free = m_state->idle_cv.wait_for(lock, deadline, [this] {
+            return m_state->stopping || !m_state->busy || m_state->abandoned;
+          });
+          if (!free || m_state->stopping || m_state->busy) {
             return std::nullopt;
           }
           m_state->busy = true;
+          m_state->abandoned = false;
           m_state->job = [state = m_state, task, finished] {
             try {
               (*task)();
@@ -124,13 +136,23 @@ namespace virtual_display {
               // task machinery itself can land here, and it must not leave
               // the worker marked busy for good.
             }
-            state->busy = false;
+            {
+              std::lock_guard lock {state->mutex};
+              state->busy = false;
+            }
+            state->idle_cv.notify_all();
             finished->set_value();
           };
         }
         m_state->wake.notify_all();
 
         if (idle.wait_for(deadline) != std::future_status::ready) {
+          // Given up on, so nobody queues behind it any more.
+          {
+            std::lock_guard lock {m_state->mutex};
+            m_state->abandoned = true;
+          }
+          m_state->idle_cv.notify_all();
           return std::nullopt;
         }
 
@@ -155,9 +177,11 @@ namespace virtual_display {
       struct state_t {
         std::mutex mutex;
         std::condition_variable wake;
+        std::condition_variable idle_cv;  ///< Signalled when the worker goes idle or a call is given up on.
         std::function<void()> job;
         bool stopping {false};
         std::atomic<bool> busy {false};
+        bool abandoned {false};  ///< The call in flight was given up on by its caller.
       };
 
       static void run(std::shared_ptr<state_t> state) {
@@ -262,6 +286,8 @@ namespace virtual_display {
         return "another session is already using the virtual display";
       case error_e::busy:
         return "the virtual display driver has not answered an earlier request yet";
+      case error_e::not_leased:
+        return "no session is streaming a virtual display";
     }
     return "unknown error";
   }
@@ -294,6 +320,28 @@ namespace virtual_display {
     std::shared_ptr<heartbeat_t> heartbeat;  ///< Keeps the driver aware of us while a lease is held.
     std::function<void()> fault_handler;  ///< What to run when the driver stops answering.
     bool fault_reported {false};  ///< One report per lease, however it is noticed.
+
+    std::string client_name;  ///< Stamped into every display the lease creates.
+    std::string client_uid;  ///< Likewise.
+
+    /**
+     * @brief The lease's other identity, which a display replacing the leased one is created under.
+     *
+     * Once the replacement is streamed the two swap. However many times a
+     * session resizes, Windows only ever sees two monitors for it.
+     */
+    uuid_util::uuid_t alt_id {};
+
+    /**
+     * @brief Whether a display may exist under alt_id, and so has to be removed.
+     *
+     * Set before a replacement is asked for, like display_may_exist. Also
+     * set for an old display a resize could not remove, which is why another
+     * replacement first has to get rid of whatever is there.
+     */
+    bool replacement_may_exist {false};
+    display_t replacement {};  ///< The replacement, once Windows knows it.
+    bool replacement_in_use {false};  ///< Whether output_override() names the replacement.
 
     /**
      * @brief Ask the driver something, and poison it if it does not answer.
@@ -343,7 +391,9 @@ namespace virtual_display {
       std::shared_ptr<worker_t> worker_ref;
       std::shared_ptr<backend_t> backend_ref;
       uuid_util::uuid_t stale {};
+      uuid_util::uuid_t stale_alt {};
       bool remove_first = false;
+      bool remove_alt = false;
 
       {
         std::lock_guard lock {mutex};
@@ -358,7 +408,9 @@ namespace virtual_display {
         worker_ref = worker;
         backend_ref = backend;
         stale = id;
+        stale_alt = alt_id;
         remove_first = display_may_exist;
+        remove_alt = replacement_may_exist;
       }
 
       // Run on the same worker, in order, so the removal cannot overtake
@@ -367,7 +419,19 @@ namespace virtual_display {
       // otherwise would let the next session start on top of it.
       bool cleaned = true;
       if (backend_ref) {
-        if (remove_first) {
+        if (remove_alt) {
+          const auto removed = worker_ref->run_bounded<bool>([backend_ref, stale_alt] {
+            return backend_ref->remove(stale_alt);
+          },
+                                                             timeouts.call);
+          cleaned = removed.value_or(false);
+          if (cleaned) {
+            std::lock_guard lock {mutex};
+            replacement_may_exist = false;
+          }
+        }
+
+        if (cleaned && remove_first) {
           const auto removed = worker_ref->run_bounded<bool>([backend_ref, stale] {
             return backend_ref->remove(stale);
           },
@@ -405,7 +469,23 @@ namespace virtual_display {
       heartbeat.reset();
       display = {};
       display_may_exist = false;
+      replacement = {};
+      replacement_may_exist = false;
+      replacement_in_use = false;
       state = state_e::idle;
+    }
+
+    /**
+     * @brief Whether the lease a caller started with is still the one held.
+     *
+     * Must be called without the lock held.
+     *
+     * @param expected The generation the caller started with.
+     * @return True while that lease is active.
+     */
+    bool still_leased(std::uint64_t expected) const {
+      std::lock_guard lock {mutex};
+      return state == state_e::active && generation == expected;
     }
 
     /**
@@ -504,6 +584,12 @@ namespace virtual_display {
       backend = impl.backend;
       impl.state = state_e::provisioning;
       impl.fault_reported = false;
+      impl.client_name = client_name;
+      impl.client_uid = client_uid;
+      impl.alt_id = uuid_util::uuid_t::generate();
+      impl.replacement = {};
+      impl.replacement_may_exist = false;
+      impl.replacement_in_use = false;
     }
 
     // Copies, because a call the caller gives up on keeps running with them.
@@ -721,7 +807,9 @@ namespace virtual_display {
     std::shared_ptr<heartbeat_t> heartbeat;
     std::shared_ptr<backend_t> backend;
     uuid_util::uuid_t id {};
+    uuid_util::uuid_t alt_id {};
     bool had_display = false;
+    bool had_replacement = false;
     bool poisoned = false;
 
     {
@@ -743,6 +831,7 @@ namespace virtual_display {
       heartbeat = std::exchange(impl.heartbeat, nullptr);
       backend = impl.backend;
       id = impl.id;
+      alt_id = impl.alt_id;
 
       if (impl.state == state_e::poisoned || impl.state == state_e::recovering) {
         // What this owes belongs to the recovery. Moving it to reverting
@@ -750,6 +839,8 @@ namespace virtual_display {
         poisoned = true;
       } else {
         had_display = impl.state == state_e::active;
+        had_replacement = had_display && impl.replacement_may_exist;
+        impl.replacement_in_use = false;
         impl.state = state_e::reverting;
       }
     }
@@ -766,6 +857,29 @@ namespace virtual_display {
     }
 
     if (backend) {
+      // A display a resize created, or one it could not get rid of, goes
+      // first, under the same rule as the leased one below.
+      if (had_replacement) {
+        const auto removed = impl.call<bool>([backend, alt_id] {
+          return backend->remove(alt_id);
+        });
+
+        if (!removed.value_or(false)) {
+          BOOST_LOG(warning) << "The virtual display driver did not remove the display a resize created. "
+                                "No session can use it until it does."sv;
+
+          std::lock_guard lock {impl.mutex};
+          if (impl.state == state_e::reverting) {
+            impl.state = state_e::poisoned;
+          }
+          return true;
+        }
+
+        std::lock_guard lock {impl.mutex};
+        impl.replacement_may_exist = false;
+        impl.replacement = {};
+      }
+
       // Removed while the lease still names it, so the display is never
       // unaccounted for while it still exists.
       if (had_display) {
@@ -831,7 +945,219 @@ namespace virtual_display {
     if (m_impl->state != state_e::active) {
       return std::nullopt;
     }
+    if (m_impl->replacement_in_use) {
+      return m_impl->replacement.device_id;
+    }
     return m_impl->display.device_id;
+  }
+
+  std::variant<display_t, error_e> manager_t::prepare_replacement(const mode_t &mode) {
+    auto &impl = *m_impl;
+
+    std::shared_ptr<backend_t> backend;
+    uuid_util::uuid_t alt {};
+    std::string name;
+    std::string uid;
+    std::uint64_t lease {};
+    bool clear_first = false;
+    {
+      std::lock_guard lock {impl.mutex};
+      switch (impl.state) {
+        case state_e::active:
+          break;
+        case state_e::poisoned:
+        case state_e::recovering:
+          return error_e::busy;
+        default:
+          return error_e::not_leased;
+      }
+
+      backend = impl.backend;
+      alt = impl.alt_id;
+      name = impl.client_name;
+      uid = impl.client_uid;
+      lease = impl.generation;
+      clear_first = impl.replacement_may_exist;
+      impl.replacement = {};
+      impl.replacement_in_use = false;
+    }
+
+    if (clear_first) {
+      // Something may still be there under this identity: a replacement that
+      // was never finished, or an old display a resize could not remove. It
+      // has to go before the identity can be used again.
+      if (!impl.call<bool>([backend, alt] {
+                 return backend->remove(alt);
+               })
+             .value_or(false)) {
+        return error_e::busy;
+      }
+
+      std::lock_guard lock {impl.mutex};
+      if (impl.state == state_e::active && impl.generation == lease) {
+        impl.replacement_may_exist = false;
+      }
+    }
+
+    {
+      // Owed removal before the request goes out, for the same reason as in
+      // acquire(): a create that never answers may still have made a display.
+      std::lock_guard lock {impl.mutex};
+      if (impl.state != state_e::active || impl.generation != lease) {
+        return error_e::not_leased;
+      }
+      impl.replacement_may_exist = true;
+    }
+
+    const auto wanted = mode;
+    const auto created = impl.call<creation_e>([backend, alt, name, uid, wanted] {
+                               return backend->add(alt, name, uid, wanted);
+                             })
+                           .value_or(creation_e::created_unverifiable);
+
+    if (created == creation_e::not_created) {
+      std::lock_guard lock {impl.mutex};
+      if (impl.state == state_e::active && impl.generation == lease) {
+        impl.replacement_may_exist = false;
+      }
+      return error_e::create_failed;
+    }
+
+    if (created != creation_e::created) {
+      // Still owed: abandon_replacement() or release() removes it.
+      return error_e::create_failed;
+    }
+
+    display_t display;
+    const auto give_up_at = std::chrono::steady_clock::now() + impl.timeouts.readiness;
+    for (;;) {
+      if (!impl.still_leased(lease)) {
+        return error_e::not_leased;
+      }
+
+      const auto device_id = impl.call<std::string>([backend, alt] {
+        return backend->device_id(alt);
+      });
+      if (!device_id) {
+        return error_e::busy;
+      }
+      if (!device_id->empty()) {
+        display.device_id = *device_id;
+        break;
+      }
+
+      if (std::chrono::steady_clock::now() >= give_up_at) {
+        return error_e::not_ready;
+      }
+
+      std::this_thread::sleep_for(impl.timeouts.readiness_poll);
+    }
+
+    // The GDI name only exists once the display is on the desktop, which it
+    // is already if Windows put it there by itself. Only used for the log.
+    if (const auto resolved = impl.call<resolution_t>([backend, alt, wanted] {
+          return backend->resolve(alt, wanted);
+        });
+        resolved && resolved->state == resolution_t::readiness_e::ready) {
+      display.gdi_name = resolved->display.gdi_name;
+    }
+
+    {
+      std::lock_guard lock {impl.mutex};
+      if (impl.state != state_e::active || impl.generation != lease) {
+        return error_e::not_leased;
+      }
+      impl.replacement = display;
+    }
+
+    BOOST_LOG(info) << "Virtual display to replace the streamed one is up"sv
+                    << (display.gdi_name.empty() ? ""s : " as "s + display.gdi_name)
+                    << " at "sv << wanted.width << 'x' << wanted.height
+                    << " @ "sv << (wanted.refresh_rate_millihz / 1000.) << "Hz"sv;
+    return display;
+  }
+
+  void manager_t::use_replacement(bool use) {
+    std::lock_guard lock {m_impl->mutex};
+    m_impl->replacement_in_use = use && m_impl->state == state_e::active && m_impl->replacement_may_exist &&
+                                 !m_impl->replacement.device_id.empty();
+  }
+
+  bool manager_t::commit_replacement() {
+    auto &impl = *m_impl;
+
+    std::shared_ptr<backend_t> backend;
+    uuid_util::uuid_t old_id {};
+    std::uint64_t lease {};
+    {
+      std::lock_guard lock {impl.mutex};
+      if (impl.state != state_e::active || !impl.replacement_may_exist || impl.replacement.device_id.empty()) {
+        return false;
+      }
+
+      backend = impl.backend;
+      old_id = impl.id;
+      lease = impl.generation;
+
+      // The replacement is the leased display from here on, whatever happens
+      // to the old one, which moves to the other identity and stays owed
+      // removal until it is gone.
+      std::swap(impl.id, impl.alt_id);
+      impl.display = std::exchange(impl.replacement, {});
+      impl.replacement_in_use = false;
+    }
+
+    const auto removed = impl.call<bool>([backend, old_id] {
+                               return backend->remove(old_id);
+                             })
+                           .value_or(false);
+
+    if (removed) {
+      std::lock_guard lock {impl.mutex};
+      if (impl.state == state_e::active && impl.generation == lease) {
+        impl.replacement_may_exist = false;
+      }
+    }
+    return removed;
+  }
+
+  bool manager_t::abandon_replacement() {
+    auto &impl = *m_impl;
+
+    std::shared_ptr<backend_t> backend;
+    uuid_util::uuid_t alt {};
+    std::uint64_t lease {};
+    {
+      std::lock_guard lock {impl.mutex};
+      impl.replacement_in_use = false;
+      if (!impl.replacement_may_exist) {
+        impl.replacement = {};
+        return true;
+      }
+      if (impl.state != state_e::active) {
+        // Nothing may be asked of the driver, and the obligation stays with
+        // whatever finishes the lease.
+        return false;
+      }
+
+      backend = impl.backend;
+      alt = impl.alt_id;
+      lease = impl.generation;
+    }
+
+    const auto removed = impl.call<bool>([backend, alt] {
+                               return backend->remove(alt);
+                             })
+                           .value_or(false);
+
+    if (removed) {
+      std::lock_guard lock {impl.mutex};
+      if (impl.state == state_e::active && impl.generation == lease) {
+        impl.replacement_may_exist = false;
+        impl.replacement = {};
+      }
+    }
+    return removed;
   }
 
   /**

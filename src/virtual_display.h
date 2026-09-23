@@ -46,7 +46,8 @@ namespace virtual_display {
     not_ready,  ///< Windows did not bring the display up in time.
     mode_unavailable,  ///< The display came up but does not offer the requested mode.
     already_leased,  ///< Another session already holds the lease.
-    busy  ///< A driver call has not come back, so nothing may be asked of it yet.
+    busy,  ///< A driver call has not come back, so nothing may be asked of it yet.
+    not_leased  ///< A replacement was asked for, but no session holds the lease.
   };
 
   /**
@@ -231,6 +232,19 @@ namespace virtual_display {
      * @return What state the display is in, and the display itself once ready.
      */
     virtual resolution_t resolve(const uuid_util::uuid_t &id, const mode_t &mode) = 0;
+
+    /**
+     * @brief Look up the id Sunshine addresses a display by, whether or not it is on the desktop.
+     *
+     * A display created to replace another mid-session can come up off the
+     * desktop, because Windows restores whatever arrangement it last saw for
+     * the same set of monitors. The display configuration puts it on the
+     * desktop, and all that needs is the id.
+     *
+     * @param id The identifier the display was created with.
+     * @return The device id, or an empty string while Windows does not know the display yet.
+     */
+    virtual std::string device_id(const uuid_util::uuid_t &id) = 0;
   };
 
   /**
@@ -364,6 +378,52 @@ namespace virtual_display {
      * @return The leased display's device id, or nothing when no lease is held.
      */
     [[nodiscard]] std::optional<std::string> output_override() const;
+
+    /**
+     * @brief Create a display to replace the leased one, for a resize.
+     *
+     * The driver fixes a display's modes when it creates it, so a new size
+     * needs a new display. The leased display is left as it is, and
+     * output_override() keeps naming it until use_replacement() says
+     * otherwise, so the stream carries on while the new one comes up.
+     *
+     * The new display takes the other of the lease's two identities, so a
+     * session that resizes many times only ever shows Windows two monitors.
+     * It only has to be known to Windows, not on the desktop: the display
+     * configuration puts it there.
+     *
+     * The replacement is owed removal from the moment it is asked for, so
+     * release() removes it even if this has not returned.
+     *
+     * @param mode Mode the new display should offer.
+     * @return The new display, whose GDI name may still be empty, or why it could not be had.
+     */
+    [[nodiscard]] std::variant<display_t, error_e> prepare_replacement(const mode_t &mode);
+
+    /**
+     * @brief Choose which display output_override() names while a replacement exists.
+     *
+     * @param use True for the replacement, false for the leased display.
+     */
+    void use_replacement(bool use);
+
+    /**
+     * @brief Remove the old display, and make the replacement the leased one.
+     *
+     * The replacement is streamed from here on whatever happens. If the old
+     * display will not go, the lease keeps its identifier, removes it on
+     * release, and refuses another replacement until it is gone.
+     *
+     * @return True if the old display was removed.
+     */
+    bool commit_replacement();
+
+    /**
+     * @brief Remove the replacement, and keep the leased display.
+     *
+     * @return True if the replacement is gone, or never existed.
+     */
+    bool abandon_replacement();
 
     struct impl_t;
 

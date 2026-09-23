@@ -111,6 +111,10 @@ namespace {
       bool fail_pings {};  ///< Set mid-test to make the driver go quiet.
       bool hold_pings {};  ///< Set mid-test to make a ping never come back.
       std::vector<std::string> order;  ///< Which calls happened, in order.
+      std::set<std::string> refuse_removal;  ///< Ids whose removal fails, set mid-test.
+      bool device_ids_unknown {};  ///< Set to make Windows never learn of a new display.
+      std::set<std::string> live_ids;  ///< Displays that exist right now.
+      int hold_add {0};  ///< Which add() waits on the gate, counting from 1; 0 for every one.
     };
 
     script_t script;
@@ -159,13 +163,15 @@ namespace {
     }
 
     virtual_display::creation_e add(const uuid_util::uuid_t &id, const std::string &, const std::string &, const virtual_display::mode_t &mode) override {
+      bool hold = false;
       {
         std::lock_guard lock {log->mutex};
         log->adds += 1;
         log->last_mode = mode;
         log->order.push_back("add");
+        hold = log->hold_add == 0 || log->adds == log->hold_add;
       }
-      if (add_gate) {
+      if (add_gate && hold) {
         add_gate->wait();
       }
       if (script.add_result == virtual_display::creation_e::not_created) {
@@ -174,6 +180,7 @@ namespace {
       std::lock_guard lock {log->mutex};
       log->added_ids.insert(id.string());
       log->added_order.push_back(id.string());
+      log->live_ids.insert(id.string());
       return script.add_result;
     }
 
@@ -190,7 +197,22 @@ namespace {
       if (script.throw_on_remove) {
         throw std::runtime_error {"the driver refused to talk"};
       }
+      std::lock_guard lock {log->mutex};
+      if (log->refuse_removal.contains(id.string())) {
+        return false;
+      }
+      if (script.remove_succeeds) {
+        log->live_ids.erase(id.string());
+      }
       return script.remove_succeeds;
+    }
+
+    std::string device_id(const uuid_util::uuid_t &id) override {
+      std::lock_guard lock {log->mutex};
+      if (log->device_ids_unknown || !log->live_ids.contains(id.string())) {
+        return {};
+      }
+      return id.string() + "-dev";
     }
 
     virtual_display::resolution_t resolve(const uuid_util::uuid_t &id, const virtual_display::mode_t &) override {
@@ -1295,4 +1317,193 @@ TEST_F(VirtualDisplayTest, ADriverThatThrowsOnRemovalKeepsTheLeaseOutOfUse) {
 
   std::lock_guard lock {log->mutex};
   EXPECT_EQ(log->adds, adds_before);
+}
+
+TEST_F(VirtualDisplayTest, AReplacementComesUpUnderTheOtherIdentityAndLeavesTheStreamAlone) {
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({});
+  const auto first = std::get<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, ""));
+
+  const auto result = manager->prepare_replacement({2560, 1080, 60000});
+
+  const auto &replacement = std::get<virtual_display::display_t>(result);
+  EXPECT_FALSE(replacement.device_id.empty());
+  EXPECT_NE(replacement.device_id, first.device_id);
+  // The stream keeps the leased display until told otherwise.
+  EXPECT_EQ(manager->output_override(), first.device_id);
+  EXPECT_TRUE(manager->leased());
+
+  std::lock_guard lock {log->mutex};
+  ASSERT_EQ(log->added_order.size(), 2u);
+  EXPECT_NE(log->added_order[0], log->added_order[1]);
+  EXPECT_EQ(log->last_mode.width, 2560);
+  EXPECT_EQ(log->last_mode.height, 1080);
+  EXPECT_EQ(log->removes, 0);
+}
+
+TEST_F(VirtualDisplayTest, TheCaptureFollowsTheReplacementOnlyWhenToldTo) {
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({});
+  const auto first = std::get<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, ""));
+  const auto replacement = std::get<virtual_display::display_t>(manager->prepare_replacement({2560, 1080, 60000}));
+
+  manager->use_replacement(true);
+  EXPECT_EQ(manager->output_override(), replacement.device_id);
+
+  manager->use_replacement(false);
+  EXPECT_EQ(manager->output_override(), first.device_id);
+}
+
+TEST_F(VirtualDisplayTest, CommittingRemovesTheOldDisplayAndTheIdentitiesTakeTurns) {
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({});
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
+  const auto second = std::get<virtual_display::display_t>(manager->prepare_replacement({2560, 1080, 60000}));
+  manager->use_replacement(true);
+
+  EXPECT_TRUE(manager->commit_replacement());
+
+  EXPECT_TRUE(manager->leased());
+  EXPECT_EQ(manager->output_override(), second.device_id);
+  std::vector<std::string> added;
+  {
+    std::lock_guard lock {log->mutex};
+    added = log->added_order;
+    EXPECT_EQ(log->removed_ids, std::set<std::string> {added[0]});
+  }
+
+  // The next resize takes the first identity again, so Windows only ever
+  // sees two monitors for the session.
+  const auto third = std::get<virtual_display::display_t>(manager->prepare_replacement({1280, 720, 60000}));
+  manager->use_replacement(true);
+  EXPECT_TRUE(manager->commit_replacement());
+  EXPECT_EQ(manager->output_override(), third.device_id);
+
+  std::lock_guard lock {log->mutex};
+  ASSERT_EQ(log->added_order.size(), 3u);
+  EXPECT_EQ(log->added_order[2], log->added_order[0]);
+  EXPECT_TRUE(log->removed_ids.contains(log->added_order[1]));
+}
+
+TEST_F(VirtualDisplayTest, AbandoningRemovesOnlyTheReplacement) {
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({});
+  const auto first = std::get<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, ""));
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->prepare_replacement({2560, 1080, 60000})));
+  manager->use_replacement(true);
+
+  EXPECT_TRUE(manager->abandon_replacement());
+
+  EXPECT_TRUE(manager->leased());
+  EXPECT_EQ(manager->output_override(), first.device_id);
+  std::lock_guard lock {log->mutex};
+  EXPECT_EQ(log->removed_ids, std::set<std::string> {log->added_order[1]});
+}
+
+TEST_F(VirtualDisplayTest, AReplacementWindowsNeverLearnsOfIsNotReadyAndStillOwed) {
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({});
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
+  {
+    std::lock_guard lock {log->mutex};
+    log->device_ids_unknown = true;
+  }
+
+  EXPECT_EQ(error_of(manager->prepare_replacement({2560, 1080, 60000})), virtual_display::error_e::not_ready);
+
+  // Nothing to capture, so the stream stays where it is.
+  manager->use_replacement(true);
+  EXPECT_TRUE(manager->output_override().has_value());
+  EXPECT_TRUE(manager->abandon_replacement());
+
+  std::lock_guard lock {log->mutex};
+  EXPECT_EQ(log->removed_ids, std::set<std::string> {log->added_order[1]});
+}
+
+TEST_F(VirtualDisplayTest, ReleaseRemovesAReplacementToo) {
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({});
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->prepare_replacement({2560, 1080, 60000})));
+
+  manager->release();
+
+  EXPECT_EQ(manager->state(), virtual_display::state_e::idle);
+  std::lock_guard lock {log->mutex};
+  EXPECT_EQ(log->removed_ids, (std::set<std::string> {log->added_order[0], log->added_order[1]}));
+  EXPECT_TRUE(log->live_ids.empty());
+}
+
+TEST_F(VirtualDisplayTest, AnOldDisplayThatWillNotGoIsClearedBeforeItsIdentityIsReused) {
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({});
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
+  const auto second = std::get<virtual_display::display_t>(manager->prepare_replacement({2560, 1080, 60000}));
+  std::string old_id;
+  {
+    std::lock_guard lock {log->mutex};
+    old_id = log->added_order[0];
+    log->refuse_removal.insert(old_id);
+  }
+
+  // The new display is streamed anyway.
+  EXPECT_FALSE(manager->commit_replacement());
+  EXPECT_EQ(manager->output_override(), second.device_id);
+  EXPECT_TRUE(manager->leased());
+
+  // Its identity is still taken, so another resize has to wait.
+  EXPECT_EQ(error_of(manager->prepare_replacement({1280, 720, 60000})), virtual_display::error_e::busy);
+  {
+    std::lock_guard lock {log->mutex};
+    EXPECT_EQ(log->adds, 2);
+    log->refuse_removal.clear();
+  }
+
+  // Once the driver lets go, the next resize clears it first and reuses the identity.
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->prepare_replacement({1280, 720, 60000})));
+  std::lock_guard lock {log->mutex};
+  ASSERT_EQ(log->added_order.size(), 3u);
+  EXPECT_EQ(log->added_order[2], old_id);
+  EXPECT_EQ(log->order[log->order.size() - 2], "remove");
+  EXPECT_EQ(log->order.back(), "add");
+}
+
+TEST_F(VirtualDisplayTest, AReplacementNeedsALease) {
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({});
+
+  EXPECT_EQ(error_of(manager->prepare_replacement({2560, 1080, 60000})), virtual_display::error_e::not_leased);
+  EXPECT_FALSE(manager->commit_replacement());
+  EXPECT_TRUE(manager->abandon_replacement());
+
+  std::lock_guard lock {log->mutex};
+  EXPECT_EQ(log->adds, 0);
+  EXPECT_EQ(log->removes, 0);
+}
+
+TEST_F(VirtualDisplayTest, APingDuringAResizeWaitsInsteadOfPoisoningTheDriver) {
+  // The heartbeat keeps pinging while a resize talks to the driver. A call
+  // that arrives while another is in flight, and still being waited on, is a
+  // queue, not a driver that stopped answering.
+  auto add_gate = std::make_shared<gate_t>();
+  auto [log, gate, ping_gate, remove_gate, manager] = make_rig({.watchdog = std::chrono::seconds {1}}, add_gate);
+  {
+    std::lock_guard lock {log->mutex};
+    log->hold_add = 2;
+  }
+  ASSERT_TRUE(std::holds_alternative<virtual_display::display_t>(manager->acquire("Client", "uid", k_mode, "")));
+
+  auto replacement = std::async(std::launch::async, [&manager] {
+    return manager->prepare_replacement({2560, 1080, 60000});
+  });
+  add_gate->await_arrival();
+
+  int pings_before = 0;
+  {
+    std::lock_guard lock {log->mutex};
+    pings_before = log->pings;
+  }
+  // The heartbeat runs every third of a second here, so this spans pings
+  // while staying well inside the call timeout.
+  std::this_thread::sleep_for(800ms);
+  add_gate->release();
+
+  EXPECT_TRUE(std::holds_alternative<virtual_display::display_t>(replacement.get()));
+  EXPECT_EQ(manager->state(), virtual_display::state_e::active);
+
+  std::this_thread::sleep_for(500ms);
+  std::lock_guard lock {log->mutex};
+  EXPECT_GT(log->pings, pings_before);
 }
