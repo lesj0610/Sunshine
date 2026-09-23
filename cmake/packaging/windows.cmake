@@ -42,13 +42,23 @@ install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/firewall/"
         DESTINATION "scripts"
         COMPONENT firewall)
 
-# Bundled virtual display driver, installed by sunshine-setup.ps1
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sudovda/"
-        DESTINATION "scripts"
-        COMPONENT assets)
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/drivers/sudovda/"
-        DESTINATION "drivers/sudovda"
-        COMPONENT assets)
+# Bundled virtual display driver. The driver exists for AMD64 only. It is its own
+# component, off by default, because installing it trusts the driver's
+# self-signed certificate machine-wide; the MSI installs the driver only when it
+# is chosen (wix_resources/sudovda-patch.xml).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64")
+    set(SUNSHINE_BUNDLE_SUDOVDA ON)
+else()
+    set(SUNSHINE_BUNDLE_SUDOVDA OFF)
+endif()
+if(SUNSHINE_BUNDLE_SUDOVDA)
+    install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sudovda/"
+            DESTINATION "scripts"
+            COMPONENT sudovda)
+    install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/drivers/sudovda/"
+            DESTINATION "drivers/sudovda"
+            COMPONENT sudovda)
+endif()
 
 # Sunshine assets
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/assets/"
@@ -105,6 +115,18 @@ set(CPACK_COMPONENT_DXGI_GROUP "Tools")
 set(CPACK_COMPONENT_FIREWALL_DISPLAY_NAME "Add Firewall Exclusions")
 set(CPACK_COMPONENT_FIREWALL_DESCRIPTION "Scripts to enable or disable firewall rules.")
 set(CPACK_COMPONENT_FIREWALL_GROUP "Scripts")
+
+# virtual display driver
+if(SUNSHINE_BUNDLE_SUDOVDA)
+    set(CPACK_COMPONENT_SUDOVDA_DISPLAY_NAME "Virtual Display Driver")
+    string(CONCAT CPACK_COMPONENT_SUDOVDA_DESCRIPTION
+            "SudoVDA, for the Use a virtual display setting. "
+            "Trusts the driver's self-signed certificate (CN=sudovda@su.mk) machine-wide; "
+            "uninstalling Sunshine keeps it.")
+    set(CPACK_COMPONENT_SUDOVDA_GROUP "Drivers")
+    set(CPACK_COMPONENT_SUDOVDA_DISABLED true)
+    set(CPACK_COMPONENT_GROUP_DRIVERS_EXPANDED true)
+endif()
 
 # include specific packaging
 include(${CMAKE_MODULE_PATH}/packaging/windows_nsis.cmake)

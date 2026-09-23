@@ -396,16 +396,6 @@ if ($Action -eq "install") {
         -Emoji "🛡️"
     Write-Information ""
 
-    # Bundled virtual display driver. Optional: a failure here is reported but
-    # does not fail the Sunshine install.
-    $installSudoVdaScript = Join-Path $RootDir "scripts\install-sudovda.bat"
-    Invoke-ScriptIfExist `
-        -ScriptPath $installSudoVdaScript `
-        -Arguments $(if ($Silent) { "-Silent" } else { "" }) `
-        -Description "Installing the virtual display driver" `
-        -Emoji "🖥️"
-    Write-Information ""
-
     # 4. Install service
     $currentStep++
     Write-Progress `
@@ -472,14 +462,6 @@ if ($Action -eq "install") {
         -ScriptPath $deleteFirewallScript `
         -Description "Removing firewall rules" `
         -Emoji "🛡️"
-    Write-Information ""
-
-    # Bundled virtual display driver
-    $uninstallSudoVdaScript = Join-Path $RootDir "scripts\uninstall-sudovda.bat"
-    Invoke-ScriptIfExist `
-        -ScriptPath $uninstallSudoVdaScript `
-        -Description "Removing the virtual display driver" `
-        -Emoji "🖥️"
     Write-Information ""
 
     # 2. Uninstall service
