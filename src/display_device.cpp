@@ -1042,6 +1042,12 @@ namespace display_device {
     return std::nullopt;
   }
 
+  bool stream_resize_supported() {
+    using enum config::video_t::dd_t::config_option_e;
+    const auto option {config::video.dd.configuration_option};
+    return virtual_display::manager().leased() && (option == ensure_primary || option == ensure_only_display);
+  }
+
   bool configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
     const auto result {parse_configuration(video_config, session)};
     if (const auto *parsed_config {std::get_if<SingleDisplayConfiguration>(&result)}; parsed_config) {

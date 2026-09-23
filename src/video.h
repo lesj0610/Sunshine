@@ -6,6 +6,7 @@
 
 // standard includes
 #include <chrono>
+#include <cstdint>
 #include <string_view>
 
 // local includes
@@ -39,6 +40,29 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+  };
+
+  /**
+   * @brief A new size for a running stream, handed to the video thread.
+   *
+   * The video thread applies it where it makes the encoder anyway, and says
+   * whether an encoder for it runs through a config_ack_t with the same
+   * generation. A resize that gave up on one change and made another can
+   * then tell the answers apart.
+   */
+  struct config_change_t {
+    std::uint64_t generation {};  ///< Tells this change apart from the others.
+    int width {};  ///< New width in pixels.
+    int height {};  ///< New height in pixels.
+    int framerate {};  ///< New frame rate.
+  };
+
+  /**
+   * @brief Whether the video thread applied a config change.
+   */
+  struct config_ack_t {
+    std::uint64_t generation {};  ///< The change this answers.
+    bool applied {};  ///< True once an encoder for it is running. False means the old config was kept.
   };
 
   namespace amf {

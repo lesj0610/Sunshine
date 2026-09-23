@@ -110,6 +110,18 @@ namespace display_device {
   [[nodiscard]] std::optional<std::string> prepare_virtual_display(const rtsp_stream::launch_session_t &session);
 
   /**
+   * @brief Whether a running stream can be resized without reconnecting.
+   *
+   * A resize replaces the virtual display and removes the one it replaced.
+   * That only keeps the desktop where it is when the new display takes over
+   * as the primary one, which the Verify and Activate options do not do:
+   * Windows would move the windows to a physical monitor.
+   *
+   * @return True while a virtual display is leased and the configuration makes it the primary display.
+   */
+  [[nodiscard]] bool stream_resize_supported();
+
+  /**
    * @brief Ask the platform to wake displays before detection or capture.
    * @param display_name Platform capture selector.
    * @param timeout Maximum time to wait for platform-specific wake detection.

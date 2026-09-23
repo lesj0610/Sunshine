@@ -7,7 +7,9 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <functional>
 #include <list>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -628,6 +630,8 @@ namespace video {
     safe::mail_raw_t::event_t<bool> idr_events;  ///< Event raised when an IDR frame is requested.
     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;  ///< Event carrying updated HDR metadata.
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;  ///< Event carrying updated touch viewport metadata.
+    safe::mail_raw_t::event_t<config_change_t> config_change_events;  ///< Event carrying a new size for the stream.
+    safe::mail_raw_t::queue_t<config_ack_t> config_ack_events;  ///< Queue answering whether a new size was applied.
 
     config_t config;  ///< Stream or encoder configuration captured for the worker.
     int frame_nr;  ///< Next capture-frame number assigned to encoded packets.
@@ -1537,14 +1541,17 @@ namespace video {
         }
       }
 
-      // The old display was removed, so we'll start back at the first display again
+      // The old display is gone. The configured output is the best guess at
+      // where the desktop went, which is how the capture follows a virtual
+      // display that a resize replaced. Failing that, we start back at the
+      // first display.
       BOOST_LOG(warning) << "Previous active display ["sv << current_display_name << "] is no longer present"sv;
-    } else {
-      for (int x = 0; x < display_names.size(); ++x) {
-        if (display_names[x] == output_name) {
-          current_display_index = x;
-          return;
-        }
+    }
+
+    for (int x = 0; x < display_names.size(); ++x) {
+      if (display_names[x] == output_name) {
+        current_display_index = x;
+        return;
       }
     }
   }
@@ -2396,6 +2403,7 @@ namespace video {
    * @param reinit_event Signal raised while the encoder/display is reinitializing.
    * @param encoder Selected encoder.
    * @param channel_data Opaque channel data passed to packets.
+   * @param started Called once the encode session exists and is about to encode.
    */
   void encode_run(
     int &frame_nr,  // Store progress of the frame number
@@ -2406,7 +2414,8 @@ namespace video {
     std::unique_ptr<platf::encode_device_t> encode_device,
     safe::signal_t &reinit_event,
     const encoder_t &encoder,
-    void *channel_data
+    void *channel_data,
+    const std::function<void()> &started
   ) {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
@@ -2439,6 +2448,7 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto config_changes = mail->event<config_change_t>(mail::video_config_change);
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2450,6 +2460,8 @@ namespace video {
         return;
       }
     }
+
+    started();
 
     while (true) {
       bool requested_idr_frame = false;
@@ -2498,6 +2510,11 @@ namespace video {
         break;
       }
 
+      // A new size means a new encoder, which the caller makes
+      if (config_changes->peek()) {
+        break;
+      }
+
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
@@ -2508,6 +2525,22 @@ namespace video {
       // While streaming check to see if the mouse is present and enable Mouse Keys to force the cursor to appear
       // This is useful for KVM switch scenarios where mouse may disappear during streaming
       platf::enable_mouse_keys();
+    }
+  }
+
+  /**
+   * @brief Apply a resize to an encoder config.
+   *
+   * @param config Config to change.
+   * @param change The new size and frame rate.
+   */
+  void apply_config_change(config_t &config, const config_change_t &change) {
+    config.width = change.width;
+    config.height = change.height;
+    if (change.framerate != config.framerate) {
+      // A fractional rate belongs to the frame rate it was given with
+      config.framerate = change.framerate;
+      config.framerateX100 = 0;
     }
   }
 
@@ -2730,7 +2763,26 @@ namespace video {
 
     std::vector<sync_session_t> synced_sessions;
     for (auto &ctx : synced_session_ctxs) {
+      // A resize asks for a new size here, where the sessions are made anyway.
+      // If no encoder runs at it, the old config is kept and the resize is told.
+      std::optional<config_change_t> change;
+      if (auto pending = ctx->config_change_events->try_pop()) {
+        change = *pending;
+      }
+      const auto previous = ctx->config;
+      if (change) {
+        apply_config_change(ctx->config, *change);
+      }
+
       auto synced_session = make_synced_session(disp.get(), encoder, *img, *ctx);
+      if (!synced_session && change) {
+        BOOST_LOG(error) << "No encoder runs at "sv << change->width << 'x' << change->height << ", keeping the previous size"sv;
+        ctx->config = previous;
+        synced_session = make_synced_session(disp.get(), encoder, *img, *ctx);
+      }
+      if (change) {
+        ctx->config_ack_events->raise(config_ack_t {change->generation, synced_session && ctx->config.width == change->width && ctx->config.height == change->height});
+      }
       if (!synced_session) {
         return encode_e::error;
       }
@@ -2774,6 +2826,12 @@ namespace video {
             }
 
             continue;
+          }
+
+          if (ctx->config_change_events->peek()) {
+            // A new size means new sessions, which are made after a reinit
+            ec = platf::capture_e::reinit;
+            return false;
           }
 
           if (ctx->idr_events->peek()) {
@@ -2900,6 +2958,8 @@ namespace video {
 
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
+    auto config_changes = mail->event<config_change_t>(mail::video_config_change);
+    auto config_acks = mail->queue<config_ack_t>(mail::video_config_ack);
 
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
@@ -2923,7 +2983,26 @@ namespace video {
 
       auto &encoder = *chosen_encoder;
 
+      // A resize asks for a new size here, where the encoder is made anyway.
+      // If no encoder runs at it, the old config is kept and the resize is
+      // told, so it can put the old display back.
+      std::optional<config_change_t> change;
+      if (auto pending = config_changes->try_pop()) {
+        change = *pending;
+      }
+      const auto previous = config;
+      if (change) {
+        apply_config_change(config, *change);
+      }
+
       auto encode_device = make_encode_device(*display, encoder, config);
+      if (!encode_device && change) {
+        BOOST_LOG(error) << "No encoder runs at "sv << change->width << 'x' << change->height << ", keeping the previous size"sv;
+        config_acks->raise(config_ack_t {change->generation, false});
+        change.reset();
+        config = previous;
+        encode_device = make_encode_device(*display, encoder, config);
+      }
       if (!encode_device) {
         return;
       }
@@ -2951,8 +3030,21 @@ namespace video {
         std::move(encode_device),
         ref->reinit_event,
         *ref->encoder_p,
-        channel_data
+        channel_data,
+        [&change, &config_acks] {
+          if (change) {
+            config_acks->raise(config_ack_t {change->generation, true});
+            change.reset();
+          }
+        }
       );
+
+      if (change) {
+        // The encode session for the new size never started
+        BOOST_LOG(error) << "No encode session runs at "sv << change->width << 'x' << change->height << ", keeping the previous size"sv;
+        config_acks->raise(config_ack_t {change->generation, false});
+        config = previous;
+      }
     }
   }
 
@@ -2985,6 +3077,8 @@ namespace video {
         std::move(idr_events),
         mail->event<hdr_info_t>(mail::hdr),
         mail->event<input::touch_port_t>(mail::touch_port),
+        mail->event<config_change_t>(mail::video_config_change),
+        mail->queue<config_ack_t>(mail::video_config_ack),
         config,
         1,
         channel_data,
