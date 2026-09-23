@@ -1150,9 +1150,10 @@ supported on the current platform.
             one, and `ensure_only_display` deactivates them for the duration of the stream. Pick one of the
             first two to leave the host's screens alone.
 
-            @note{Requires the SudoVDA virtual display driver, which the Windows installer sets up. If the
-            driver is missing or does not answer, the session is refused with a 503 rather than served from an
-            attached monitor, since that monitor's resolution would then be changed instead.}
+            @note{Requires the SudoVDA virtual display driver. The Windows installer can set it up on AMD64,
+            where it is an optional feature that is off unless chosen. If the driver is missing or does not
+            answer, the session is refused with a 503 rather than served from an attached monitor, since that
+            monitor's resolution would then be changed instead.}
             @note{Only one session at a time can use a virtual display, because Sunshine captures one output.
             A second session is refused while the first holds it.}
             @note{Has no effect while `dd_configuration_option` is `disabled`, since nothing would then set
