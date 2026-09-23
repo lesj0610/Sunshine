@@ -1,6 +1,12 @@
 # windows specific packaging
 install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
 
+# Notices for third-party code this fork compiles into sunshine.exe. Part of the
+# application component, so they are installed whatever else is chosen.
+install(FILES "${CMAKE_SOURCE_DIR}/third-party/sudovda/THIRD_PARTY_NOTICES.txt"
+        DESTINATION "."
+        COMPONENT application)
+
 # Hardening: include zlib1.dll (loaded via LoadLibrary() in openssl's libcrypto.a)
 install(FILES "${ZLIB}" DESTINATION "." COMPONENT application)
 
