@@ -636,6 +636,9 @@ namespace video {
     config_t config;  ///< Stream or encoder configuration captured for the worker.
     int frame_nr;  ///< Next capture-frame number assigned to encoded packets.
     void *channel_data;  ///< Platform-specific channel data forwarded to packet senders.
+
+    std::optional<config_change_progress_t> progress {};  ///< A resize being carried out, until it is answered.
+    config_t previous {};  ///< The config to go back to if that resize fails.
   };
 
   /**
@@ -673,6 +676,7 @@ namespace video {
     safe::signal_t reinit_event;  ///< Reinit event.
     const encoder_t *encoder_p;  ///< Encoder p.
     sync_util::sync_t<std::weak_ptr<platf::display_t>> display_wp;  ///< Display wp.
+    std::string display_name;  ///< Name of the display display_wp points at. Guarded by display_wp's lock.
   };
 
   /**
@@ -1541,17 +1545,14 @@ namespace video {
         }
       }
 
-      // The old display is gone. The configured output is the best guess at
-      // where the desktop went, which is how the capture follows a virtual
-      // display that a resize replaced. Failing that, we start back at the
-      // first display.
+      // The old display was removed, so we'll start back at the first display again
       BOOST_LOG(warning) << "Previous active display ["sv << current_display_name << "] is no longer present"sv;
-    }
-
-    for (int x = 0; x < display_names.size(); ++x) {
-      if (display_names[x] == output_name) {
-        current_display_index = x;
-        return;
+    } else {
+      for (int x = 0; x < display_names.size(); ++x) {
+        if (display_names[x] == output_name) {
+          current_display_index = x;
+          return;
+        }
       }
     }
   }
@@ -1561,12 +1562,14 @@ namespace video {
    *
    * @param capture_ctx_queue Capture context queue.
    * @param display_wp Weak pointer holder for the active display.
+   * @param display_name Name of the active display, set under display_wp's lock.
    * @param reinit_event Signal raised while the display is being reinitialized.
    * @param encoder Selected encoder.
    */
   void captureThread(
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue,
     sync_util::sync_t<std::weak_ptr<platf::display_t>> &display_wp,
+    std::string &display_name,
     safe::signal_t &reinit_event,
     const encoder_t &encoder
   ) {
@@ -1585,6 +1588,7 @@ namespace video {
     });
 
     auto switch_display_event = mail::man->event<int>(mail::switch_display);
+    auto retarget_event = mail::man->event<std::string>(mail::retarget_display);
 
     // Wait for the initial capture context or a request to stop the queue
     auto initial_capture_ctx = capture_ctx_queue->pop();
@@ -1602,7 +1606,11 @@ namespace video {
     if (!disp) {
       return;
     }
-    display_wp = disp;
+    {
+      auto lg = display_wp.lock();
+      display_wp.raw = disp;
+      display_name = display_names[display_p];
+    }
 
     constexpr auto capture_buffer_size = 12;
     std::list<std::shared_ptr<platf::img_t>> imgs(capture_buffer_size);
@@ -1731,7 +1739,7 @@ namespace video {
           capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
         }
 
-        if (switch_display_event->peek()) {
+        if (switch_display_event->peek() || retarget_event->peek()) {
           artificial_reinit = true;
           return false;
         }
@@ -1788,6 +1796,11 @@ namespace video {
               // Refresh display names since a display removal might have caused the reinitialization
               refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
 
+              // A resize names the display it moved the desktop onto
+              if (retarget_event->peek()) {
+                display_p = choose_display(display_names, display_p, retarget_event->pop());
+              }
+
               // Process any pending display switch with the new list of displays
               if (switch_display_event->peek()) {
                 display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
@@ -1803,7 +1816,11 @@ namespace video {
               return;
             }
 
-            display_wp = disp;
+            {
+              auto lg = display_wp.lock();
+              display_wp.raw = disp;
+              display_name = display_names[display_p];
+            }
 
             reinit_event.reset();
             continue;
@@ -2404,6 +2421,7 @@ namespace video {
    * @param encoder Selected encoder.
    * @param channel_data Opaque channel data passed to packets.
    * @param started Called once the encode session exists and is about to encode.
+   * @param encoded Called after each frame is encoded, with whether it came from an image captured from disp.
    */
   void encode_run(
     int &frame_nr,  // Store progress of the frame number
@@ -2415,7 +2433,8 @@ namespace video {
     safe::signal_t &reinit_event,
     const encoder_t &encoder,
     void *channel_data,
-    const std::function<void()> &started
+    const std::function<void()> &started,
+    const std::function<void(bool)> &encoded
   ) {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
@@ -2482,10 +2501,15 @@ namespace video {
       }
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+      bool captured = false;
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
+          // Only an image of the display being encoded counts. One captured
+          // before a reinitialization can still be queued, and after a
+          // resize it is of the other display, which has another size.
+          captured = img->width == disp->width && img->height == disp->height;
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
@@ -2519,6 +2543,7 @@ namespace video {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
       }
+      encoded(captured);
 
       session->request_normal_frame();
 
@@ -2542,6 +2567,46 @@ namespace video {
       config.framerate = change.framerate;
       config.framerateX100 = 0;
     }
+  }
+
+  config_change_progress_t::config_change_progress_t(config_change_t change):
+      m_change {std::move(change)},
+      m_on_target {m_change.output_name.empty()} {
+  }
+
+  const config_change_t &config_change_progress_t::change() const {
+    return m_change;
+  }
+
+  void config_change_progress_t::capturing(const std::string &display_name) {
+    m_on_target = m_change.output_name.empty() || display_name == m_change.output_name;
+  }
+
+  bool config_change_progress_t::on_target() const {
+    return m_on_target;
+  }
+
+  std::optional<config_ack_t> config_change_progress_t::frame_encoded(bool captured) const {
+    // A made-up or repeated frame says nothing about what the capture sees
+    if (!m_on_target || !captured) {
+      return std::nullopt;
+    }
+    return config_ack_t {m_change.generation, true};
+  }
+
+  config_ack_t config_change_progress_t::failed() const {
+    return config_ack_t {m_change.generation, false};
+  }
+
+  int choose_display(const std::vector<std::string> &display_names, int current_index, const std::optional<std::string> &target) {
+    if (target) {
+      const auto found = std::ranges::find(display_names, *target);
+      if (found != display_names.end()) {
+        return static_cast<int>(found - display_names.begin());
+      }
+      BOOST_LOG(warning) << "The display a resize asked for ["sv << *target << "] is not among the displays that can be captured"sv;
+    }
+    return current_index;
   }
 
   /**
@@ -2736,9 +2801,47 @@ namespace video {
       synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*ctx)));
     }
 
+    // A resize asks for a new size here, where the sessions are made anyway,
+    // and before the display is picked, since it names the display to capture.
+    // A change that replaces one not answered yet answers that one no.
+    const auto keep_previous = [](sync_session_ctx_t &ctx, std::string_view why) {
+      BOOST_LOG(error) << "Stream resize to "sv << ctx.progress->change().width << 'x' << ctx.progress->change().height
+                       << ": "sv << why << ", keeping the previous size"sv;
+      ctx.config_ack_events->raise(ctx.progress->failed());
+      ctx.config = ctx.previous;
+      ctx.progress.reset();
+    };
+
+    std::optional<std::string> target;
+    for (auto &ctx : synced_session_ctxs) {
+      if (auto pending = ctx->config_change_events->try_pop()) {
+        if (ctx->progress) {
+          keep_previous(*ctx, "a newer change replaced it"sv);
+        }
+        ctx->previous = ctx->config;
+        apply_config_change(ctx->config, *pending);
+        ctx->progress.emplace(std::move(*pending));
+      }
+      if (ctx->progress && !ctx->progress->change().output_name.empty()) {
+        target = ctx->progress->change().output_name;
+      }
+    }
+
+    const auto target_deadline = std::chrono::steady_clock::now() + 3s;
     while (encode_session_ctx_queue.running()) {
       // Refresh display names since a display removal might have caused the reinitialization
       refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+
+      // A resize names the display it moved the desktop onto. The list can
+      // lag behind the move, so it is looked for again for a while.
+      if (target) {
+        const auto chosen = choose_display(display_names, display_p, target);
+        if (display_names[chosen] != *target && std::chrono::steady_clock::now() < target_deadline) {
+          std::this_thread::sleep_for(250ms);
+          continue;
+        }
+        display_p = chosen;
+      }
 
       // Process any pending display switch with the new list of displays
       if (switch_display_event->peek()) {
@@ -2763,25 +2866,17 @@ namespace video {
 
     std::vector<sync_session_t> synced_sessions;
     for (auto &ctx : synced_session_ctxs) {
-      // A resize asks for a new size here, where the sessions are made anyway.
-      // If no encoder runs at it, the old config is kept and the resize is told.
-      std::optional<config_change_t> change;
-      if (auto pending = ctx->config_change_events->try_pop()) {
-        change = *pending;
-      }
-      const auto previous = ctx->config;
-      if (change) {
-        apply_config_change(ctx->config, *change);
+      if (ctx->progress) {
+        ctx->progress->capturing(display_names[display_p]);
+        if (!ctx->progress->on_target()) {
+          keep_previous(*ctx, "the capture did not move to the new display"sv);
+        }
       }
 
       auto synced_session = make_synced_session(disp.get(), encoder, *img, *ctx);
-      if (!synced_session && change) {
-        BOOST_LOG(error) << "No encoder runs at "sv << change->width << 'x' << change->height << ", keeping the previous size"sv;
-        ctx->config = previous;
+      if (!synced_session && ctx->progress) {
+        keep_previous(*ctx, "no encoder runs at this size"sv);
         synced_session = make_synced_session(disp.get(), encoder, *img, *ctx);
-      }
-      if (change) {
-        ctx->config_ack_events->raise(config_ack_t {change->generation, synced_session && ctx->config.width == change->width && ctx->config.height == change->height});
       }
       if (!synced_session) {
         return encode_e::error;
@@ -2856,6 +2951,14 @@ namespace video {
             ctx->shutdown_event->raise(true);
 
             continue;
+          }
+
+          // A resize is answered once a frame captured from its display was encoded at its size
+          if (ctx->progress) {
+            if (const auto ack = ctx->progress->frame_encoded(frame_captured)) {
+              ctx->config_ack_events->raise(*ack);
+              ctx->progress.reset();
+            }
           }
 
           pos->session->request_normal_frame();
@@ -2960,6 +3063,22 @@ namespace video {
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
     auto config_changes = mail->event<config_change_t>(mail::video_config_change);
     auto config_acks = mail->queue<config_ack_t>(mail::video_config_ack);
+    auto retarget_event = mail::man->event<std::string>(mail::retarget_display);
+
+    // A resize being carried out: the change, the config to go back to, and
+    // how long the capture has to move to the display it names.
+    std::optional<config_change_progress_t> progress;
+    config_t previous = config;
+    std::chrono::steady_clock::time_point capture_deadline;
+    std::chrono::steady_clock::time_point next_retarget;
+
+    const auto keep_previous = [&](std::string_view why) {
+      BOOST_LOG(error) << "Stream resize to "sv << progress->change().width << 'x' << progress->change().height
+                       << ": "sv << why << ", keeping the previous size"sv;
+      config_acks->raise(progress->failed());
+      config = previous;
+      progress.reset();
+    };
 
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
@@ -2970,8 +3089,24 @@ namespace video {
         std::this_thread::sleep_for(20ms);
         continue;
       }
+
+      // A resize asks for a new size here, where the encoder is made anyway
+      if (auto pending = config_changes->try_pop()) {
+        if (progress) {
+          keep_previous("a newer change replaced it"sv);
+        }
+        previous = config;
+        apply_config_change(config, *pending);
+        progress.emplace(std::move(*pending));
+
+        const auto now = std::chrono::steady_clock::now();
+        capture_deadline = now + 3s;
+        next_retarget = now;
+      }
+
       // Wait for the display to be ready
       std::shared_ptr<platf::display_t> display;
+      std::string display_name;
       {
         auto lg = ref->display_wp.lock();
         if (ref->display_wp->expired()) {
@@ -2979,28 +3114,37 @@ namespace video {
         }
 
         display = ref->display_wp->lock();
+        display_name = ref->display_name;
+      }
+
+      if (progress) {
+        progress->capturing(display_name);
+        if (!progress->on_target()) {
+          // Nothing is encoded at the new size until the capture is on the
+          // display the resize named, so a frame of the old display never
+          // goes out as the new one. The display is let go while waiting,
+          // since the capture cannot reinitialize while it is held.
+          display.reset();
+
+          const auto now = std::chrono::steady_clock::now();
+          if (now >= capture_deadline) {
+            keep_previous("the capture did not move to the new display"sv);
+            continue;
+          }
+          if (now >= next_retarget) {
+            retarget_event->raise(progress->change().output_name);
+            next_retarget = now + 500ms;
+          }
+          std::this_thread::sleep_for(20ms);
+          continue;
+        }
       }
 
       auto &encoder = *chosen_encoder;
 
-      // A resize asks for a new size here, where the encoder is made anyway.
-      // If no encoder runs at it, the old config is kept and the resize is
-      // told, so it can put the old display back.
-      std::optional<config_change_t> change;
-      if (auto pending = config_changes->try_pop()) {
-        change = *pending;
-      }
-      const auto previous = config;
-      if (change) {
-        apply_config_change(config, *change);
-      }
-
       auto encode_device = make_encode_device(*display, encoder, config);
-      if (!encode_device && change) {
-        BOOST_LOG(error) << "No encoder runs at "sv << change->width << 'x' << change->height << ", keeping the previous size"sv;
-        config_acks->raise(config_ack_t {change->generation, false});
-        change.reset();
-        config = previous;
+      if (!encode_device && progress) {
+        keep_previous("no encoder runs at this size"sv);
         encode_device = make_encode_device(*display, encoder, config);
       }
       if (!encode_device) {
@@ -3021,6 +3165,7 @@ namespace video {
       }
       hdr_event->raise(std::move(hdr_info));
 
+      bool session_started = false;
       encode_run(
         frame_nr,
         mail,
@@ -3031,19 +3176,23 @@ namespace video {
         ref->reinit_event,
         *ref->encoder_p,
         channel_data,
-        [&change, &config_acks] {
-          if (change) {
-            config_acks->raise(config_ack_t {change->generation, true});
-            change.reset();
+        [&session_started] {
+          session_started = true;
+        },
+        [&progress, &config_acks](bool captured) {
+          // A resize is answered once a frame captured from its display was encoded at its size
+          if (!progress) {
+            return;
+          }
+          if (const auto ack = progress->frame_encoded(captured)) {
+            config_acks->raise(*ack);
+            progress.reset();
           }
         }
       );
 
-      if (change) {
-        // The encode session for the new size never started
-        BOOST_LOG(error) << "No encode session runs at "sv << change->width << 'x' << change->height << ", keeping the previous size"sv;
-        config_acks->raise(config_ack_t {change->generation, false});
-        config = previous;
+      if (progress && !session_started) {
+        keep_previous("no encode session runs at this size"sv);
       }
     }
   }
@@ -3754,6 +3903,7 @@ namespace video {
       captureThread,
       capture_thread_ctx.capture_ctx_queue,
       std::ref(capture_thread_ctx.display_wp),
+      std::ref(capture_thread_ctx.display_name),
       std::ref(capture_thread_ctx.reinit_event),
       std::ref(*capture_thread_ctx.encoder_p)
     };

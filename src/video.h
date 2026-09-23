@@ -7,7 +7,10 @@
 // standard includes
 #include <chrono>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
 // local includes
 #include "input.h"
@@ -45,16 +48,17 @@ namespace video {
   /**
    * @brief A new size for a running stream, handed to the video thread.
    *
-   * The video thread applies it where it makes the encoder anyway, and says
-   * whether an encoder for it runs through a config_ack_t with the same
-   * generation. A resize that gave up on one change and made another can
-   * then tell the answers apart.
+   * The video thread moves the capture to the named display, applies the
+   * size where it makes the encoder anyway, and answers through a
+   * config_ack_t with the same generation. A resize that gave up on one
+   * change and made another can then tell the answers apart.
    */
   struct config_change_t {
     std::uint64_t generation {};  ///< Tells this change apart from the others.
     int width {};  ///< New width in pixels.
     int height {};  ///< New height in pixels.
     int framerate {};  ///< New frame rate.
+    std::string output_name;  ///< Display to capture, as the capture names displays. Empty to keep the current one.
   };
 
   /**
@@ -62,8 +66,78 @@ namespace video {
    */
   struct config_ack_t {
     std::uint64_t generation {};  ///< The change this answers.
-    bool applied {};  ///< True once an encoder for it is running. False means the old config was kept.
+    bool applied {};  ///< True once a frame captured from the named display was encoded at the new config. False means the old config was kept.
   };
+
+  /**
+   * @brief One config change, from being picked up to being answered.
+   *
+   * The answer is yes only once a frame captured from the display the change
+   * names has been encoded at the new config. Until then the change may be
+   * waiting for the capture to move there, and anything that ends it before
+   * that is a no, which puts the old config back.
+   */
+  class config_change_progress_t {
+  public:
+    /**
+     * @param change The change being carried out.
+     */
+    explicit config_change_progress_t(config_change_t change);
+
+    /**
+     * @brief The change being carried out.
+     *
+     * @return The change.
+     */
+    [[nodiscard]] const config_change_t &change() const;
+
+    /**
+     * @brief Say which display is being captured now.
+     *
+     * @param display_name The display, as the capture names it.
+     */
+    void capturing(const std::string &display_name);
+
+    /**
+     * @brief Whether the display being captured is the one the change names.
+     *
+     * @return True if so, or if the change names none.
+     */
+    [[nodiscard]] bool on_target() const;
+
+    /**
+     * @brief A frame was encoded at the new config.
+     *
+     * @param captured False for a frame made up or repeated while waiting for the capture.
+     * @return The answer, once it is yes.
+     */
+    [[nodiscard]] std::optional<config_ack_t> frame_encoded(bool captured) const;
+
+    /**
+     * @brief The answer when the change cannot be carried out.
+     *
+     * @return A no for this change.
+     */
+    [[nodiscard]] config_ack_t failed() const;
+
+  private:
+    config_change_t m_change;
+    bool m_on_target;
+  };
+
+  /**
+   * @brief Pick the display to capture once the list of displays is refreshed.
+   *
+   * A resize names the display it moved the desktop onto. That wins over the
+   * display being captured, which may well still be on the list, since the
+   * old display is only removed once the new one is streamed.
+   *
+   * @param display_names Displays that can be captured.
+   * @param current_index The pick so far.
+   * @param target The display a resize asked for, if any.
+   * @return The index to capture: the target's if it is on the list, otherwise the pick so far.
+   */
+  [[nodiscard]] int choose_display(const std::vector<std::string> &display_names, int current_index, const std::optional<std::string> &target);
 
   namespace amf {
 

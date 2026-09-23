@@ -565,7 +565,8 @@ namespace stream {
 
     struct {
       std::unique_ptr<stream_resize::coordinator_t> coordinator;  ///< Resizes the stream in place, when the host can.
-      safe::mail_raw_t::queue_t<stream_resize::result_t> results;  ///< Answers waiting for the control thread.
+      safe::mail_raw_t::queue_t<stream_resize::result_t> results;  ///< Answers handed to the control thread.
+      stream_resize::outbox_t outbox;  ///< Answers the control thread has not got out yet. Only it touches this.
     } resize;  ///< Resizing the stream without reconnecting.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
@@ -1204,7 +1205,7 @@ namespace stream {
       encrypted_payload;
 
     auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
-    if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+    if (payload.empty() || session->broadcast_ref->control_server.send(payload, session->control.peer)) {
       TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
       BOOST_LOG(warning) << "Couldn't send a stream resize answer to ["sv << addr << ':' << port << ']';
 
@@ -1217,14 +1218,27 @@ namespace stream {
   /**
    * @brief Send every stream resize answer waiting for the control thread.
    *
+   * An answer that does not go out is kept and tried again, with the ones
+   * after it held back so they stay in order.
+   *
    * @param session Session to send them to.
+   * @return False once answers have been failing to go out for too long.
    */
-  void send_stream_resize_results(session_t *session) {
+  bool send_stream_resize_results(session_t *session) {
     auto &results = session->resize.results;
-    while (session->control.peer && results->peek()) {
-      auto result = results->pop();
-      send_stream_resize_result(session, *result);
+    while (results->peek()) {
+      session->resize.outbox.push(*results->pop());
     }
+
+    if (!session->control.peer) {
+      // Still waiting for PING from Moonlight
+      return true;
+    }
+
+    return session->resize.outbox.flush([session](const stream_resize::result_t &result) {
+      return send_stream_resize_result(session, result) == 0;
+    },
+                                        std::chrono::steady_clock::now());
   }
 
   /**
@@ -1475,7 +1489,12 @@ namespace stream {
               send_hdr_mode(session, std::move(hdr_info));
             }
 
-            send_stream_resize_results(session);
+            if (!send_stream_resize_results(session)) {
+              // The client cannot tell what size the stream is without the
+              // answer, so the session is ended rather than left like that.
+              BOOST_LOG(error) << "Stream resize answers are not getting through to the client. Ending the session."sv;
+              session::stop(*session);
+            }
           }
 
           ++pos;
@@ -2359,18 +2378,27 @@ namespace stream {
 
   private:
     /**
-     * @brief Ask the video thread for a new encoder, and wait for it to run.
+     * @brief Ask the video thread for a new encoder on the display the stream should show, and wait for it.
      *
      * @param mode What to encode at.
-     * @return True once an encoder for it runs.
+     * @return True once a frame captured from that display was encoded at the mode.
      */
     bool apply_video(const stream_resize::stream_mode_t &mode) {
-      const auto generation = ++m_video_generation;
-      m_changes->raise(video::config_change_t {generation, mode.width, mode.height, mode.fps});
+      // The capture has to be on the display the configuration just put the
+      // desktop on, and it is named here rather than left for the capture to
+      // guess: the display it was on may well still be there.
+      const auto output_name = display_device::map_output_name(display_device::active_output_id(config::video));
+      if (output_name.empty()) {
+        BOOST_LOG(warning) << "Stream resize: the display to capture is not on the desktop"sv;
+        return false;
+      }
 
-      // Long enough for the capture to find the display again and for an
-      // encoder to start, which the reinitialization this causes includes.
-      constexpr auto timeout = 5s;
+      const auto generation = ++m_video_generation;
+      m_changes->raise(video::config_change_t {generation, mode.width, mode.height, mode.fps, output_name});
+
+      // Long enough for the capture to move to the display, for an encoder to
+      // start at the new size, and for a frame of the display to be encoded.
+      constexpr auto timeout = 8s;
       const auto applied = stream_resize::await_video_ack(generation, timeout, [this](std::chrono::milliseconds wait) -> std::optional<stream_resize::video_ack_t> {
         auto ack = m_acks->pop(wait);
         if (!ack) {

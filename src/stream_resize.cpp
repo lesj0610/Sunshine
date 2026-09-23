@@ -316,6 +316,30 @@ namespace stream_resize {
     }
   }
 
+  void outbox_t::push(const result_t &result) {
+    m_waiting.push_back(result);
+  }
+
+  bool outbox_t::flush(const std::function<bool(const result_t &)> &send, std::chrono::steady_clock::time_point now) {
+    while (!m_waiting.empty()) {
+      if (!send(m_waiting.front())) {
+        if (!m_failing_since) {
+          m_failing_since = now;
+        }
+        return now - *m_failing_since < give_up_after;
+      }
+
+      m_waiting.pop_front();
+      m_failing_since.reset();
+    }
+
+    return true;
+  }
+
+  bool outbox_t::empty() const {
+    return m_waiting.empty();
+  }
+
   std::optional<bool> await_video_ack(
     std::uint64_t generation,
     std::chrono::milliseconds timeout,

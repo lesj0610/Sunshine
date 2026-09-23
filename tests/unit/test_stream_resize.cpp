@@ -19,6 +19,7 @@
 
 // local includes
 #include <src/stream_resize.h>
+#include <src/video.h>
 
 // lib includes
 #include <moonlight-common-c/src/StreamResize.h>
@@ -551,4 +552,105 @@ TEST_F(StreamResizeTest, AStopBetweenStepsTakesNoFurtherStep) {
 
   EXPECT_EQ(rig.calls(), (std::vector<std::string> {"create_display"}));
   EXPECT_TRUE(rig.sent->snapshot().empty());
+}
+
+TEST_F(StreamResizeTest, AnswersThatFailToGoOutAreKeptInOrderAndRetried) {
+  stream_resize::outbox_t outbox;
+  const auto start = std::chrono::steady_clock::now();
+  outbox.push({1, k_wide, status_e::ok});
+  outbox.push({2, k_wide, status_e::superseded});
+  outbox.push({3, k_tall, status_e::ok});
+
+  std::vector<std::uint32_t> sent;
+  bool line_down = true;
+  const auto send = [&](const stream_resize::result_t &result) {
+    if (line_down && result.id == 2) {
+      return false;
+    }
+    sent.push_back(result.id);
+    return true;
+  };
+
+  // The second one does not go out, so the third waits behind it
+  EXPECT_TRUE(outbox.flush(send, start));
+  EXPECT_EQ(sent, (std::vector<std::uint32_t> {1}));
+  EXPECT_FALSE(outbox.empty());
+
+  line_down = false;
+  EXPECT_TRUE(outbox.flush(send, start + 1s));
+  EXPECT_EQ(sent, (std::vector<std::uint32_t> {1, 2, 3}));
+  EXPECT_TRUE(outbox.empty());
+}
+
+TEST_F(StreamResizeTest, AnswersThatKeepFailingEndTheSession) {
+  stream_resize::outbox_t outbox;
+  const auto start = std::chrono::steady_clock::now();
+  outbox.push({1, k_wide, status_e::ok});
+  const auto refuse = [](const stream_resize::result_t &) {
+    return false;
+  };
+
+  EXPECT_TRUE(outbox.flush(refuse, start));
+  EXPECT_TRUE(outbox.flush(refuse, start + stream_resize::outbox_t::give_up_after - 1ms));
+  EXPECT_FALSE(outbox.flush(refuse, start + stream_resize::outbox_t::give_up_after));
+
+  // A success in between starts the clock again
+  stream_resize::outbox_t recovering;
+  recovering.push({1, k_wide, status_e::ok});
+  recovering.push({2, k_tall, status_e::ok});
+  bool first = true;
+  const auto one_then_none = [&](const stream_resize::result_t &) {
+    return std::exchange(first, false);
+  };
+  EXPECT_TRUE(recovering.flush(refuse, start));
+  EXPECT_TRUE(recovering.flush(one_then_none, start + 4s));
+  EXPECT_TRUE(recovering.flush(refuse, start + 8s));
+  EXPECT_FALSE(recovering.flush(refuse, start + 8s + stream_resize::outbox_t::give_up_after));
+}
+
+TEST_F(StreamResizeTest, TheDisplayAResizeNamesWinsWhileTheOldOneIsStillThere) {
+  // Both the old and the new display are on the list: the old one is only
+  // removed once the new one is streamed.
+  const std::vector<std::string> names {"\\\\.\\DISPLAY1", "\\\\.\\DISPLAY7", "\\\\.\\DISPLAY8"};
+  const int capturing_old = 1;
+
+  EXPECT_EQ(video::choose_display(names, capturing_old, std::string {"\\\\.\\DISPLAY8"}), 2);
+
+  // Without a resize the display being captured stays, as before
+  EXPECT_EQ(video::choose_display(names, capturing_old, std::nullopt), capturing_old);
+
+  // A display that is not there leaves the pick alone
+  EXPECT_EQ(video::choose_display(names, capturing_old, std::string {"\\\\.\\DISPLAY9"}), capturing_old);
+}
+
+TEST_F(StreamResizeTest, AResizeIsOnlyAnsweredOnceAFrameOfItsDisplayWasEncoded) {
+  video::config_change_progress_t progress {{7, 2560, 1080, 60, "\\\\.\\DISPLAY8"}};
+
+  // Still capturing the old display, which is still there
+  progress.capturing("\\\\.\\DISPLAY7");
+  EXPECT_FALSE(progress.on_target());
+  EXPECT_FALSE(progress.frame_encoded(true).has_value());
+
+  // On the new display, a frame made up while waiting for the capture is not enough
+  progress.capturing("\\\\.\\DISPLAY8");
+  EXPECT_TRUE(progress.on_target());
+  EXPECT_FALSE(progress.frame_encoded(false).has_value());
+
+  const auto ack = progress.frame_encoded(true);
+  ASSERT_TRUE(ack.has_value());
+  EXPECT_EQ(ack->generation, 7u);
+  EXPECT_TRUE(ack->applied);
+
+  // The capture moving away again takes the answer back
+  progress.capturing("\\\\.\\DISPLAY7");
+  EXPECT_FALSE(progress.frame_encoded(true).has_value());
+
+  const auto no = progress.failed();
+  EXPECT_EQ(no.generation, 7u);
+  EXPECT_FALSE(no.applied);
+
+  // A change that names no display takes whichever is captured
+  video::config_change_progress_t anywhere {{8, 1920, 1080, 60, {}}};
+  EXPECT_TRUE(anywhere.on_target());
+  EXPECT_TRUE(anywhere.frame_encoded(true).has_value());
 }

@@ -342,6 +342,51 @@ namespace stream_resize {
   };
 
   /**
+   * @brief Answers waiting for the control channel, kept until they have gone out.
+   *
+   * An answer that fails to send stays at the front, and the ones behind it
+   * wait, so the client still gets them in order. Only used by the control
+   * thread.
+   */
+  class outbox_t {
+  public:
+    /**
+     * @brief How long answers may keep failing to go out before the session has to end.
+     *
+     * A client whose answer never arrives cannot tell what the stream is, so
+     * the session is ended rather than left in that state.
+     */
+    static constexpr std::chrono::seconds give_up_after {5};
+
+    /**
+     * @brief Queue an answer behind the ones already waiting.
+     *
+     * @param result The answer.
+     */
+    void push(const result_t &result);
+
+    /**
+     * @brief Send what is waiting, in order, stopping at the first that does not go out.
+     *
+     * @param send Sends one answer. Returns false if it did not go out.
+     * @param now The time.
+     * @return False once answers have been failing to go out for longer than give_up_after.
+     */
+    bool flush(const std::function<bool(const result_t &)> &send, std::chrono::steady_clock::time_point now);
+
+    /**
+     * @brief Whether nothing is waiting.
+     *
+     * @return True when empty.
+     */
+    [[nodiscard]] bool empty() const;
+
+  private:
+    std::deque<result_t> m_waiting;
+    std::optional<std::chrono::steady_clock::time_point> m_failing_since;
+  };
+
+  /**
    * @brief One answer from the video thread about a config change.
    */
   struct video_ack_t {
