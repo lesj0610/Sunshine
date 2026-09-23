@@ -39,6 +39,10 @@ $SudoVdaFileHashes = [ordered]@{
 $SudoVdaCertificateThumbprint = '3C918FC73525AD8B1521B6DB26B71F694277CC49'
 $SudoVdaCertificateStores     = @('Root', 'TrustedPublisher')
 
+# ERROR_SUCCESS_REBOOT_REQUIRED. nefconc exits with it when the change was made
+# but only completes after a restart.
+$SudoVdaRebootRequired = 3010
+
 function Write-SudoVdaStep {
     param([string] $Message)
     Write-Information "  $Message" -InformationAction Continue
@@ -191,6 +195,27 @@ function Invoke-Nefcon {
     return $exitCode
 }
 
+function Get-NefconOutcome {
+    <#
+    .SYNOPSIS
+    What a nefconc exit code means: success, reboot-required or failure.
+
+    .DESCRIPTION
+    Only 0 and 3010 are success. 3010 means the change was made and completes
+    after a restart: it must not be undone, and the device may not show it yet.
+    #>
+    [OutputType([string])]
+    param([Parameter(Mandatory)] [int] $ExitCode)
+
+    if ($ExitCode -eq 0) {
+        return 'success'
+    }
+    if ($ExitCode -eq $SudoVdaRebootRequired) {
+        return 'reboot-required'
+    }
+    return 'failure'
+}
+
 function Write-SudoVdaConsentText {
     Write-SudoVdaStep ''
     Write-SudoVdaStep 'The virtual display driver is signed with a self-signed certificate:'
@@ -232,8 +257,12 @@ function Undo-SudoVdaInstall {
                         '--hardware-id', $SudoVdaHardwareId,
                         '--class-guid', $SudoVdaDisplayClass
                     )
-                    if ($code -ne 0) {
+                    $outcome = Get-NefconOutcome -ExitCode $code
+                    if ($outcome -eq 'failure') {
                         throw "nefconc exit code $code"
+                    }
+                    if ($outcome -eq 'reboot-required') {
+                        Write-SudoVdaStep "  $($step.Description) goes after a restart"
                     }
                 }
             }
@@ -258,8 +287,8 @@ function Install-SudoVdaDriver {
     asked, and only when someone can answer it.
 
     .OUTPUTS
-    What happened: installed, already-installed, skipped-no-files,
-    skipped-architecture, not-asked, declined or failed.
+    What happened: installed, installed-reboot-required, already-installed,
+    skipped-no-files, skipped-architecture, not-asked, declined or failed.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -326,15 +355,21 @@ function Install-SudoVdaDriver {
         Write-SudoVdaStep 'Signing certificate trusted'
 
         # --- driver ---
+        # A step that needs a restart has still succeeded, so it is kept, and
+        # the device cannot be expected to be up until after that restart.
+        $rebootRequired = $false
+
         $code = Invoke-Nefcon -NefconPath $nefcon -Arguments @(
             '--create-device-node',
             '--class-name', 'Display',
             '--class-guid', $SudoVdaDisplayClass,
             '--hardware-id', $SudoVdaHardwareId
         )
-        if ($code -ne 0) {
+        $outcome = Get-NefconOutcome -ExitCode $code
+        if ($outcome -eq 'failure') {
             throw "could not create the device node (nefconc exit code $code)"
         }
+        $rebootRequired = $rebootRequired -or ($outcome -eq 'reboot-required')
         [void] $undo.Add([pscustomobject]@{
             Kind        = 'device-node'
             Store       = $null
@@ -342,8 +377,15 @@ function Install-SudoVdaDriver {
         })
 
         $code = Invoke-Nefcon -NefconPath $nefcon -Arguments @('--install-driver', '--inf-path', $inf)
-        if ($code -ne 0) {
+        $outcome = Get-NefconOutcome -ExitCode $code
+        if ($outcome -eq 'failure') {
             throw "could not install the driver (nefconc exit code $code)"
+        }
+        $rebootRequired = $rebootRequired -or ($outcome -eq 'reboot-required')
+
+        if ($rebootRequired) {
+            Write-Warning 'The virtual display driver is installed and needs a restart to finish.'
+            return 'installed-reboot-required'
         }
 
         # --- verify ---
@@ -377,7 +419,8 @@ function Uninstall-SudoVdaDriver {
     certificate, and removing it would break their signature checks.
 
     .OUTPUTS
-    What happened: removed, not-installed, missing-tool or failed.
+    What happened: removed, removed-reboot-required, not-installed,
+    missing-tool or failed.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -398,9 +441,16 @@ function Uninstall-SudoVdaDriver {
         '--hardware-id', $SudoVdaHardwareId,
         '--class-guid', $SudoVdaDisplayClass
     )
-    if ($code -ne 0) {
+    $outcome = Get-NefconOutcome -ExitCode $code
+    if ($outcome -eq 'failure') {
         Write-Warning "Could not remove the virtual display driver: nefconc exit code $code"
         return 'failed'
+    }
+    if ($outcome -eq 'reboot-required') {
+        # Removed, finishing at the next restart; the device may be listed
+        # until then.
+        Write-Warning 'The virtual display driver is removed and needs a restart to finish.'
+        return 'removed-reboot-required'
     }
 
     foreach ($attempt in 1..20) {
@@ -412,6 +462,79 @@ function Uninstall-SudoVdaDriver {
     }
     Write-Warning 'Could not remove the virtual display driver: the device is still present.'
     return 'failed'
+}
+
+function Get-SudoVdaExitCode {
+    <#
+    .SYNOPSIS
+    The exit code for a result: 0, 3010 when a restart finishes the job, or 1
+    when it did not happen.
+
+    .DESCRIPTION
+    Declining, and a machine the driver does not support, are not failures.
+    not-asked is: the caller asked for an install that could not go ahead
+    without consent, and should pass -Silent if it has that consent. Missing
+    files or a missing nefconc mean an incomplete package.
+    #>
+    [OutputType([int])]
+    param([Parameter(Mandatory)] [string] $Result)
+
+    switch ($Result) {
+        'installed'                 { return 0 }
+        'already-installed'         { return 0 }
+        'declined'                  { return 0 }
+        'skipped-architecture'      { return 0 }
+        'removed'                   { return 0 }
+        'not-installed'             { return 0 }
+        'installed-reboot-required' { return $SudoVdaRebootRequired }
+        'removed-reboot-required'   { return $SudoVdaRebootRequired }
+    }
+    return 1
+}
+
+function Invoke-SudoVdaInstall {
+    <#
+    .SYNOPSIS
+    What install-sudovda.ps1 does: install, log, and return the exit code.
+    #>
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory)] [string] $RootDir,
+        [switch] $Silent
+    )
+
+    $log = Open-SudoVdaLog -Action 'install'
+    try {
+        $result = Install-SudoVdaDriver -RootDir $RootDir -Silent:$Silent
+        Write-SudoVdaStep "Result: $result"
+        return Get-SudoVdaExitCode -Result $result
+    } catch {
+        Write-Warning "Virtual display driver install failed: $($_.Exception.Message)"
+        return 1
+    } finally {
+        Close-SudoVdaLog -Path $log
+    }
+}
+
+function Invoke-SudoVdaUninstall {
+    <#
+    .SYNOPSIS
+    What uninstall-sudovda.ps1 does: remove, log, and return the exit code.
+    #>
+    [OutputType([int])]
+    param([Parameter(Mandatory)] [string] $RootDir)
+
+    $log = Open-SudoVdaLog -Action 'uninstall'
+    try {
+        $result = Uninstall-SudoVdaDriver -RootDir $RootDir
+        Write-SudoVdaStep "Result: $result"
+        return Get-SudoVdaExitCode -Result $result
+    } catch {
+        Write-Warning "Could not remove the virtual display driver: $($_.Exception.Message)"
+        return 1
+    } finally {
+        Close-SudoVdaLog -Path $log
+    }
 }
 
 function Open-SudoVdaLog {

@@ -13,6 +13,11 @@
     console, it asks first. With nobody to ask and no -Silent it changes
     nothing.
 
+    Exits 0 when there is nothing wrong (including a decline, or a machine the
+    driver does not support), 3010 when a restart finishes the install, and 1
+    when it did not happen. The installer ignores the code, so it never fails
+    the Sunshine install; it is there for whoever runs this by hand.
+
     A transcript goes to %TEMP%\Sunshine\logs\sudovda.
 #>
 
@@ -28,13 +33,4 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir 'sudovda-driver.ps1')
 
-$log = Open-SudoVdaLog -Action 'install'
-try {
-    $result = Install-SudoVdaDriver -RootDir (Split-Path -Parent $scriptDir) -Silent:$Silent
-    Write-SudoVdaStep "Result: $result"
-} catch {
-    Write-Warning "Virtual display driver install failed: $($_.Exception.Message)"
-} finally {
-    Close-SudoVdaLog -Path $log
-}
-exit 0
+exit (Invoke-SudoVdaInstall -RootDir (Split-Path -Parent $scriptDir) -Silent:$Silent)

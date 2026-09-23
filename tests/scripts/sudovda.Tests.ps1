@@ -119,12 +119,12 @@ Describe "Test-SudoVdaPayload" {
 }
 
 Describe "Get-NativeArchitecture" {
-    It "reports <Expected> for processor architecture <Code>" -ForEach @(
-        @{ Code = 9; Expected = "AMD64" }
-        @{ Code = 12; Expected = "ARM64" }
-        @{ Code = 0; Expected = "x86" }
+    It "reports <Expected> for processor architecture <ProcessorCode>" -ForEach @(
+        @{ ProcessorCode = 9; Expected = "AMD64" }
+        @{ ProcessorCode = 12; Expected = "ARM64" }
+        @{ ProcessorCode = 0; Expected = "x86" }
     ) {
-        Mock Get-ProcessorArchitectureCode { $Code }
+        Mock Get-ProcessorArchitectureCode { $ProcessorCode }
 
         Get-NativeArchitecture | Should -Be $Expected
     }
@@ -311,6 +311,56 @@ Describe "Install-SudoVdaDriver" {
         Should -Invoke -CommandName Add-SudoVdaCertificate -Times 0 -Exactly -Scope It
         Should -Invoke -CommandName Invoke-Nefcon -Times 0 -Exactly -Scope It
     }
+
+    It "keeps a device node that needs a restart, and does not wait for the device" {
+        Mock Invoke-Nefcon { 3010 } -ParameterFilter { $Arguments -contains "--create-device-node" }
+
+        Install-SudoVdaDriver -RootDir $root -Silent | Should -Be "installed-reboot-required"
+
+        Should -Invoke -CommandName Invoke-Nefcon -Times 1 -Exactly -Scope It -ParameterFilter { $Arguments -contains "--install-driver" }
+        Should -Invoke -CommandName Invoke-Nefcon -Times 0 -Exactly -Scope It -ParameterFilter { $Arguments -contains "--remove-device-node" }
+        Should -Invoke -CommandName Remove-SudoVdaCertificate -Times 0 -Exactly -Scope It
+        Should -Invoke -CommandName Wait-SudoVdaDevice -Times 0 -Exactly -Scope It
+        Should -Invoke -CommandName Write-Warning -Times 0 -Exactly -Scope It -ParameterFilter { $Message -like "*failed*" }
+    }
+
+    It "keeps a driver install that needs a restart, and does not wait for the device" {
+        Mock Invoke-Nefcon { 3010 } -ParameterFilter { $Arguments -contains "--install-driver" }
+
+        Install-SudoVdaDriver -RootDir $root -Silent | Should -Be "installed-reboot-required"
+
+        Should -Invoke -CommandName Invoke-Nefcon -Times 0 -Exactly -Scope It -ParameterFilter { $Arguments -contains "--remove-device-node" }
+        Should -Invoke -CommandName Remove-SudoVdaCertificate -Times 0 -Exactly -Scope It
+        Should -Invoke -CommandName Wait-SudoVdaDevice -Times 0 -Exactly -Scope It
+        Should -Invoke -CommandName Write-Warning -Times 0 -Exactly -Scope It -ParameterFilter { $Message -like "*failed*" }
+    }
+
+    It "counts a rollback removal that needs a restart as undone and keeps going" {
+        Mock Get-SudoVdaCertificate {
+            Get-FakeCertificate -Store "Root" -Thumbprint $SudoVdaCertificateThumbprint
+        } -ParameterFilter { $Store -eq "Root" }
+        Mock Invoke-Nefcon { 1 } -ParameterFilter { $Arguments -contains "--install-driver" }
+        Mock Invoke-Nefcon { 3010 } -ParameterFilter { $Arguments -contains "--remove-device-node" }
+
+        Install-SudoVdaDriver -RootDir $root -Silent | Should -Be "failed"
+
+        Should -Invoke -CommandName Invoke-Nefcon -Times 1 -Exactly -Scope It -ParameterFilter { $Arguments -contains "--remove-device-node" }
+        Should -Invoke -CommandName Write-Warning -Times 0 -Exactly -Scope It -ParameterFilter { $Message -like "*could not undo*" }
+        Should -Invoke -CommandName Remove-SudoVdaCertificate -Times 1 -Exactly -Scope It -ParameterFilter { $Store -eq "TrustedPublisher" }
+        Should -Invoke -CommandName Remove-SudoVdaCertificate -Times 0 -Exactly -Scope It -ParameterFilter { $Store -eq "Root" }
+    }
+
+    It "treats nefconc exit code <NefconExit> as a failure" -ForEach @(
+        @{ NefconExit = 1 }
+        @{ NefconExit = 3011 }
+        @{ NefconExit = -1 }
+    ) {
+        Mock Invoke-Nefcon { $NefconExit } -ParameterFilter { $Arguments -contains "--install-driver" }
+
+        Install-SudoVdaDriver -RootDir $root -Silent | Should -Be "failed"
+
+        Should -Invoke -CommandName Remove-SudoVdaCertificate -Times 2 -Exactly -Scope It
+    }
 }
 
 Describe "Uninstall-SudoVdaDriver" {
@@ -367,5 +417,120 @@ Describe "Uninstall-SudoVdaDriver" {
         Uninstall-SudoVdaDriver -RootDir $root | Should -Be "missing-tool"
 
         Should -Invoke -CommandName Invoke-Nefcon -Times 0 -Exactly -Scope It
+    }
+
+    It "reports a removal that needs a restart without waiting for the device to go" {
+        Mock Invoke-Nefcon { 3010 }
+
+        Uninstall-SudoVdaDriver -RootDir $root | Should -Be "removed-reboot-required"
+
+        Should -Invoke -CommandName Start-Sleep -Times 0 -Exactly -Scope It
+        Should -Invoke -CommandName Get-SudoVdaDevice -Times 1 -Exactly -Scope It
+        Should -Invoke -CommandName Remove-SudoVdaCertificate -Times 0 -Exactly -Scope It
+        Should -Invoke -CommandName Write-Warning -Times 0 -Exactly -Scope It -ParameterFilter { $Message -like "Could not*" }
+    }
+}
+
+Describe "Get-NefconOutcome" {
+    It "reads <NefconExit> as <Expected>" -ForEach @(
+        @{ NefconExit = 0; Expected = "success" }
+        @{ NefconExit = 3010; Expected = "reboot-required" }
+        @{ NefconExit = 1; Expected = "failure" }
+        @{ NefconExit = 5; Expected = "failure" }
+        @{ NefconExit = 3011; Expected = "failure" }
+        @{ NefconExit = -1; Expected = "failure" }
+    ) {
+        Get-NefconOutcome -ExitCode $NefconExit | Should -Be $Expected
+    }
+}
+
+Describe "Get-SudoVdaExitCode" {
+    It "exits <Expected> for <Result>" -ForEach @(
+        @{ Result = "installed"; Expected = 0 }
+        @{ Result = "already-installed"; Expected = 0 }
+        @{ Result = "declined"; Expected = 0 }
+        @{ Result = "skipped-architecture"; Expected = 0 }
+        @{ Result = "removed"; Expected = 0 }
+        @{ Result = "not-installed"; Expected = 0 }
+        @{ Result = "installed-reboot-required"; Expected = 3010 }
+        @{ Result = "removed-reboot-required"; Expected = 3010 }
+        @{ Result = "failed"; Expected = 1 }
+        @{ Result = "not-asked"; Expected = 1 }
+        @{ Result = "skipped-no-files"; Expected = 1 }
+        @{ Result = "missing-tool"; Expected = 1 }
+    ) {
+        Get-SudoVdaExitCode -Result $Result | Should -Be $Expected
+    }
+}
+
+Describe "Invoke-SudoVdaInstall" {
+    BeforeEach {
+        Mock Open-SudoVdaLog {}
+        Mock Close-SudoVdaLog {}
+        Mock Write-SudoVdaStep {}
+        Mock Write-Warning {}
+    }
+
+    It "returns <Expected> for <Result>" -ForEach @(
+        @{ Result = "installed"; Expected = 0 }
+        @{ Result = "installed-reboot-required"; Expected = 3010 }
+        @{ Result = "failed"; Expected = 1 }
+    ) {
+        Mock Install-SudoVdaDriver { $Result }
+
+        Invoke-SudoVdaInstall -RootDir $TestDrive -Silent | Should -Be $Expected
+
+        Should -Invoke -CommandName Install-SudoVdaDriver -Times 1 -Exactly -Scope It -ParameterFilter { $Silent }
+        Should -Invoke -CommandName Close-SudoVdaLog -Times 1 -Exactly -Scope It
+    }
+
+    It "returns a failure when the install throws" {
+        Mock Install-SudoVdaDriver { throw "unexpected" }
+
+        Invoke-SudoVdaInstall -RootDir $TestDrive | Should -Be 1
+
+        Should -Invoke -CommandName Close-SudoVdaLog -Times 1 -Exactly -Scope It
+    }
+}
+
+Describe "Invoke-SudoVdaUninstall" {
+    BeforeEach {
+        Mock Open-SudoVdaLog {}
+        Mock Close-SudoVdaLog {}
+        Mock Write-SudoVdaStep {}
+        Mock Write-Warning {}
+    }
+
+    It "returns <Expected> for <Result>" -ForEach @(
+        @{ Result = "removed"; Expected = 0 }
+        @{ Result = "removed-reboot-required"; Expected = 3010 }
+        @{ Result = "failed"; Expected = 1 }
+    ) {
+        Mock Uninstall-SudoVdaDriver { $Result }
+
+        Invoke-SudoVdaUninstall -RootDir $TestDrive | Should -Be $Expected
+    }
+
+    It "returns a failure when the removal throws" {
+        Mock Uninstall-SudoVdaDriver { throw "unexpected" }
+
+        Invoke-SudoVdaUninstall -RootDir $TestDrive | Should -Be 1
+    }
+}
+
+Describe "install-sudovda.ps1" {
+    It "passes its result on as the process exit code" {
+        $scripts = Join-Path $TestDrive "Sunshine\scripts"
+        New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+        $source = Split-Path -Parent $sourcePath
+        foreach ($name in @("install-sudovda.ps1", "sudovda-driver.ps1")) {
+            Copy-Item -LiteralPath (Join-Path $source $name) -Destination $scripts
+        }
+        $shell = (Get-Process -Id $PID).Path
+
+        # No drivers folder next to it: an incomplete package, which is a failure.
+        & $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts "install-sudovda.ps1") -Silent *> $null
+
+        $LASTEXITCODE | Should -Be 1
     }
 }

@@ -12,6 +12,10 @@
     it would break their signature checks. Remove it by hand if you want it
     gone.
 
+    Exits 0 when the driver is gone or was never there, 3010 when a restart
+    finishes the removal, and 1 when it could not be removed. The installer
+    ignores the code, so it never fails the Sunshine uninstall.
+
     A transcript goes to %TEMP%\Sunshine\logs\sudovda.
 #>
 
@@ -24,13 +28,4 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir 'sudovda-driver.ps1')
 
-$log = Open-SudoVdaLog -Action 'uninstall'
-try {
-    $result = Uninstall-SudoVdaDriver -RootDir (Split-Path -Parent $scriptDir)
-    Write-SudoVdaStep "Result: $result"
-} catch {
-    Write-Warning "Could not remove the virtual display driver: $($_.Exception.Message)"
-} finally {
-    Close-SudoVdaLog -Path $log
-}
-exit 0
+exit (Invoke-SudoVdaUninstall -RootDir (Split-Path -Parent $scriptDir))
