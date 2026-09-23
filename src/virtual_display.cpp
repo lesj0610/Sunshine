@@ -101,20 +101,36 @@ namespace virtual_display {
         auto task = std::make_shared<std::packaged_task<R()>>(std::move(work));
         auto result = task->get_future();
 
+        // The task's own future is ready the moment the work returns, which is
+        // before the worker has been marked idle again. Waiting on that would
+        // let the caller come back and submit the next call while this one
+        // still looks in flight, and the driver would be poisoned over a call
+        // it had in fact answered. So the handover is a second future, set
+        // after the worker is idle.
+        auto finished = std::make_shared<std::promise<void>>();
+        auto idle = finished->get_future();
+
         {
           std::lock_guard lock {m_state->mutex};
           if (m_state->stopping || m_state->busy) {
             return std::nullopt;
           }
           m_state->busy = true;
-          m_state->job = [state = m_state, task] {
-            (*task)();
+          m_state->job = [state = m_state, task, finished] {
+            try {
+              (*task)();
+            } catch (...) {
+              // Whatever the work threw is already in its future. Only the
+              // task machinery itself can land here, and it must not leave
+              // the worker marked busy for good.
+            }
             state->busy = false;
+            finished->set_value();
           };
         }
         m_state->wake.notify_all();
 
-        if (result.wait_for(deadline) != std::future_status::ready) {
+        if (idle.wait_for(deadline) != std::future_status::ready) {
           return std::nullopt;
         }
 
