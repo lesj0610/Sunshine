@@ -534,3 +534,50 @@ Describe "install-sudovda.ps1" {
         $LASTEXITCODE | Should -Be 1
     }
 }
+
+Describe "SudoVDA batch wrappers" {
+    # The last hop of the exit code contract: install-sudovda.ps1 exits with
+    # what Invoke-SudoVdaInstall returned, powershell.exe exits with that, and
+    # the batch file passes %errorlevel% on. A stand-in sudovda-driver.ps1 makes
+    # the result 3010 without a driver. Windows only: cmd.exe and powershell.exe
+    # are what is being tested, and a Unix exit status would truncate 3010.
+    BeforeEach {
+        $scripts = Join-Path $TestDrive ("scripts-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+        $source = Split-Path -Parent $sourcePath
+        foreach ($name in @(
+            "install-sudovda.ps1",
+            "uninstall-sudovda.ps1",
+            "install-sudovda.bat",
+            "uninstall-sudovda.bat"
+        )) {
+            Copy-Item -LiteralPath (Join-Path $source $name) -Destination $scripts
+        }
+        Set-Content -LiteralPath (Join-Path $scripts "sudovda-driver.ps1") -Value @(
+            'function Invoke-SudoVdaInstall { param([string] $RootDir, [switch] $Silent) $null = $RootDir, $Silent; return 3010 }'
+            'function Invoke-SudoVdaUninstall { param([string] $RootDir) $null = $RootDir; return 3010 }'
+        )
+
+        function Invoke-BatchFile {
+            param([string] $Path, [string] $Arguments = "")
+            $process = Start-Process `
+                -FilePath "cmd.exe" `
+                -ArgumentList "/d /s /c `"`"$Path`" $Arguments`"" `
+                -NoNewWindow `
+                -PassThru `
+                -RedirectStandardOutput (Join-Path $TestDrive "batch-stdout.txt") `
+                -RedirectStandardError (Join-Path $TestDrive "batch-stderr.txt")
+            $null = $process.Handle
+            $process.WaitForExit()
+            return $process.ExitCode
+        }
+    }
+
+    It "install-sudovda.bat exits 3010 when the install needs a restart" -Skip:([Environment]::OSVersion.Platform -ne "Win32NT") {
+        Invoke-BatchFile -Path (Join-Path $scripts "install-sudovda.bat") -Arguments "-Silent" | Should -Be 3010
+    }
+
+    It "uninstall-sudovda.bat exits 3010 when the removal needs a restart" -Skip:([Environment]::OSVersion.Platform -ne "Win32NT") {
+        Invoke-BatchFile -Path (Join-Path $scripts "uninstall-sudovda.bat") | Should -Be 3010
+    }
+}
