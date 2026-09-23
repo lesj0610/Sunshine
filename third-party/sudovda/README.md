@@ -5,7 +5,8 @@ display driver, taken verbatim from SudoMaker/SudoVDA.
 
     source  https://github.com/SudoMaker/SudoVDA
     path    Common/Include/sudovda-ioctl.h
-    commit  adc5c5a0
+    commit  a4b09fa2aa731a964d0cb5d139cb1e6240e4da12
+            (the file last changed in 1044eca77a456fd6537873dedc114368014e0083)
     sha256  dd924c9bd3918f75bdc1c1153ed16f23ae1658fde890d76f5f4f35397062dd73
 
 One byte differs from upstream: a newline was added at the end, because the
