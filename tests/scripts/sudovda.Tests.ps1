@@ -14,6 +14,13 @@ BeforeAll {
             param()
         }
     }
+    if (-not (Get-Command Get-PnpDeviceProperty -ErrorAction SilentlyContinue)) {
+        function Get-PnpDeviceProperty {
+            [CmdletBinding()]
+            param([string]$InstanceId, [string[]]$KeyName)
+            $null = $InstanceId, $KeyName
+        }
+    }
     if (-not (Get-Command Import-Certificate -ErrorAction SilentlyContinue)) {
         function Import-Certificate {
             [CmdletBinding()]
@@ -33,12 +40,78 @@ BeforeAll {
     }
 
     function Get-FakeDevice {
-        param([string]$Status = "OK")
+        param([string]$Status = "OK", [string]$InstanceId = "ROOT\DISPLAY\0001")
         [PSCustomObject]@{
-            InstanceId = "ROOT\DISPLAY\0001"
+            InstanceId = $InstanceId
             HardwareID = @("ROOT\SUDOMAKER\SUDOVDA")
             Status     = $Status
         }
+    }
+}
+
+Describe "Write-SudoVdaStep" {
+    It "writes to the host, which Windows PowerShell 5.1 transcripts keep" {
+        $record = Write-SudoVdaStep "hello" 6>&1
+
+        "$record" | Should -Be "  hello"
+        $record.Tags | Should -Contain "PSHOST"
+    }
+}
+
+Describe "Test-SudoVdaDeviceReady" {
+    It "is ready when the device is OK and the driver is on it" {
+        Mock Get-PnpDeviceProperty { [PSCustomObject]@{ KeyName = $KeyName; Data = "oem42.inf" } }
+
+        Test-SudoVdaDeviceReady -Device (Get-FakeDevice) | Should -BeTrue
+
+        Should -Invoke -CommandName Get-PnpDeviceProperty -Times 1 -Exactly -Scope It -ParameterFilter {
+            $InstanceId -eq "ROOT\DISPLAY\0001" -and $KeyName -contains "DEVPKEY_Device_DriverInfPath"
+        }
+    }
+
+    It "is not ready when the node has no driver, although Windows reports it as OK" {
+        Mock Get-PnpDeviceProperty { [PSCustomObject]@{ KeyName = $KeyName; Data = $null } }
+
+        Test-SudoVdaDeviceReady -Device (Get-FakeDevice) | Should -BeFalse
+    }
+
+    It "is not ready when the driver cannot be read" {
+        Mock Get-PnpDeviceProperty {}
+
+        Test-SudoVdaDeviceReady -Device (Get-FakeDevice) | Should -BeFalse
+    }
+
+    It "is not ready when the device is not OK" {
+        Mock Get-PnpDeviceProperty { [PSCustomObject]@{ KeyName = $KeyName; Data = "oem42.inf" } }
+
+        Test-SudoVdaDeviceReady -Device (Get-FakeDevice -Status "Error") | Should -BeFalse
+
+        Should -Invoke -CommandName Get-PnpDeviceProperty -Times 0 -Exactly -Scope It
+    }
+}
+
+Describe "Wait-SudoVdaDevice" {
+    BeforeEach {
+        Mock Start-Sleep {}
+    }
+
+    It "passes over a node without its driver for one that has it" {
+        Mock Get-SudoVdaDevice {
+            Get-FakeDevice -InstanceId "ROOT\DISPLAY\0001"
+            Get-FakeDevice -InstanceId "ROOT\DISPLAY\0002"
+        }
+        Mock Test-SudoVdaDeviceReady { $Device.InstanceId -eq "ROOT\DISPLAY\0002" }
+
+        (Wait-SudoVdaDevice).InstanceId | Should -Be "ROOT\DISPLAY\0002"
+    }
+
+    It "returns the device as last seen when its driver never comes up" {
+        Mock Get-SudoVdaDevice { Get-FakeDevice }
+        Mock Test-SudoVdaDeviceReady { $false }
+
+        (Wait-SudoVdaDevice).InstanceId | Should -Be "ROOT\DISPLAY\0001"
+
+        Should -Invoke -CommandName Start-Sleep -Times 20 -Exactly -Scope It
     }
 }
 
@@ -202,6 +275,48 @@ Describe "Invoke-Nefcon" {
     }
 }
 
+Describe "Invoke-Pnputil" {
+    It "logs what pnputil says under its name and returns the exit code" {
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock Write-SudoVdaStep { $script:logged.Add($Message) }
+        $shell = (Get-Process -Id $PID).Path
+        Mock Get-PnputilPath { $shell }
+
+        $code = Invoke-Pnputil -Arguments @(
+            "-NoProfile",
+            "-Command",
+            "[Console]::Out.WriteLine('device removed'); exit 7"
+        )
+
+        $code | Should -Be 7
+        $script:logged | Should -Contain "  pnputil: device removed"
+    }
+
+    It "returns -1 without running anything when pnputil is not there" {
+        Mock Get-PnputilPath { Join-Path $TestDrive "missing\pnputil.exe" }
+        Mock Write-Warning {}
+
+        Invoke-Pnputil -Arguments @("/remove-device", "ROOT\DISPLAY\0001") | Should -Be -1
+    }
+}
+
+Describe "Uninstall-SudoVdaDeviceNode" {
+    It "removes the node by its instance ID and reads exit code <PnputilExit> as <Expected>" -ForEach @(
+        @{ PnputilExit = 0;    Expected = "success" }
+        @{ PnputilExit = 3010; Expected = "reboot-required" }
+        @{ PnputilExit = -1;   Expected = "failure" }
+        @{ PnputilExit = 87;   Expected = "failure" }
+    ) {
+        Mock Invoke-Pnputil { $PnputilExit }
+
+        Uninstall-SudoVdaDeviceNode -InstanceId "ROOT\DISPLAY\0001" | Should -Be $Expected
+
+        Should -Invoke -CommandName Invoke-Pnputil -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Arguments[0] -eq "/remove-device" -and $Arguments[1] -eq "ROOT\DISPLAY\0001"
+        }
+    }
+}
+
 Describe "Install-SudoVdaDriver" {
     BeforeEach {
         $root = Join-Path $TestDrive ([guid]::NewGuid().ToString())
@@ -218,6 +333,9 @@ Describe "Install-SudoVdaDriver" {
         Mock Remove-SudoVdaCertificate {}
         Mock Invoke-Nefcon { 0 }
         Mock Wait-SudoVdaDevice { Get-FakeDevice }
+        Mock Test-SudoVdaDeviceReady { $true }
+        Mock Uninstall-SudoVdaDeviceNode { "success" }
+        Mock Start-Sleep {}
         Mock Write-Warning {}
         Mock Write-SudoVdaStep {}
     }
@@ -318,6 +436,52 @@ Describe "Install-SudoVdaDriver" {
 
         Should -Invoke -CommandName Add-SudoVdaCertificate -Times 0 -Exactly -Scope It
         Should -Invoke -CommandName Invoke-Nefcon -Times 0 -Exactly -Scope It
+        Should -Invoke -CommandName Uninstall-SudoVdaDeviceNode -Times 0 -Exactly -Scope It
+    }
+
+    It "replaces a node that has the hardware ID but not the driver" {
+        Mock Get-SudoVdaDevice { Get-FakeDevice }
+        Mock Test-SudoVdaDeviceReady { $Device.InstanceId -ne "ROOT\DISPLAY\0001" }
+        Mock Wait-SudoVdaDevice { Get-FakeDevice -InstanceId "ROOT\DISPLAY\0002" }
+
+        Install-SudoVdaDriver -RootDir $root -Silent | Should -Be "installed"
+
+        Should -Invoke -CommandName Uninstall-SudoVdaDeviceNode -Times 1 -Exactly -Scope It -ParameterFilter {
+            $InstanceId -eq "ROOT\DISPLAY\0001"
+        }
+        Should -Invoke -CommandName Invoke-Nefcon -Times 1 -Exactly -Scope It -ParameterFilter { $Arguments -contains "--create-device-node" }
+        Should -Invoke -CommandName Invoke-Nefcon -Times 1 -Exactly -Scope It -ParameterFilter { $Arguments -contains "--install-driver" }
+    }
+
+    It "leaves a node without the driver alone when the install is declined" {
+        Mock Get-SudoVdaDevice { Get-FakeDevice }
+        Mock Test-SudoVdaDeviceReady { $false }
+        Mock Test-CanPrompt { $true }
+        Mock Read-Host { "n" }
+
+        Install-SudoVdaDriver -RootDir $root | Should -Be "declined"
+
+        Should -Invoke -CommandName Uninstall-SudoVdaDeviceNode -Times 0 -Exactly -Scope It
+    }
+
+    It "stops before trusting anything when a node without the driver cannot be removed" {
+        Mock Get-SudoVdaDevice { Get-FakeDevice }
+        Mock Test-SudoVdaDeviceReady { $false }
+        Mock Uninstall-SudoVdaDeviceNode { "failure" }
+
+        Install-SudoVdaDriver -RootDir $root -Silent | Should -Be "failed"
+
+        Should -Invoke -CommandName Add-SudoVdaCertificate -Times 0 -Exactly -Scope It
+        Should -Invoke -CommandName Invoke-Nefcon -Times 0 -Exactly -Scope It
+    }
+
+    It "rolls back when the device comes up without its driver" {
+        Mock Test-SudoVdaDeviceReady { $false }
+
+        Install-SudoVdaDriver -RootDir $root -Silent | Should -Be "failed"
+
+        Should -Invoke -CommandName Invoke-Nefcon -Times 1 -Exactly -Scope It -ParameterFilter { $Arguments -contains "--remove-device-node" }
+        Should -Invoke -CommandName Remove-SudoVdaCertificate -Times 2 -Exactly -Scope It
     }
 
     It "skips when the driver files are not there" {
@@ -404,6 +568,7 @@ Describe "Uninstall-SudoVdaDriver" {
             }
         }
         Mock Invoke-Nefcon { 0 }
+        Mock Uninstall-SudoVdaDeviceNode { "success" }
         Mock Remove-SudoVdaCertificate {}
         Mock Start-Sleep {}
         Mock Write-Warning {}
@@ -435,6 +600,42 @@ Describe "Uninstall-SudoVdaDriver" {
         Mock Get-SudoVdaDevice { Get-FakeDevice }
 
         Uninstall-SudoVdaDriver -RootDir $root | Should -Be "failed"
+
+        Should -Invoke -CommandName Uninstall-SudoVdaDeviceNode -Times 1 -Exactly -Scope It
+    }
+
+    It "removes a node nefconc cannot see by its instance ID" {
+        $script:nodeRemoved = $false
+        Mock Get-SudoVdaDevice {
+            if (-not $script:nodeRemoved) {
+                Get-FakeDevice
+            }
+        }
+        Mock Uninstall-SudoVdaDeviceNode {
+            $script:nodeRemoved = $true
+            "success"
+        }
+
+        Uninstall-SudoVdaDriver -RootDir $root | Should -Be "removed"
+
+        Should -Invoke -CommandName Invoke-Nefcon -Times 1 -Exactly -Scope It -ParameterFilter { $Arguments -contains "--remove-device-node" }
+        Should -Invoke -CommandName Uninstall-SudoVdaDeviceNode -Times 1 -Exactly -Scope It -ParameterFilter {
+            $InstanceId -eq "ROOT\DISPLAY\0001"
+        }
+    }
+
+    It "reports a node that cannot be removed by its instance ID either" {
+        Mock Get-SudoVdaDevice { Get-FakeDevice }
+        Mock Uninstall-SudoVdaDeviceNode { "failure" }
+
+        Uninstall-SudoVdaDriver -RootDir $root | Should -Be "failed"
+    }
+
+    It "reports a removal by instance ID that needs a restart" {
+        Mock Get-SudoVdaDevice { Get-FakeDevice }
+        Mock Uninstall-SudoVdaDeviceNode { "reboot-required" }
+
+        Uninstall-SudoVdaDriver -RootDir $root | Should -Be "removed-reboot-required"
     }
 
     It "leaves the device when nefconc is missing" {

@@ -45,8 +45,13 @@ $SudoVdaCertificateStores     = @('Root', 'TrustedPublisher')
 $SudoVdaRebootRequired = 3010
 
 function Write-SudoVdaStep {
+    # To the host, not the information stream: Windows PowerShell 5.1 leaves
+    # Write-Information out of transcripts, and the install log is one. It
+    # would keep the warnings and lose every step and the result.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '',
+        Justification = 'Windows PowerShell 5.1 transcripts leave out Write-Information')]
     param([string] $Message)
-    Write-Information "  $Message" -InformationAction Continue
+    Write-Host "  $Message"
 }
 
 function Get-ProcessorArchitectureCode {
@@ -92,23 +97,71 @@ function Get-SudoVdaDevice {
         Where-Object { $_.HardwareID -contains $SudoVdaHardwareId }
 }
 
+function Test-SudoVdaDeviceReady {
+    <#
+    .SYNOPSIS
+    Whether a SudoVDA device node has the driver installed on it and running.
+
+    .DESCRIPTION
+    A node can outlive its driver. A removal that takes the driver but not the
+    node leaves one with the hardware ID and no driver, no class and no device
+    interface, and Windows still reports it as OK. The status alone does not
+    say the driver is there; the INF the node was installed from does.
+    #>
+    [OutputType([bool])]
+    param([Parameter(Mandatory)] $Device)
+
+    if ($Device.Status -ne 'OK') {
+        return $false
+    }
+    $inf = Get-PnpDeviceProperty -InstanceId $Device.InstanceId -KeyName 'DEVPKEY_Device_DriverInfPath' `
+        -ErrorAction SilentlyContinue
+    return [bool] ($inf -and $inf.Data)
+}
+
 function Wait-SudoVdaDevice {
     <#
     .SYNOPSIS
-    Wait for the device to come up after the driver install.
+    Wait for the device to come up with its driver after the driver install.
 
     .OUTPUTS
-    The device as last seen, or nothing if it never appeared.
+    The first device that is up, else the device as last seen, or nothing if
+    none appeared.
     #>
     $device = $null
     foreach ($attempt in 1..20) {
         Start-Sleep -Milliseconds 500
-        $device = Get-SudoVdaDevice | Select-Object -First 1
-        if ($device -and $device.Status -eq 'OK') {
-            break
+        $devices = @(Get-SudoVdaDevice)
+        foreach ($candidate in $devices) {
+            if (Test-SudoVdaDeviceReady -Device $candidate) {
+                return $candidate
+            }
+        }
+        if ($devices.Count -gt 0) {
+            $device = $devices[0]
         }
     }
     return $device
+}
+
+function Wait-SudoVdaDeviceGone {
+    <#
+    .SYNOPSIS
+    Wait for every SudoVDA device node to go.
+
+    .OUTPUTS
+    True once none is left.
+    #>
+    [OutputType([bool])]
+    param()
+
+    foreach ($attempt in 1..20) {
+        Start-Sleep -Milliseconds 500
+        if (-not (Get-SudoVdaDevice)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-SudoVdaCertificate {
@@ -171,6 +224,32 @@ function Test-CanPrompt {
     }
 }
 
+function Invoke-SudoVdaTool {
+    <#
+    .SYNOPSIS
+    Run a tool, log what it says under its name, and return its exit code.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] [string[]] $Arguments
+    )
+
+    # The tools may write to stderr. That is output to log, not an error to
+    # stop on, which is what Windows PowerShell makes of it under 'Stop'.
+    $ErrorActionPreference = 'Continue'
+    $output = & $Path @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+
+    foreach ($line in $output) {
+        $text = "$line".Trim()
+        if ($text) {
+            Write-SudoVdaStep "  ${Name}: $text"
+        }
+    }
+    return $exitCode
+}
+
 function Invoke-Nefcon {
     <#
     .SYNOPSIS
@@ -180,20 +259,42 @@ function Invoke-Nefcon {
         [Parameter(Mandatory)] [string] $NefconPath,
         [Parameter(Mandatory)] [string[]] $Arguments
     )
+    return Invoke-SudoVdaTool -Path $NefconPath -Name 'nefconc' -Arguments $Arguments
+}
 
-    # nefconc may write to stderr. That is output to log, not an error to stop
-    # on, which is what Windows PowerShell makes of it under 'Stop'.
-    $ErrorActionPreference = 'Continue'
-    $output = & $NefconPath @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
+function Get-PnputilPath {
+    <#
+    .SYNOPSIS
+    Where this process finds pnputil.
 
-    foreach ($line in $output) {
-        $text = "$line".Trim()
-        if ($text) {
-            Write-SudoVdaStep "  nefconc: $text"
-        }
+    .DESCRIPTION
+    pnputil is only in the 64-bit System32. A 32-bit PowerShell is redirected
+    from there to SysWOW64, and reaches the real one through Sysnative.
+    #>
+    [OutputType([string])]
+    param()
+
+    $directory = 'System32'
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        $directory = 'Sysnative'
     }
-    return $exitCode
+    return Join-Path $env:SystemRoot "$directory\pnputil.exe"
+}
+
+function Invoke-Pnputil {
+    <#
+    .SYNOPSIS
+    Run pnputil, log what it says, and return its exit code, or -1 if it is
+    not there.
+    #>
+    param([Parameter(Mandatory)] [string[]] $Arguments)
+
+    $pnputil = Get-PnputilPath
+    if (-not (Test-Path -LiteralPath $pnputil)) {
+        Write-Warning "pnputil.exe not found at $pnputil"
+        return -1
+    }
+    return Invoke-SudoVdaTool -Path $pnputil -Name 'pnputil' -Arguments $Arguments
 }
 
 function Get-NefconOutcome {
@@ -215,6 +316,81 @@ function Get-NefconOutcome {
         return 'reboot-required'
     }
     return 'failure'
+}
+
+function Uninstall-SudoVdaDeviceNode {
+    <#
+    .SYNOPSIS
+    Remove one device node by its instance ID, whatever state it is in.
+
+    .DESCRIPTION
+    nefconc looks devices up through their class, so it cannot see a node
+    that lost its class along with its driver. pnputil removes the instance
+    itself, and exits 0 or 3010 as nefconc does.
+
+    .OUTPUTS
+    success, reboot-required or failure.
+    #>
+    [OutputType([string])]
+    param([Parameter(Mandatory)] [string] $InstanceId)
+
+    $code = Invoke-Pnputil -Arguments @('/remove-device', $InstanceId)
+    return Get-NefconOutcome -ExitCode $code
+}
+
+function Uninstall-SudoVdaDevice {
+    <#
+    .SYNOPSIS
+    Remove every SudoVDA device node, and the driver package with them.
+
+    .DESCRIPTION
+    nefconc removes the devices it can find and then the driver package,
+    unless something else still uses it. A node it cannot find, because it
+    lost its class along with its driver, is then removed by its instance ID.
+
+    .OUTPUTS
+    removed, removed-reboot-required or failed.
+    #>
+    [OutputType([string])]
+    param([Parameter(Mandatory)] [string] $NefconPath)
+
+    $code = Invoke-Nefcon -NefconPath $NefconPath -Arguments @(
+        '--remove-device-node',
+        '--hardware-id', $SudoVdaHardwareId,
+        '--class-guid', $SudoVdaDisplayClass
+    )
+    $outcome = Get-NefconOutcome -ExitCode $code
+    if ($outcome -eq 'failure') {
+        Write-Warning "nefconc could not remove the virtual display driver (exit code $code)"
+        return 'failed'
+    }
+    if ($outcome -eq 'reboot-required') {
+        # Removed, finishing at the next restart; the device may be listed
+        # until then.
+        return 'removed-reboot-required'
+    }
+    if (Wait-SudoVdaDeviceGone) {
+        return 'removed'
+    }
+
+    $rebootRequired = $false
+    foreach ($device in @(Get-SudoVdaDevice)) {
+        Write-SudoVdaStep "Removing $($device.InstanceId), which nefconc could not see"
+        $outcome = Uninstall-SudoVdaDeviceNode -InstanceId $device.InstanceId
+        if ($outcome -eq 'failure') {
+            Write-Warning "Could not remove the device node $($device.InstanceId)"
+            return 'failed'
+        }
+        $rebootRequired = $rebootRequired -or ($outcome -eq 'reboot-required')
+    }
+    if ($rebootRequired) {
+        return 'removed-reboot-required'
+    }
+    if (Wait-SudoVdaDeviceGone) {
+        return 'removed'
+    }
+    Write-Warning 'The virtual display device is still present.'
+    return 'failed'
 }
 
 function Write-SudoVdaConsentText {
@@ -253,16 +429,11 @@ function Undo-SudoVdaInstall {
                     Remove-SudoVdaCertificate -Store $step.Store
                 }
                 'device-node' {
-                    $code = Invoke-Nefcon -NefconPath $NefconPath -Arguments @(
-                        '--remove-device-node',
-                        '--hardware-id', $SudoVdaHardwareId,
-                        '--class-guid', $SudoVdaDisplayClass
-                    )
-                    $outcome = Get-NefconOutcome -ExitCode $code
-                    if ($outcome -eq 'failure') {
-                        throw "nefconc exit code $code"
+                    $outcome = Uninstall-SudoVdaDevice -NefconPath $NefconPath
+                    if ($outcome -eq 'failed') {
+                        throw 'the device node is still there'
                     }
-                    if ($outcome -eq 'reboot-required') {
+                    if ($outcome -eq 'removed-reboot-required') {
                         Write-SudoVdaStep "  $($step.Description) goes after a restart"
                     }
                 }
@@ -314,9 +485,16 @@ function Install-SudoVdaDriver {
         return 'skipped-architecture'
     }
 
-    if (Get-SudoVdaDevice) {
-        Write-SudoVdaStep 'SudoVDA is already installed, leaving it as it is.'
-        return 'already-installed'
+    # A node with the hardware ID is only the driver if the driver is on it.
+    # One that is not, left by a removal that took the driver and not the
+    # node, would otherwise pass for an install forever and keep the driver
+    # from ever being installed again.
+    $brokenNodes = @(Get-SudoVdaDevice)
+    foreach ($device in $brokenNodes) {
+        if (Test-SudoVdaDeviceReady -Device $device) {
+            Write-SudoVdaStep 'SudoVDA is already installed, leaving it as it is.'
+            return 'already-installed'
+        }
     }
 
     $undo = [System.Collections.ArrayList]::new()
@@ -335,6 +513,21 @@ function Install-SudoVdaDriver {
             if ($answer -match '^(n|no)$') {
                 Write-SudoVdaStep 'Skipped at your request. Sunshine works without it.'
                 return 'declined'
+            }
+        }
+
+        # --- broken nodes ---
+        # Replaced rather than repaired, so the install below is the same one
+        # a machine that never had the driver gets. There is nothing to put
+        # back if a later step fails: the node was of no use.
+        foreach ($device in $brokenNodes) {
+            Write-SudoVdaStep "Removing $($device.InstanceId), which has the SudoVDA hardware ID but not its driver"
+            $outcome = Uninstall-SudoVdaDeviceNode -InstanceId $device.InstanceId
+            if ($outcome -eq 'failure') {
+                throw "could not remove the device node $($device.InstanceId)"
+            }
+            if ($outcome -eq 'reboot-required') {
+                Write-SudoVdaStep "  $($device.InstanceId) goes after a restart"
             }
         }
 
@@ -394,8 +587,8 @@ function Install-SudoVdaDriver {
         if (-not $device) {
             throw 'the driver installed but no device appeared'
         }
-        if ($device.Status -ne 'OK') {
-            throw "the device is present but its status is '$($device.Status)'"
+        if (-not (Test-SudoVdaDeviceReady -Device $device)) {
+            throw "the device is present but its driver is not running on it (status '$($device.Status)')"
         }
 
         Write-SudoVdaStep "Virtual display driver installed: $($device.InstanceId)"
@@ -415,9 +608,10 @@ function Uninstall-SudoVdaDriver {
 
     .DESCRIPTION
     nefconc removes the device and then the driver package, unless something
-    else still uses it. The signing certificate stays in the trusted stores on
-    purpose: other software may have been installed under the same
-    certificate, and removing it would break their signature checks.
+    else still uses it, and a node it cannot see goes by its instance ID. The
+    signing certificate stays in the trusted stores on purpose: other software
+    may have been installed under the same certificate, and removing it would
+    break their signature checks.
 
     .OUTPUTS
     What happened: removed, removed-reboot-required, not-installed,
@@ -437,32 +631,19 @@ function Uninstall-SudoVdaDriver {
         return 'missing-tool'
     }
 
-    $code = Invoke-Nefcon -NefconPath $nefcon -Arguments @(
-        '--remove-device-node',
-        '--hardware-id', $SudoVdaHardwareId,
-        '--class-guid', $SudoVdaDisplayClass
-    )
-    $outcome = Get-NefconOutcome -ExitCode $code
-    if ($outcome -eq 'failure') {
-        Write-Warning "Could not remove the virtual display driver: nefconc exit code $code"
-        return 'failed'
-    }
-    if ($outcome -eq 'reboot-required') {
-        # Removed, finishing at the next restart; the device may be listed
-        # until then.
-        Write-Warning 'The virtual display driver is removed and needs a restart to finish.'
-        return 'removed-reboot-required'
-    }
-
-    foreach ($attempt in 1..20) {
-        Start-Sleep -Milliseconds 500
-        if (-not (Get-SudoVdaDevice)) {
+    $result = Uninstall-SudoVdaDevice -NefconPath $nefcon
+    switch ($result) {
+        'removed' {
             Write-SudoVdaStep 'Virtual display driver removed'
-            return 'removed'
+        }
+        'removed-reboot-required' {
+            Write-Warning 'The virtual display driver is removed and needs a restart to finish.'
+        }
+        default {
+            Write-Warning 'Could not remove the virtual display driver.'
         }
     }
-    Write-Warning 'Could not remove the virtual display driver: the device is still present.'
-    return 'failed'
+    return $result
 }
 
 function Get-SudoVdaExitCode {
