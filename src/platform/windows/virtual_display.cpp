@@ -303,6 +303,10 @@ namespace virtual_display {
       /**
        * @brief Open the driver's device interface.
        *
+       * Why it could not is logged. A driver that is not there and a driver
+       * that would not open take different fixes, and the refusal the client
+       * sees names neither.
+       *
        * @return An open handle, or INVALID_HANDLE_VALUE.
        */
       static HANDLE open_interface() {
@@ -313,19 +317,25 @@ namespace virtual_display {
           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
         );
         if (device_info == INVALID_HANDLE_VALUE) {
+          BOOST_LOG(error) << "Could not look up the virtual display driver's device interface (error "sv
+                           << GetLastError() << ')';
           return INVALID_HANDLE_VALUE;
         }
 
         HANDLE handle = INVALID_HANDLE_VALUE;
+        DWORD interfaces = 0;
+        DWORD open_error = ERROR_SUCCESS;
         SP_DEVICE_INTERFACE_DATA interface_data {};
         interface_data.cbSize = sizeof(interface_data);
 
         for (DWORD i = 0;
              SetupDiEnumDeviceInterfaces(device_info, nullptr, &SUDOVDA::SUVDA_INTERFACE_GUID, i, &interface_data);
              ++i) {
+          ++interfaces;
           DWORD detail_size = 0;
           SetupDiGetDeviceInterfaceDetailA(device_info, &interface_data, nullptr, 0, &detail_size, nullptr);
           if (detail_size == 0) {
+            open_error = GetLastError();
             continue;
           }
 
@@ -334,6 +344,7 @@ namespace virtual_display {
           detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
 
           if (!SetupDiGetDeviceInterfaceDetailA(device_info, &interface_data, detail, detail_size, &detail_size, nullptr)) {
+            open_error = GetLastError();
             continue;
           }
 
@@ -349,9 +360,23 @@ namespace virtual_display {
           if (handle != INVALID_HANDLE_VALUE) {
             break;
           }
+          open_error = GetLastError();
         }
 
         SetupDiDestroyDeviceInfoList(device_info);
+
+        if (handle == INVALID_HANDLE_VALUE) {
+          if (interfaces == 0) {
+            // No driver is running: it was never installed, or its device
+            // node was left without it, which Windows still lists as a device.
+            BOOST_LOG(error) << "The virtual display driver is not running: no SudoVDA device interface is present. "
+                                "Choose the virtual display driver in the Sunshine installer, or run "
+                                "install-sudovda.bat in the Sunshine scripts folder as administrator."sv;
+          } else {
+            BOOST_LOG(error) << "Could not open the virtual display driver's device interface (error "sv
+                             << open_error << ')';
+          }
+        }
         return handle;
       }
 
