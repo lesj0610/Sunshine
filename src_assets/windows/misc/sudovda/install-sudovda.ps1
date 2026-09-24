@@ -61,8 +61,10 @@ function Invoke-Rollback {
 }
 
 function Get-VirtualDisplayDevice {
+    # nefconc creates the device node from the class name, so Windows names
+    # the instance ROOT\DISPLAY\nnnn. Only the hardware ID says it is SudoVDA.
     Get-PnpDevice -ErrorAction SilentlyContinue |
-        Where-Object { $_.InstanceId -like 'ROOT\SUDOMAKER\SUDOVDA*' }
+        Where-Object { $_.HardwareID -contains 'root\sudomaker\sudovda' }
 }
 
 try {
