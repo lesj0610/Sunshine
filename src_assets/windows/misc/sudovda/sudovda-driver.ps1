@@ -13,10 +13,11 @@
     reported and returned instead of thrown.
 #>
 
-# How Windows knows the device.
-$SudoVdaHardwareId      = 'root\sudomaker\sudovda'
-$SudoVdaInstancePattern = 'ROOT\SUDOMAKER\SUDOVDA*'
-$SudoVdaDisplayClass    = '{4D36E968-E325-11CE-BFC1-08002BE10318}'
+# How Windows knows the device. nefconc creates the device node from the
+# class name, so Windows names the instance ROOT\DISPLAY\nnnn like any other
+# root-enumerated display adapter. Only the hardware ID says it is SudoVDA.
+$SudoVdaHardwareId   = 'root\sudomaker\sudovda'
+$SudoVdaDisplayClass = '{4D36E968-E325-11CE-BFC1-08002BE10318}'
 
 # The driver is built for AMD64 only. Its INF has no other platform section,
 # so on anything else the install can only fail, after the certificate has
@@ -88,7 +89,7 @@ function Get-NativeArchitecture {
 
 function Get-SudoVdaDevice {
     Get-PnpDevice -ErrorAction SilentlyContinue |
-        Where-Object { $_.InstanceId -like $SudoVdaInstancePattern }
+        Where-Object { $_.HardwareID -contains $SudoVdaHardwareId }
 }
 
 function Wait-SudoVdaDevice {

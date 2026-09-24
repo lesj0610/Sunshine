@@ -35,9 +35,35 @@ BeforeAll {
     function Get-FakeDevice {
         param([string]$Status = "OK")
         [PSCustomObject]@{
-            InstanceId = "ROOT\SUDOMAKER\SUDOVDA\0000"
+            InstanceId = "ROOT\DISPLAY\0001"
+            HardwareID = @("ROOT\SUDOMAKER\SUDOVDA")
             Status     = $Status
         }
+    }
+}
+
+Describe "Get-SudoVdaDevice" {
+    It "finds the device by its hardware ID, whatever Windows named the instance" {
+        Mock Get-PnpDevice {
+            @(
+                [PSCustomObject]@{ InstanceId = "ROOT\DISPLAY\0000"; HardwareID = @("ROOT\OTHERVENDOR\IDD"); Status = "OK" }
+                Get-FakeDevice
+                [PSCustomObject]@{ InstanceId = "PCI\VEN_10DE&DEV_1234\3&0"; HardwareID = @("PCI\VEN_10DE&DEV_1234"); Status = "OK" }
+            )
+        }
+
+        $found = @(Get-SudoVdaDevice)
+
+        $found.Count | Should -Be 1
+        $found[0].InstanceId | Should -Be "ROOT\DISPLAY\0001"
+    }
+
+    It "finds nothing when no device has the hardware ID" {
+        Mock Get-PnpDevice {
+            [PSCustomObject]@{ InstanceId = "ROOT\DISPLAY\0000"; HardwareID = @("ROOT\OTHERVENDOR\IDD"); Status = "OK" }
+        }
+
+        @(Get-SudoVdaDevice).Count | Should -Be 0
     }
 }
 
