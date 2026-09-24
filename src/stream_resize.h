@@ -26,7 +26,19 @@
 #include <optional>
 #include <thread>
 
+// lib includes
+#include <moonlight-common-c/src/Limelight.h>
+
 namespace stream_resize {
+
+  /**
+   * @brief How long the host has to answer a request, from receiving it to sending the answer.
+   *
+   * The client has no other way to tell a host that is slow from one that is
+   * stuck, so it gives up on the session once this and the time the answer
+   * takes to travel have passed.
+   */
+  constexpr std::chrono::milliseconds answer_within {LI_STREAM_RESIZE_ANSWER_WITHIN_MS};
 
   /**
    * @brief What a stream is encoded at.
@@ -73,6 +85,15 @@ namespace stream_resize {
     std::uint32_t id {};  ///< The request this answers.
     stream_mode_t mode {};  ///< What the stream is encoded at once the answer is sent.
     status_e status {};  ///< How the request ended.
+
+    /**
+     * @brief The first frame of the encoding the answer describes, when the host started one.
+     *
+     * Set for OK after a switch, and for a rollback that rebuilt the encoder
+     * at the old mode. Frames before it can have another size however late
+     * they arrive, so the client takes no keyframe from before it.
+     */
+    std::optional<std::uint32_t> first_frame;
   };
 
   /**
@@ -91,9 +112,11 @@ namespace stream_resize {
    * @brief What a resize does to the host, one step at a time.
    *
    * The coordinator calls these from one thread, one at a time, in the order
-   * they are declared. Every call must return, and bound its own waits. The
-   * generation passed in is the transaction's, which is what a step uses to
-   * ignore late answers to an earlier one.
+   * they are declared. Every call must return, and bound its own waits: the
+   * longest a request can take with every step at its limit has to fit in
+   * options_t::decide_within, and a step still running past that is taken to
+   * be stuck. The generation passed in is the transaction's, which is what a
+   * step uses to ignore late answers to an earlier one.
    */
   class steps_t {
   public:
@@ -121,12 +144,16 @@ namespace stream_resize {
      *
      * @param generation Transaction generation.
      * @param mode Mode to encode at.
-     * @return True once an encoder for the mode is running.
+     * @return The number of the first frame encoded at the mode, once an
+     *         encoder for it is running, or nothing if none runs.
      */
-    virtual bool switch_video(std::uint64_t generation, const stream_mode_t &mode) = 0;
+    virtual std::optional<std::uint32_t> switch_video(std::uint64_t generation, const stream_mode_t &mode) = 0;
 
     /**
      * @brief Committed: remove the old display.
+     *
+     * Runs after the client was told, since the new display is already being
+     * streamed.
      *
      * @param generation Transaction generation.
      * @return True if it was removed. A failure is not undone, because the
@@ -147,9 +174,10 @@ namespace stream_resize {
      *
      * @param generation Transaction generation.
      * @param mode Mode the stream had before the transaction.
-     * @return True once an encoder for the mode is running.
+     * @return The number of the first frame encoded at the mode, once an
+     *         encoder for it is running, or nothing if none runs.
      */
-    virtual bool restore_video(std::uint64_t generation, const stream_mode_t &mode) = 0;
+    virtual std::optional<std::uint32_t> restore_video(std::uint64_t generation, const stream_mode_t &mode) = 0;
 
     /**
      * @brief Rolling back: remove the new display.
@@ -176,6 +204,17 @@ namespace stream_resize {
    */
   struct options_t {
     bool fps_change_supported {false};  ///< Whether a request may change the frame rate.
+
+    /**
+     * @brief How long a request may go undecided after it arrived.
+     *
+     * A request still undecided then is answered as ending the session, and
+     * the session is ended: its steps bound their own waits, so one running
+     * this long is stuck. What is left of answer_within is for the answer to
+     * get out, which the control thread keeps trying for
+     * outbox_t::give_up_after.
+     */
+    std::chrono::milliseconds decide_within {answer_within - std::chrono::seconds {6}};
   };
 
   /**
@@ -190,6 +229,10 @@ namespace stream_resize {
    * request is decided first. The client treats an answer older than one it
    * has already seen as stale, so an answer sent out of order would hide a
    * resize that really happened.
+   *
+   * A watchdog answers a request that goes undecided for
+   * options_t::decide_within as ending the session, and ends it, so the
+   * client hears within answer_within even when a step is stuck.
    */
   class coordinator_t {
   public:
@@ -246,6 +289,13 @@ namespace stream_resize {
     [[nodiscard]] phase_e phase() const;
 
     /**
+     * @brief Whether a request went undecided for too long and the session is ending for it.
+     *
+     * @return True once that happened.
+     */
+    [[nodiscard]] bool timed_out() const;
+
+    /**
      * @brief What the stream is encoded at.
      *
      * @return The mode as of the last finished transaction.
@@ -258,8 +308,10 @@ namespace stream_resize {
      */
     struct answer_t {
       std::uint32_t id {};  ///< The request.
+      std::chrono::steady_clock::time_point due;  ///< When it has to be decided by.
       std::optional<status_e> status;  ///< How it ended, once decided.
       std::optional<stream_mode_t> mode;  ///< Set for OK; otherwise the current mode when sent.
+      std::optional<std::uint32_t> first_frame;  ///< See result_t::first_frame.
     };
 
     /**
@@ -277,12 +329,23 @@ namespace stream_resize {
     void run();
 
     /**
-     * @brief Carry out one request.
+     * @brief The watchdog's thread: end the session for a request that goes undecided too long.
+     */
+    void watch();
+
+    /**
+     * @brief Carry out one request, and answer it unless the session stopped in the middle.
      *
      * @param request The request.
-     * @return The answer, or nothing if the session stopped in the middle.
      */
-    std::optional<result_t> transact(const request_t &request);
+    void transact(const request_t &request);
+
+    /**
+     * @brief Record how a transaction ended, unless the session stopped meanwhile.
+     *
+     * @param result The answer, or nothing if the session stopped in the middle.
+     */
+    void finish(const std::optional<result_t> &result);
 
     /**
      * @brief Undo what a failed transaction did, most recent step first.
@@ -316,8 +379,9 @@ namespace stream_resize {
      * @param id The request.
      * @param status How it ended.
      * @param mode What the stream is encoded at, for OK. Other answers take the mode when they leave.
+     * @param first_frame See result_t::first_frame.
      */
-    void decide(std::uint32_t id, status_e status, std::optional<stream_mode_t> mode = std::nullopt);
+    void decide(std::uint32_t id, status_e status, std::optional<stream_mode_t> mode = std::nullopt, std::optional<std::uint32_t> first_frame = std::nullopt);
 
     /**
      * @brief Send the answers at the front of the line that are settled. Called with m_mutex held.
@@ -336,9 +400,11 @@ namespace stream_resize {
     std::uint32_t m_last_id {0};  ///< Newest request id seen. Older ones are ignored.
     std::optional<request_t> m_waiting;  ///< The one request waiting for the running one.
     bool m_stopping {false};
+    bool m_timed_out {false};
     std::deque<answer_t> m_answers;  ///< In the order the requests arrived.
 
     std::thread m_thread;
+    std::thread m_watchdog;
   };
 
   /**
@@ -386,12 +452,15 @@ namespace stream_resize {
     std::optional<std::chrono::steady_clock::time_point> m_failing_since;
   };
 
+  static_assert(options_t {}.decide_within + outbox_t::give_up_after + std::chrono::seconds {1} <= answer_within, "An answer decided in time must still have time to get out");
+
   /**
    * @brief One answer from the video thread about a config change.
    */
   struct video_ack_t {
     std::uint64_t generation {};  ///< The change this answers.
     bool applied {};  ///< Whether an encoder for it is running.
+    std::uint32_t first_frame {};  ///< The first frame that encoder encoded. Only set when applied.
   };
 
   /**
@@ -404,9 +473,9 @@ namespace stream_resize {
    * @param generation The change whose answer is wanted.
    * @param timeout How long to wait in total.
    * @param pop Waits up to the given time for the next answer. Nothing means none came.
-   * @return Whether the change was applied, or nothing if no answer to it came in time.
+   * @return The answer to the change, or nothing if none came in time.
    */
-  std::optional<bool> await_video_ack(
+  std::optional<video_ack_t> await_video_ack(
     std::uint64_t generation,
     std::chrono::milliseconds timeout,
     const std::function<std::optional<video_ack_t>(std::chrono::milliseconds)> &pop

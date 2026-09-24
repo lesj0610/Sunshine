@@ -2586,12 +2586,20 @@ namespace video {
     return m_on_target;
   }
 
+  void config_change_progress_t::started(std::int64_t frame_nr) {
+    if (!m_first_frame) {
+      // Frame numbers go out as their low 32 bits
+      m_first_frame = static_cast<std::uint32_t>(frame_nr);
+    }
+  }
+
   std::optional<config_ack_t> config_change_progress_t::frame_encoded(bool captured) const {
-    // A made-up or repeated frame says nothing about what the capture sees
-    if (!m_on_target || !captured) {
+    // A made-up or repeated frame says nothing about what the capture sees,
+    // and without the first frame the client cannot tell the new stream apart
+    if (!m_on_target || !captured || !m_first_frame) {
       return std::nullopt;
     }
-    return config_ack_t {m_change.generation, true};
+    return config_ack_t {m_change.generation, true, *m_first_frame};
   }
 
   config_ack_t config_change_progress_t::failed() const {
@@ -2880,6 +2888,9 @@ namespace video {
       }
       if (!synced_session) {
         return encode_e::error;
+      }
+      if (ctx->progress) {
+        ctx->progress->started(ctx->frame_nr);
       }
 
       synced_sessions.emplace_back(std::move(*synced_session));
@@ -3176,8 +3187,11 @@ namespace video {
         ref->reinit_event,
         *ref->encoder_p,
         channel_data,
-        [&session_started] {
+        [&session_started, &progress, &frame_nr] {
           session_started = true;
+          if (progress) {
+            progress->started(frame_nr);
+          }
         },
         [&progress, &config_acks](bool captured) {
           // A resize is answered once a frame captured from its display was encoded at its size

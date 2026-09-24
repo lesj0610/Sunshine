@@ -1198,6 +1198,8 @@ namespace stream {
       static_cast<std::uint16_t>(result.mode.height),
       static_cast<std::uint16_t>(result.mode.fps),
       static_cast<std::uint8_t>(result.status),
+      result.first_frame.has_value(),
+      result.first_frame.value_or(0),
     };
     ssStreamResizeWriteResult(&wire, plaintext.result);
 
@@ -2306,6 +2308,30 @@ namespace stream {
   }
 
   /**
+   * @brief How long a resize waits for the video thread to run an encoder on the new display.
+   *
+   * Long enough for the capture to move to the display, for an encoder to
+   * start at the new size, and for a frame of the display to be encoded.
+   */
+  constexpr auto resize_video_timeout = 8s;
+
+  /**
+   * @brief The longest a resize can take to be answered with every step running to its limit.
+   *
+   * The longest way through is a resize whose encoder does not run at the new
+   * size: the display is created, the configuration and the encoder are
+   * switched, both are switched back, and the new display is removed before
+   * the answer goes out. The lease runs with the default timeouts.
+   */
+  constexpr auto resize_longest_answer = virtual_display::longest_prepare_replacement(virtual_display::timeouts_t {}) +
+                                         2 * display_device::configure_timeout + 2 * resize_video_timeout +
+                                         virtual_display::longest_abandon_replacement(virtual_display::timeouts_t {});
+
+  // A resize that is slow but still moving must be answered for what it did,
+  // and only one stuck past every step's limit may end the session.
+  static_assert(resize_longest_answer <= stream_resize::options_t {}.decide_within, "A resize with every step at its limit must still be decided in time");
+
+  /**
    * @brief What a resize does on this host.
    *
    * The new display comes from the virtual display lease, the desktop is
@@ -2345,7 +2371,7 @@ namespace stream {
       return display_device::configure_display(config::video, launch_for(m_target));
     }
 
-    bool switch_video(std::uint64_t, const stream_resize::stream_mode_t &mode) override {
+    std::optional<std::uint32_t> switch_video(std::uint64_t, const stream_resize::stream_mode_t &mode) override {
       return apply_video(mode);
     }
 
@@ -2359,7 +2385,7 @@ namespace stream {
       return display_device::configure_display(config::video, launch_for(m_shown));
     }
 
-    bool restore_video(std::uint64_t, const stream_resize::stream_mode_t &mode) override {
+    std::optional<std::uint32_t> restore_video(std::uint64_t, const stream_resize::stream_mode_t &mode) override {
       return apply_video(mode);
     }
 
@@ -2381,32 +2407,33 @@ namespace stream {
      * @brief Ask the video thread for a new encoder on the display the stream should show, and wait for it.
      *
      * @param mode What to encode at.
-     * @return True once a frame captured from that display was encoded at the mode.
+     * @return The first frame the new encoder encoded, once a frame captured
+     *         from that display was encoded at the mode, or nothing.
      */
-    bool apply_video(const stream_resize::stream_mode_t &mode) {
+    std::optional<std::uint32_t> apply_video(const stream_resize::stream_mode_t &mode) {
       // The capture has to be on the display the configuration just put the
       // desktop on, and it is named here rather than left for the capture to
       // guess: the display it was on may well still be there.
       const auto output_name = display_device::map_output_name(display_device::active_output_id(config::video));
       if (output_name.empty()) {
         BOOST_LOG(warning) << "Stream resize: the display to capture is not on the desktop"sv;
-        return false;
+        return std::nullopt;
       }
 
       const auto generation = ++m_video_generation;
       m_changes->raise(video::config_change_t {generation, mode.width, mode.height, mode.fps, output_name});
 
-      // Long enough for the capture to move to the display, for an encoder to
-      // start at the new size, and for a frame of the display to be encoded.
-      constexpr auto timeout = 8s;
-      const auto applied = stream_resize::await_video_ack(generation, timeout, [this](std::chrono::milliseconds wait) -> std::optional<stream_resize::video_ack_t> {
+      const auto ack = stream_resize::await_video_ack(generation, resize_video_timeout, [this](std::chrono::milliseconds wait) -> std::optional<stream_resize::video_ack_t> {
         auto ack = m_acks->pop(wait);
         if (!ack) {
           return std::nullopt;
         }
-        return stream_resize::video_ack_t {ack->generation, ack->applied};
+        return stream_resize::video_ack_t {ack->generation, ack->applied, ack->first_frame};
       });
-      return applied.value_or(false);
+      if (!ack || !ack->applied) {
+        return std::nullopt;
+      }
+      return ack->first_frame;
     }
 
     /**

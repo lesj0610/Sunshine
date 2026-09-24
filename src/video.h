@@ -67,6 +67,7 @@ namespace video {
   struct config_ack_t {
     std::uint64_t generation {};  ///< The change this answers.
     bool applied {};  ///< True once a frame captured from the named display was encoded at the new config. False means the old config was kept.
+    std::uint32_t first_frame {};  ///< The first frame encoded at the new config. Only set when applied.
   };
 
   /**
@@ -76,6 +77,10 @@ namespace video {
    * names has been encoded at the new config. Until then the change may be
    * waiting for the capture to move there, and anything that ends it before
    * that is a no, which puts the old config back.
+   *
+   * A yes carries the first frame encoded at the new config. The client
+   * takes no keyframe from before it, since frames before it can have the
+   * old size however late they arrive.
    */
   class config_change_progress_t {
   public:
@@ -106,6 +111,16 @@ namespace video {
     [[nodiscard]] bool on_target() const;
 
     /**
+     * @brief An encoder at the new config is about to encode its first frame.
+     *
+     * Only the first encoder counts: one made after it, when the capture
+     * reinitializes, still encodes at the new config.
+     *
+     * @param frame_nr The number the encoder's first frame gets.
+     */
+    void started(std::int64_t frame_nr);
+
+    /**
      * @brief A frame was encoded at the new config.
      *
      * @param captured False for a frame made up or repeated while waiting for the capture.
@@ -123,6 +138,7 @@ namespace video {
   private:
     config_change_t m_change;
     bool m_on_target;
+    std::optional<std::uint32_t> m_first_frame;
   };
 
   /**

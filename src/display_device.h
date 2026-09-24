@@ -137,6 +137,16 @@ namespace display_device {
   [[nodiscard]] std::unique_ptr<DisplayPowerGuardInterface> keep_display_awake(const std::string &reason);
 
   /**
+   * @brief How long configure_display() waits for a configuration to take effect.
+   *
+   * Long enough for the display API to come back after a topology change,
+   * short enough that a session does not sit unanswered. A configuration
+   * that has not settled by then is reported as failed, since the caller's
+   * next step is to capture a display whose mode it can no longer assume.
+   */
+  inline constexpr std::chrono::milliseconds configure_timeout {15000};
+
+  /**
    * @brief Configure the display device based on the user configuration and the session information.
    * @note This is a convenience method for calling similar method of a different signature.
    *

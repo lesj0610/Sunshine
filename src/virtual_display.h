@@ -273,6 +273,43 @@ namespace virtual_display {
   };
 
   /**
+   * @brief The longest one driver call can keep its caller waiting.
+   *
+   * A call first waits for one already running to finish, and then as long
+   * again for its own.
+   *
+   * @param timeouts The lease's timeouts.
+   * @return The longest wait.
+   */
+  constexpr std::chrono::milliseconds longest_call(const timeouts_t &timeouts) {
+    return 2 * timeouts.call;
+  }
+
+  /**
+   * @brief The longest manager_t::prepare_replacement() can take.
+   *
+   * A call to clear the identity and one to create the display, readiness
+   * checks until the display is up or its time is over, the check running
+   * when it is, and a call to resolve the display for the log.
+   *
+   * @param timeouts The lease's timeouts.
+   * @return The longest wait.
+   */
+  constexpr std::chrono::milliseconds longest_prepare_replacement(const timeouts_t &timeouts) {
+    return 3 * longest_call(timeouts) + timeouts.readiness + timeouts.readiness_poll + longest_call(timeouts);
+  }
+
+  /**
+   * @brief The longest manager_t::abandon_replacement() can take, which is one call to remove the display.
+   *
+   * @param timeouts The lease's timeouts.
+   * @return The longest wait.
+   */
+  constexpr std::chrono::milliseconds longest_abandon_replacement(const timeouts_t &timeouts) {
+    return longest_call(timeouts);
+  }
+
+  /**
    * @brief Owns the virtual display for as long as a session is using it.
    *
    * Only one lease exists at a time. Sunshine addresses the display to capture

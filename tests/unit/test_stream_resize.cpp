@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 // test includes
@@ -35,6 +36,10 @@ namespace {
   constexpr stream_mode_t k_tall {1280, 1440, 60};
   constexpr stream_mode_t k_small {1280, 720, 60};
 
+  // The first frames the fake encoder reports for the new mode and for the old one
+  constexpr std::uint32_t k_switched_at = 500;
+  constexpr std::uint32_t k_restored_at = 700;
+
   /**
    * @brief Steps that report what they were asked and do what the script says.
    */
@@ -47,6 +52,7 @@ namespace {
       std::condition_variable cv;
 
       std::map<std::string, bool> outcome;  ///< Step name to what it returns; missing means true.
+      std::map<std::string, std::chrono::milliseconds> delay;  ///< Step name to how long it takes.
       std::string hold;  ///< A step that waits until released or interrupted.
       bool held {false};  ///< Whether a step is waiting at the hold.
       bool released {false};
@@ -65,6 +71,14 @@ namespace {
       std::unique_lock lock {state->mutex};
       state->calls.push_back(name);
       state->generations.push_back(generation);
+      state->cv.notify_all();
+
+      if (const auto delay = state->delay.find(name); delay != state->delay.end()) {
+        const auto how_long = delay->second;
+        lock.unlock();
+        std::this_thread::sleep_for(how_long);
+        lock.lock();
+      }
 
       if (state->hold == name) {
         state->held = true;
@@ -98,8 +112,11 @@ namespace {
       return step("switch_topology", generation);
     }
 
-    bool switch_video(std::uint64_t generation, const stream_mode_t &mode) override {
-      return step("switch_video", generation, mode);
+    std::optional<std::uint32_t> switch_video(std::uint64_t generation, const stream_mode_t &mode) override {
+      if (!step("switch_video", generation, mode)) {
+        return std::nullopt;
+      }
+      return k_switched_at;
     }
 
     bool remove_old_display(std::uint64_t generation) override {
@@ -110,8 +127,11 @@ namespace {
       return step("restore_topology", generation);
     }
 
-    bool restore_video(std::uint64_t generation, const stream_mode_t &mode) override {
-      return step("restore_video", generation, mode);
+    std::optional<std::uint32_t> restore_video(std::uint64_t generation, const stream_mode_t &mode) override {
+      if (!step("restore_video", generation, mode)) {
+        return std::nullopt;
+      }
+      return k_restored_at;
     }
 
     bool remove_new_display(std::uint64_t generation) override {
@@ -175,6 +195,18 @@ namespace {
       steps->cv.notify_all();
     }
 
+    /// Wait until the transaction running is done with every step, including the ones after its answer.
+    bool await_idle() {
+      const auto give_up_at = std::chrono::steady_clock::now() + 5s;
+      while (coordinator->phase() != stream_resize::phase_e::idle) {
+        if (std::chrono::steady_clock::now() >= give_up_at) {
+          return false;
+        }
+        std::this_thread::sleep_for(1ms);
+      }
+      return true;
+    }
+
     std::vector<std::string> calls() {
       std::lock_guard lock {steps->mutex};
       return steps->calls;
@@ -225,11 +257,13 @@ TEST_F(StreamResizeTest, AResizeRunsEveryStepInOrderAndReportsTheNewMode) {
   rig.coordinator->submit({1, k_wide});
 
   ASSERT_TRUE(rig.sent->await(1));
+  ASSERT_TRUE(rig.await_idle());
   const auto results = rig.sent->snapshot();
   ASSERT_EQ(results.size(), 1u);
   EXPECT_EQ(results[0].id, 1u);
   EXPECT_EQ(results[0].status, status_e::ok);
   EXPECT_EQ(results[0].mode, k_wide);
+  EXPECT_EQ(results[0].first_frame, std::optional<std::uint32_t> {k_switched_at});
   EXPECT_EQ(rig.calls(), k_forward);
   EXPECT_EQ(rig.coordinator->current_mode(), k_wide);
   EXPECT_EQ(rig.coordinator->phase(), stream_resize::phase_e::idle);
@@ -243,6 +277,7 @@ TEST_F(StreamResizeTest, EveryStepOfATransactionGetsItsGenerationAndTheNextGetsA
   ASSERT_TRUE(rig.sent->await(1));
   rig.coordinator->submit({2, k_tall});
   ASSERT_TRUE(rig.sent->await(2));
+  ASSERT_TRUE(rig.await_idle());
 
   std::lock_guard lock {rig.steps->mutex};
   ASSERT_EQ(rig.steps->generations.size(), 8u);
@@ -262,6 +297,8 @@ TEST_F(StreamResizeTest, ADisplayThatDoesNotComeUpIsOnlyRemoved) {
   const auto results = rig.sent->snapshot();
   EXPECT_EQ(results[0].status, status_e::failed_rolled_back);
   EXPECT_EQ(results[0].mode, k_start);
+  // The stream was never touched, so any keyframe of it will do
+  EXPECT_FALSE(results[0].first_frame.has_value());
   EXPECT_EQ(rig.calls(), (std::vector<std::string> {"create_display", "remove_new_display"}));
   EXPECT_EQ(rig.coordinator->current_mode(), k_start);
   EXPECT_EQ(rig.coordinator->phase(), stream_resize::phase_e::idle);
@@ -274,6 +311,7 @@ TEST_F(StreamResizeTest, AFailedDisplayConfigurationIsUndoneDesktopFirstThenVide
 
   ASSERT_TRUE(rig.sent->await(1));
   EXPECT_EQ(rig.sent->snapshot()[0].status, status_e::failed_rolled_back);
+  EXPECT_EQ(rig.sent->snapshot()[0].first_frame, std::optional<std::uint32_t> {k_restored_at});
   EXPECT_EQ(
     rig.calls(),
     (std::vector<std::string> {"create_display", "switch_topology", "restore_topology", "restore_video", "remove_new_display"})
@@ -289,6 +327,8 @@ TEST_F(StreamResizeTest, AnEncoderThatDoesNotRunAtTheNewSizeIsRebuiltAtTheOldOne
   const auto results = rig.sent->snapshot();
   EXPECT_EQ(results[0].status, status_e::failed_rolled_back);
   EXPECT_EQ(results[0].mode, k_start);
+  // Frames of the failed attempt can still arrive, so the old mode is taken up from the restored encoder's first frame
+  EXPECT_EQ(results[0].first_frame, std::optional<std::uint32_t> {k_restored_at});
   EXPECT_EQ(
     rig.calls(),
     (std::vector<std::string> {"create_display", "switch_topology", "switch_video", "restore_topology", "restore_video", "remove_new_display"})
@@ -308,9 +348,40 @@ TEST_F(StreamResizeTest, AnOldDisplayThatWillNotGoIsNotARollback) {
   rig.coordinator->submit({1, k_wide});
 
   ASSERT_TRUE(rig.sent->await(1));
+  ASSERT_TRUE(rig.await_idle());
   EXPECT_EQ(rig.sent->snapshot()[0].status, status_e::ok);
   EXPECT_EQ(rig.calls(), k_forward);
   EXPECT_EQ(rig.coordinator->current_mode(), k_wide);
+}
+
+TEST_F(StreamResizeTest, AnOkIsAnsweredBeforeTheOldDisplayIsRemoved) {
+  auto rig = make_rig({}, "remove_old_display");
+
+  rig.coordinator->submit({1, k_wide});
+
+  // The new display is streamed once the encoder runs on it, so the client
+  // hears then, not after the old display is gone
+  ASSERT_TRUE(rig.sent->await(1));
+  ASSERT_TRUE(rig.await_hold());
+  const auto results = rig.sent->snapshot();
+  EXPECT_EQ(results[0].status, status_e::ok);
+  EXPECT_EQ(results[0].first_frame, std::optional<std::uint32_t> {k_switched_at});
+  EXPECT_EQ(rig.coordinator->phase(), stream_resize::phase_e::committed);
+  EXPECT_EQ(rig.coordinator->current_mode(), k_wide);
+
+  // A request arriving meanwhile waits for the old display to go
+  rig.coordinator->submit({2, k_tall});
+  std::this_thread::sleep_for(50ms);
+  EXPECT_EQ(rig.calls(), k_forward);
+
+  {
+    std::lock_guard lock {rig.steps->mutex};
+    rig.steps->hold.clear();
+  }
+  rig.release();
+  ASSERT_TRUE(rig.sent->await(2));
+  ASSERT_TRUE(rig.await_idle());
+  EXPECT_EQ(rig.sent->snapshot()[1].mode, k_tall);
 }
 
 TEST_F(StreamResizeTest, ARollbackThatFailsPoisonsTheSessionAndEndsIt) {
@@ -403,6 +474,7 @@ TEST_F(StreamResizeTest, OnlyTheNewestWaitingRequestRunsAndTheOthersAreSupersede
   EXPECT_EQ(results[3].mode, k_tall);
 
   // Two transactions, not four.
+  ASSERT_TRUE(rig.await_idle());
   std::vector<std::string> expected = k_forward;
   expected.insert(expected.end(), k_forward.begin(), k_forward.end());
   EXPECT_EQ(rig.calls(), expected);
@@ -457,6 +529,7 @@ TEST_F(StreamResizeTest, TheModeTheStreamAlreadyHasNeedsNoTransaction) {
   ASSERT_TRUE(rig.sent->await(1));
   EXPECT_EQ(rig.sent->snapshot()[0].status, status_e::ok);
   EXPECT_EQ(rig.sent->snapshot()[0].mode, k_start);
+  EXPECT_FALSE(rig.sent->snapshot()[0].first_frame.has_value());
   EXPECT_TRUE(rig.calls().empty());
 }
 
@@ -502,7 +575,7 @@ TEST_F(StreamResizeTest, StoppingMidTransactionUndoesNothingAndAnswersNothing) {
 }
 
 TEST_F(StreamResizeTest, TheAnswerToAnotherChangeIsNotTakenForTheOneAwaited) {
-  std::vector<stream_resize::video_ack_t> queue {{3, true}, {4, false}, {5, true}};
+  std::vector<stream_resize::video_ack_t> queue {{3, true, 30}, {4, false}, {5, true, 50}};
   auto pop = [&queue](std::chrono::milliseconds) -> std::optional<stream_resize::video_ack_t> {
     if (queue.empty()) {
       return std::nullopt;
@@ -512,15 +585,20 @@ TEST_F(StreamResizeTest, TheAnswerToAnotherChangeIsNotTakenForTheOneAwaited) {
     return ack;
   };
 
-  EXPECT_EQ(stream_resize::await_video_ack(5, 1s, pop), std::optional<bool> {true});
+  auto ack = stream_resize::await_video_ack(5, 1s, pop);
+  ASSERT_TRUE(ack.has_value());
+  EXPECT_TRUE(ack->applied);
+  EXPECT_EQ(ack->first_frame, 50u);
   EXPECT_TRUE(queue.empty());
 
-  queue = {{3, true}, {4, false}};
-  EXPECT_EQ(stream_resize::await_video_ack(4, 1s, pop), std::optional<bool> {false});
+  queue = {{3, true, 30}, {4, false}};
+  ack = stream_resize::await_video_ack(4, 1s, pop);
+  ASSERT_TRUE(ack.has_value());
+  EXPECT_FALSE(ack->applied);
 
   // Only late answers, then nothing: the wait gives up rather than taking one of them.
-  queue = {{1, true}, {2, true}};
-  EXPECT_EQ(stream_resize::await_video_ack(9, 1s, pop), std::nullopt);
+  queue = {{1, true, 10}, {2, true, 20}};
+  EXPECT_FALSE(stream_resize::await_video_ack(9, 1s, pop).has_value());
 }
 
 TEST_F(StreamResizeTest, WaitingForAVideoAnswerGivesUpInTime) {
@@ -530,8 +608,88 @@ TEST_F(StreamResizeTest, WaitingForAVideoAnswerGivesUpInTime) {
     return stream_resize::video_ack_t {1, true};
   };
 
-  EXPECT_EQ(stream_resize::await_video_ack(2, 100ms, pop), std::nullopt);
+  EXPECT_FALSE(stream_resize::await_video_ack(2, 100ms, pop).has_value());
   EXPECT_LT(std::chrono::steady_clock::now() - started, 2s);
+}
+
+TEST_F(StreamResizeTest, ASlowRollbackIsAnsweredForWhatItDid) {
+  // Every step takes its time, but the whole rollback fits in the time a
+  // request may take, so the client hears it was rolled back and the session
+  // carries on
+  constexpr auto step_time = 100ms;
+  auto rig = make_rig({{"switch_video", false}}, {}, {.decide_within = 1500ms});
+  {
+    std::lock_guard lock {rig.steps->mutex};
+    for (const auto *name : {"create_display", "switch_topology", "switch_video", "restore_topology", "restore_video", "remove_new_display"}) {
+      rig.steps->delay[name] = step_time;
+    }
+  }
+
+  const auto started = std::chrono::steady_clock::now();
+  rig.coordinator->submit({1, k_wide});
+
+  ASSERT_TRUE(rig.sent->await(1));
+  EXPECT_GE(std::chrono::steady_clock::now() - started, 6 * step_time);
+  const auto results = rig.sent->snapshot();
+  EXPECT_EQ(results[0].status, status_e::failed_rolled_back);
+  EXPECT_EQ(results[0].first_frame, std::optional<std::uint32_t> {k_restored_at});
+
+  // Nothing more comes of it once the time is up
+  std::this_thread::sleep_for(1600ms - (std::chrono::steady_clock::now() - started));
+  EXPECT_EQ(rig.sent->snapshot().size(), 1u);
+  EXPECT_FALSE(rig.coordinator->timed_out());
+  EXPECT_EQ(rig.end_session_calls(), 0);
+  EXPECT_EQ(rig.coordinator->phase(), stream_resize::phase_e::idle);
+}
+
+TEST_F(StreamResizeTest, AStuckStepEndsTheSessionInTime) {
+  // The display configuration never comes back, not even when interrupted
+  constexpr auto decide_within = 300ms;
+  auto rig = make_rig({}, "switch_topology", {.decide_within = decide_within});
+  {
+    std::lock_guard lock {rig.steps->mutex};
+    rig.steps->ignore_interrupt = true;
+  }
+
+  const auto started = std::chrono::steady_clock::now();
+  rig.coordinator->submit({1, k_wide});
+  ASSERT_TRUE(rig.await_hold());
+  rig.coordinator->submit({2, k_tall});
+
+  // Both are answered, in order, and the session ends
+  ASSERT_TRUE(rig.sent->await(2));
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  EXPECT_GE(elapsed, decide_within);
+  EXPECT_LT(elapsed, decide_within + 2s);
+  const auto results = rig.sent->snapshot();
+  ASSERT_EQ(results.size(), 2u);
+  EXPECT_EQ(results[0].id, 1u);
+  EXPECT_EQ(results[0].status, status_e::failed_session_ending);
+  EXPECT_EQ(results[1].id, 2u);
+  EXPECT_EQ(results[1].status, status_e::failed_session_ending);
+  EXPECT_TRUE(rig.coordinator->timed_out());
+  EXPECT_EQ(rig.coordinator->phase(), stream_resize::phase_e::poisoned);
+  {
+    std::unique_lock lock {rig.steps->mutex};
+    EXPECT_TRUE(rig.steps->cv.wait_for(lock, 5s, [&] {
+      return rig.steps->end_session_calls == 1;
+    }));
+    EXPECT_TRUE(rig.steps->interrupted);
+  }
+
+  // The step coming back late changes nothing: no further step, no second answer
+  rig.release();
+  rig.coordinator->submit({3, k_small});
+  std::this_thread::sleep_for(50ms);
+  rig.coordinator->stop();
+  EXPECT_EQ(rig.calls(), (std::vector<std::string> {"create_display", "switch_topology"}));
+  EXPECT_EQ(rig.sent->snapshot().size(), 2u);
+  EXPECT_EQ(rig.end_session_calls(), 1);
+}
+
+TEST_F(StreamResizeTest, TheTimeToDecideLeavesTheAnswerTimeToGetOut) {
+  EXPECT_EQ(stream_resize::answer_within, std::chrono::milliseconds {LI_STREAM_RESIZE_ANSWER_WITHIN_MS});
+  EXPECT_LE(stream_resize::options_t {}.decide_within + stream_resize::outbox_t::give_up_after, stream_resize::answer_within);
 }
 
 TEST_F(StreamResizeTest, AStopBetweenStepsTakesNoFurtherStep) {
@@ -636,10 +794,18 @@ TEST_F(StreamResizeTest, AResizeIsOnlyAnsweredOnceAFrameOfItsDisplayWasEncoded) 
   EXPECT_TRUE(progress.on_target());
   EXPECT_FALSE(progress.frame_encoded(false).has_value());
 
+  // Nor is one from before an encoder at the new size said where it starts
+  EXPECT_FALSE(progress.frame_encoded(true).has_value());
+
+  // An encoder made again after a reinit still encodes the new size, so the
+  // first one's first frame stays the answer's
+  progress.started(41);
+  progress.started(57);
   const auto ack = progress.frame_encoded(true);
   ASSERT_TRUE(ack.has_value());
   EXPECT_EQ(ack->generation, 7u);
   EXPECT_TRUE(ack->applied);
+  EXPECT_EQ(ack->first_frame, 41u);
 
   // The capture moving away again takes the answer back
   progress.capturing("\\\\.\\DISPLAY7");
@@ -652,5 +818,8 @@ TEST_F(StreamResizeTest, AResizeIsOnlyAnsweredOnceAFrameOfItsDisplayWasEncoded) 
   // A change that names no display takes whichever is captured
   video::config_change_progress_t anywhere {{8, 1920, 1080, 60, {}}};
   EXPECT_TRUE(anywhere.on_target());
-  EXPECT_TRUE(anywhere.frame_encoded(true).has_value());
+  anywhere.started(0x1'0000'0005);
+  ASSERT_TRUE(anywhere.frame_encoded(true).has_value());
+  // Frame numbers go out as their low 32 bits
+  EXPECT_EQ(anywhere.frame_encoded(true)->first_frame, 5u);
 }

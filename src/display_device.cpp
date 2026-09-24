@@ -50,14 +50,9 @@ namespace display_device {
     constexpr std::chrono::milliseconds DEFAULT_RETRY_INTERVAL {5000};
 
     /**
-     * @brief How long a caller waits for a configuration to take effect.
-     *
-     * Long enough for the display API to come back after a topology change,
-     * short enough that a session does not sit unanswered. A configuration
-     * that has not settled by then is reported as failed, since the caller's
-     * next step is to capture a display whose mode it can no longer assume.
+     * @brief How long a caller waits for a configuration to take effect (see configure_timeout).
      */
-    constexpr std::chrono::milliseconds APPLY_TIMEOUT {15000};
+    constexpr std::chrono::milliseconds APPLY_TIMEOUT {configure_timeout};
 
     /**
      * @brief How long a caller waits for a configuration to be restored.

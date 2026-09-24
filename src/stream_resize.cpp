@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -53,6 +54,9 @@ namespace stream_resize {
     m_thread = std::thread {[this] {
       run();
     }};
+    m_watchdog = std::thread {[this] {
+      watch();
+    }};
   }
 
   coordinator_t::~coordinator_t() {
@@ -73,7 +77,8 @@ namespace stream_resize {
       return;
     }
     m_last_id = request.id;
-    m_answers.push_back({request.id});
+    m_answers.push_back({request.id, std::chrono::steady_clock::now() + m_options.decide_within});
+    m_wake.notify_all();
 
     if (m_phase == phase_e::poisoned) {
       decide(request.id, status_e::rejected_unsupported);
@@ -101,7 +106,7 @@ namespace stream_resize {
     }
 
     m_last_id = id;
-    m_answers.push_back({id});
+    m_answers.push_back({id, std::chrono::steady_clock::now() + m_options.decide_within});
     decide(id, status_e::rejected_invalid);
   }
 
@@ -119,14 +124,21 @@ namespace stream_resize {
   void coordinator_t::stop() {
     request_stop();
 
-    if (m_thread.joinable() && m_thread.get_id() != std::this_thread::get_id()) {
-      m_thread.join();
+    for (auto *thread : {&m_thread, &m_watchdog}) {
+      if (thread->joinable() && thread->get_id() != std::this_thread::get_id()) {
+        thread->join();
+      }
     }
   }
 
   phase_e coordinator_t::phase() const {
     std::lock_guard lock {m_mutex};
     return m_phase;
+  }
+
+  bool coordinator_t::timed_out() const {
+    std::lock_guard lock {m_mutex};
+    return m_timed_out;
   }
 
   stream_mode_t coordinator_t::current_mode() const {
@@ -154,19 +166,14 @@ namespace stream_resize {
         }
       }
 
-      const auto result = transact(request);
+      transact(request);
 
       bool poisoned = false;
       {
         std::lock_guard lock {m_mutex};
-        if (m_stopping || !result) {
+        if (m_stopping) {
           return;
         }
-
-        if (result->status == status_e::ok) {
-          m_current = result->mode;
-        }
-        decide(result->id, result->status, result->mode);
 
         if (m_phase == phase_e::poisoned) {
           poisoned = true;
@@ -185,7 +192,54 @@ namespace stream_resize {
     }
   }
 
-  std::optional<result_t> coordinator_t::transact(const request_t &request) {
+  void coordinator_t::watch() {
+    std::unique_lock lock {m_mutex};
+    for (;;) {
+      if (m_stopping) {
+        return;
+      }
+
+      // Answers are decided in any order but due in the order they arrived,
+      // so the first undecided one is due first.
+      const auto undecided = std::ranges::find_if(m_answers, [](const answer_t &answer) {
+        return !answer.status;
+      });
+      if (undecided == m_answers.end()) {
+        m_wake.wait(lock);
+        continue;
+      }
+      if (std::chrono::steady_clock::now() < undecided->due) {
+        m_wake.wait_until(lock, undecided->due);
+        continue;
+      }
+
+      // Every step bounds its own waits, and together they fit in the time
+      // allowed, so a request still running now is stuck in one of them.
+      // Nothing is known about the host, so the session ends, and the client
+      // is told first rather than left to find out.
+      BOOST_LOG(error) << "Stream resize "sv << undecided->id << " is still not done after "sv
+                       << m_options.decide_within.count() << "ms. Ending the session."sv;
+      for (auto &answer : m_answers) {
+        if (!answer.status) {
+          answer.status = status_e::failed_session_ending;
+        }
+      }
+      send_decided();
+
+      m_timed_out = true;
+      m_phase = phase_e::poisoned;
+      m_stopping = true;
+      m_waiting.reset();
+      lock.unlock();
+      m_wake.notify_all();
+
+      m_steps->interrupt();
+      m_steps->end_session();
+      return;
+    }
+  }
+
+  void coordinator_t::transact(const request_t &request) {
     std::uint64_t generation;
     stream_mode_t from;
     {
@@ -204,39 +258,59 @@ namespace stream_resize {
     set_phase(phase_e::preparing);
     if (!m_steps->create_display(generation, request.mode)) {
       BOOST_LOG(warning) << "Stream resize "sv << request.id << ": the new display did not come up"sv;
-      return roll_back(generation, stage_e::create, request);
+      finish(roll_back(generation, stage_e::create, request));
+      return;
     }
     if (stopping()) {
-      return std::nullopt;
+      return;
     }
 
     set_phase(phase_e::switching);
     if (!m_steps->switch_topology(generation)) {
       BOOST_LOG(warning) << "Stream resize "sv << request.id << ": the display configuration was not applied"sv;
-      return roll_back(generation, stage_e::topology, request);
+      finish(roll_back(generation, stage_e::topology, request));
+      return;
     }
     if (stopping()) {
-      return std::nullopt;
+      return;
     }
 
-    if (!m_steps->switch_video(generation, request.mode)) {
+    const auto first_frame = m_steps->switch_video(generation, request.mode);
+    if (!first_frame) {
       BOOST_LOG(warning) << "Stream resize "sv << request.id << ": the encoder did not run at the new size"sv;
-      return roll_back(generation, stage_e::video, request);
+      finish(roll_back(generation, stage_e::video, request));
+      return;
     }
     if (stopping()) {
-      return std::nullopt;
+      return;
     }
 
     // The new display is being streamed from here on, so nothing after this
-    // point is undone.
+    // point is undone, and the client is told now rather than once the old
+    // display is gone.
     set_phase(phase_e::committed);
+    finish(result_t {request.id, request.mode, status_e::ok, first_frame});
+    if (stopping()) {
+      return;
+    }
     if (!m_steps->remove_old_display(generation)) {
       BOOST_LOG(warning) << "Stream resize "sv << request.id
                          << ": the old display was not removed. The lease keeps it and removes it when the session ends."sv;
     }
 
     set_phase(phase_e::idle);
-    return result_t {request.id, request.mode, status_e::ok};
+  }
+
+  void coordinator_t::finish(const std::optional<result_t> &result) {
+    std::lock_guard lock {m_mutex};
+    if (m_stopping || !result) {
+      return;
+    }
+
+    if (result->status == status_e::ok) {
+      m_current = result->mode;
+    }
+    decide(result->id, result->status, result->mode, result->first_frame);
   }
 
   std::optional<result_t> coordinator_t::roll_back(std::uint64_t generation, stage_e stage, const request_t &request) {
@@ -257,10 +331,16 @@ namespace stream_resize {
     // The desktop goes back first, because the capture can only find a
     // display that is on the desktop. The encoder is then rebuilt on the old
     // display and checked, and only once that works is the new display
-    // removed. A display that never got onto the desktop only needs removing.
+    // removed. A display that never got onto the desktop only needs removing,
+    // and the stream it never touched needs no new first frame.
     bool restored = true;
+    std::optional<std::uint32_t> first_frame;
     if (stage != stage_e::create) {
-      restored = m_steps->restore_topology(generation) && !stopping() && m_steps->restore_video(generation, from);
+      restored = m_steps->restore_topology(generation) && !stopping();
+      if (restored) {
+        first_frame = m_steps->restore_video(generation, from);
+        restored = first_frame.has_value();
+      }
     }
     restored = restored && !stopping() && m_steps->remove_new_display(generation);
 
@@ -275,7 +355,7 @@ namespace stream_resize {
     }
 
     set_phase(phase_e::idle);
-    return result_t {request.id, from, status_e::failed_rolled_back};
+    return result_t {request.id, from, status_e::failed_rolled_back, first_frame};
   }
 
   bool coordinator_t::stopping() const {
@@ -288,16 +368,17 @@ namespace stream_resize {
     m_phase = phase;
   }
 
-  void coordinator_t::decide(std::uint32_t id, status_e status, std::optional<stream_mode_t> mode) {
+  void coordinator_t::decide(std::uint32_t id, status_e status, std::optional<stream_mode_t> mode, std::optional<std::uint32_t> first_frame) {
     const auto answer = std::ranges::find_if(m_answers, [id](const answer_t &candidate) {
       return candidate.id == id;
     });
-    if (answer == m_answers.end()) {
+    if (answer == m_answers.end() || answer->status) {
       return;
     }
 
     answer->status = status;
     answer->mode = mode;
+    answer->first_frame = first_frame;
     send_decided();
   }
 
@@ -307,9 +388,10 @@ namespace stream_resize {
 
       // Anything but OK reports what the stream is encoded at as the answer
       // leaves, which accounts for every request answered before it.
-      const result_t result {answer.id, answer.mode.value_or(m_current), *answer.status};
+      const result_t result {answer.id, answer.mode.value_or(m_current), *answer.status, answer.first_frame};
       BOOST_LOG(info) << "Stream resize "sv << result.id << ' ' << to_string(result.status) << ": streaming "sv
-                      << result.mode.width << 'x' << result.mode.height << " @ "sv << result.mode.fps << "fps"sv;
+                      << result.mode.width << 'x' << result.mode.height << " @ "sv << result.mode.fps << "fps"sv
+                      << (result.first_frame ? " from frame "s + std::to_string(*result.first_frame) : ""s);
       m_send(result);
 
       m_answers.pop_front();
@@ -340,7 +422,7 @@ namespace stream_resize {
     return m_waiting.empty();
   }
 
-  std::optional<bool> await_video_ack(
+  std::optional<video_ack_t> await_video_ack(
     std::uint64_t generation,
     std::chrono::milliseconds timeout,
     const std::function<std::optional<video_ack_t>(std::chrono::milliseconds)> &pop
@@ -359,7 +441,7 @@ namespace stream_resize {
       }
 
       if (ack->generation == generation) {
-        return ack->applied;
+        return ack;
       }
 
       BOOST_LOG(debug) << "Ignoring the answer to config change "sv << ack->generation << " while waiting for "sv << generation;
