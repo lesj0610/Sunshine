@@ -13,6 +13,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -23,6 +24,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "display_device.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -587,15 +589,46 @@ namespace rtsp_stream {
     }
 
     /**
+     * @brief Claim the pending-launch slot without filling it yet.
+     * @return True if this caller now holds it.
+     */
+    bool reserve_launch() {
+      std::lock_guard raise_lock {raise_mutex};
+      if (launch_reserved || launch_event.view(0s)) {
+        return false;
+      }
+      launch_reserved = true;
+      return true;
+    }
+
+    /**
+     * @brief Give an unused claim back.
+     */
+    void cancel_launch_reservation() {
+      std::lock_guard raise_lock {raise_mutex};
+      launch_reserved = false;
+    }
+
+    /**
      * @brief Launch a new streaming session.
      * @note If the client does not begin streaming within the ping_timeout,
      *       the session will be discarded.
      * @param launch_session Streaming session information.
+     * @return False if one was already waiting, in which case nothing changed.
      */
-    void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      // Held across the check and the raise. Two requests arriving together
+      // would otherwise both find the slot empty and the second would
+      // silently replace the first.
+      std::lock_guard raise_lock {raise_mutex};
+
+      // The claim is being used up, whether or not the slot turns out to be
+      // fillable.
+      launch_reserved = false;
+
       // If a launch event is still pending, don't overwrite it.
       if (launch_event.view(0s)) {
-        return;
+        return false;
       }
 
       // Raise the new launch session to prepare for the RTSP handshake
@@ -608,9 +641,18 @@ namespace rtsp_stream {
           auto discarded = launch_event.pop(0s);
           if (discarded) {
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+
+            // The display was prepared for a client that never arrived. With
+            // nothing else streaming there is nobody it could belong to, so
+            // it is put back rather than left configured indefinitely.
+            if (this->session_count() == 0) {
+              display_device::revert_configuration();
+            }
           }
         }
       });
+
+      return true;
     }
 
     /**
@@ -640,6 +682,8 @@ namespace rtsp_stream {
       return (int) _session_slots->size();
     }
 
+    std::mutex raise_mutex;  ///< Makes claiming the launch slot a single step.
+    bool launch_reserved {false};  ///< Someone is on their way to filling the slot.
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
 
     /**
@@ -742,8 +786,51 @@ namespace rtsp_stream {
   /**
    * @brief Queue a launch session until the RTSP client connects.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
-    server.session_raise(std::move(launch_session));
+  /**
+   * @brief Queue a launch session for the RTSP handshake.
+   *
+   * @param launch_session Session to queue.
+   * @return False if a launch is already pending.
+   */
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    return server.session_raise(std::move(launch_session));
+  }
+
+  launch_reservation_t::launch_reservation_t(bool held):
+      m_held {held} {
+  }
+
+  launch_reservation_t::~launch_reservation_t() {
+    if (m_held) {
+      server.cancel_launch_reservation();
+    }
+  }
+
+  launch_reservation_t::launch_reservation_t(launch_reservation_t &&other) noexcept:
+      m_held {std::exchange(other.m_held, false)} {
+  }
+
+  launch_reservation_t &launch_reservation_t::operator=(launch_reservation_t &&other) noexcept {
+    if (this != &other) {
+      if (m_held) {
+        server.cancel_launch_reservation();
+      }
+      m_held = std::exchange(other.m_held, false);
+    }
+    return *this;
+  }
+
+  bool launch_reservation_t::commit(std::shared_ptr<launch_session_t> launch_session) {
+    if (!m_held) {
+      return false;
+    }
+
+    m_held = false;
+    return server.session_raise(std::move(launch_session));
+  }
+
+  launch_reservation_t reserve_launch_session() {
+    return launch_reservation_t {server.reserve_launch()};
   }
 
   void launch_session_clear(uint32_t launch_session_id) {

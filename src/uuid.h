@@ -7,6 +7,9 @@
 // standard includes
 #include <random>
 
+// local includes
+#include "utility.h"
+
 /**
  * @brief UUID utilities.
  */

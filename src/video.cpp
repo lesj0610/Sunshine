@@ -1504,7 +1504,7 @@ namespace video {
    */
   void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
-    const auto output_name {display_device::map_output_name(config::video.output_name)};
+    const auto output_name {display_device::map_output_name(display_device::active_output_id(config::video))};
     std::string current_display_name;
 
     // If we have a current display index, let's start with that
@@ -3066,7 +3066,7 @@ namespace video {
    * @brief Validate encoder before it is used.
    */
   bool validate_encoder(encoder_t &encoder, bool expect_failure) {
-    const auto output_name {display_device::map_output_name(config::video.output_name)};
+    const auto output_name {display_device::map_output_name(display_device::active_output_id(config::video))};
     std::shared_ptr<platf::display_t> disp;
 
     BOOST_LOG(info) << "Trying encoder ["sv << encoder.name << ']';
@@ -3415,7 +3415,7 @@ namespace video {
     }
 
     if (chosen_encoder == nullptr) {
-      const auto output_name {display_device::map_output_name(config::video.output_name)};
+      const auto output_name {display_device::map_output_name(display_device::active_output_id(config::video))};
       BOOST_LOG(fatal) << "Unable to find display or encoder during startup."sv;
       if (!config::video.adapter_name.empty() || !output_name.empty()) {
         BOOST_LOG(fatal) << "Please ensure your manually chosen GPU and monitor are connected and powered on."sv;

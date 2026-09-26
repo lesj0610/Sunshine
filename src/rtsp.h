@@ -51,7 +51,76 @@ namespace rtsp_stream {
    *
    * @param launch_session Session state prepared by the GameStream launch handler.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  /**
+   * @brief A claim on the one pending-launch slot.
+   *
+   * Taken before anything with a side effect happens, so a request that is
+   * going to lose the race finds out before it starts an app or takes a
+   * display rather than after. Releasing without committing gives the slot
+   * back.
+   */
+  class launch_reservation_t {
+  public:
+    launch_reservation_t() = default;
+
+    /**
+     * @param held Whether the slot was actually claimed.
+     */
+    explicit launch_reservation_t(bool held);
+
+    /**
+     * @brief Gives the slot back unless it was committed.
+     */
+    ~launch_reservation_t();
+
+    /**
+     * @param other The claim to take over. It is left holding nothing.
+     */
+    launch_reservation_t(launch_reservation_t &&other) noexcept;
+
+    /**
+     * @param other The claim to take over. It is left holding nothing.
+     * @return This claim.
+     */
+    launch_reservation_t &operator=(launch_reservation_t &&other) noexcept;
+
+    launch_reservation_t(const launch_reservation_t &) = delete;
+    launch_reservation_t &operator=(const launch_reservation_t &) = delete;
+
+    /**
+     * @brief Whether the slot was claimed.
+     *
+     * @return True while this holds it.
+     */
+    explicit operator bool() const {
+      return m_held;
+    }
+
+    /**
+     * @brief Hand the session over and keep the slot.
+     *
+     * @param launch_session Session the client will connect for.
+     * @return True if the session was queued.
+     */
+    bool commit(std::shared_ptr<launch_session_t> launch_session);
+
+  private:
+    bool m_held {false};
+  };
+
+  /**
+   * @brief Claim the pending-launch slot.
+   *
+   * @return A claim, which is false if another launch already holds it.
+   *
+   * @examples
+   * auto reservation { reserve_launch_session() };
+   * if (!reservation) {
+   *   // refuse, without having started anything
+   * }
+   * @examples_end
+   */
+  [[nodiscard]] launch_reservation_t reserve_launch_session();
 
   /**
    * @brief Clear state for the specified launch session.

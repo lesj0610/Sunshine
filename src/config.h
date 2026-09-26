@@ -205,6 +205,7 @@ namespace config {
         std::vector<mode_remapping_entry_t> refresh_rate_only;  ///< To be use when only `refresh_rate_option` is set to `automatic`.
       };
 
+      bool virtual_display;  ///< Stream a virtual display created for the session instead of a physical one.
       config_option_e configuration_option;  ///< Display-preparation mode selected by configuration.
       resolution_option_e resolution_option;  ///< Resolution-selection mode selected by configuration.
       std::string manual_resolution;  ///< Manual resolution in case `resolution_option == resolution_option_e::manual`.
