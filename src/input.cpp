@@ -10,6 +10,7 @@ extern "C" {
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cmath>
@@ -33,6 +34,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "platform/common.h"
+#include "platform/keyboard_lang_keys.h"
 #include "platform/virtualhid_input.h"
 #include "thread_pool.h"
 #include "utility.h"
@@ -1092,16 +1094,20 @@ namespace input {
    * @param synthetic_modifiers Synthetic modifiers.
    */
   void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, uint8_t synthetic_modifiers) {
+    // The LANG bits identify one specific physical key. A synthesized modifier is
+    // a different key, so it must not inherit them.
+    const auto modifier_flags = platf::keyboard::without_lang_flags(flags);
+
     if (!release) {
       // Press any synthetic modifiers required for this key
       if (synthetic_modifiers & MODIFIER_SHIFT) {
-        emit_keyboard_update(VKEY_SHIFT, false, flags);
+        emit_keyboard_update(VKEY_SHIFT, false, modifier_flags);
       }
       if (synthetic_modifiers & MODIFIER_CTRL) {
-        emit_keyboard_update(VKEY_CONTROL, false, flags);
+        emit_keyboard_update(VKEY_CONTROL, false, modifier_flags);
       }
       if (synthetic_modifiers & MODIFIER_ALT) {
-        emit_keyboard_update(VKEY_MENU, false, flags);
+        emit_keyboard_update(VKEY_MENU, false, modifier_flags);
       }
     }
 
@@ -1110,13 +1116,13 @@ namespace input {
     if (!release) {
       // Raise any synthetic modifier keys we pressed
       if (synthetic_modifiers & MODIFIER_SHIFT) {
-        emit_keyboard_update(VKEY_SHIFT, true, flags);
+        emit_keyboard_update(VKEY_SHIFT, true, modifier_flags);
       }
       if (synthetic_modifiers & MODIFIER_CTRL) {
-        emit_keyboard_update(VKEY_CONTROL, true, flags);
+        emit_keyboard_update(VKEY_CONTROL, true, modifier_flags);
       }
       if (synthetic_modifiers & MODIFIER_ALT) {
-        emit_keyboard_update(VKEY_MENU, true, flags);
+        emit_keyboard_update(VKEY_MENU, true, modifier_flags);
       }
     }
   }
@@ -1154,6 +1160,20 @@ namespace input {
     auto release = util::endian::little(packet->header.magic) == KEY_UP_EVENT_MAGIC;
     auto keyCode = packet->keyCode & 0x00FF;
 
+    // Reject malformed LANG events before touching any key or modifier state.
+    // Only SS_KBE_FLAG_LANG1 with 0x15 and SS_KBE_FLAG_LANG2 with 0x19 are valid;
+    // anything else would leave us guessing which physical key was meant.
+    if (platf::keyboard::is_malformed_lang_event(keyCode, packet->flags)) {
+      // A peer can send these as fast as it likes, so warn once rather than per packet.
+      static std::atomic<bool> warned {false};
+      if (!warned.exchange(true)) {
+        BOOST_LOG(warning) << "Dropping keyboard events with malformed LANG flags (warning shown once): key code ["sv
+                           << util::hex(keyCode).to_string_view() << "] flags ["sv
+                           << util::hex(packet->flags).to_string_view() << ']';
+      }
+      return;
+    }
+
     update_modifier_state(*input, keyCode, release);
 
     // Right-alt maps to meta, so it must not also register as ALT
@@ -1190,7 +1210,9 @@ namespace input {
           task_pool.cancel(key_press_repeat_id);
         }
 
-        if (config::input.key_repeat_delay.count() > 0) {
+        // A held Hangul/Hanja key must not auto-repeat: each repeat would toggle
+        // the host IME again.
+        if (config::input.key_repeat_delay.count() > 0 && platf::keyboard::should_schedule_repeat(packet->flags)) {
           key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, keyCode, packet->flags, synthetic_modifiers).task_id;
         }
       } else {

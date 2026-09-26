@@ -916,3 +916,101 @@ TEST_F(KeyboardPassthroughTest, ReleasesTheRemappedRightAltForKeyRightaltToKeyWi
 
   EXPECT_EQ(taken(), (std::vector<std::string> {released(VKEY_LWIN)}));
 }
+
+// The Korean IME keys travel as VK_HANGUL (0x15) and VK_HANJA (0x19), which the protocol
+// shares with the Japanese VK_KANA and VK_KANJI. SS_KBE_FLAG_LANG1/LANG2 disambiguate them.
+// These exercise the real packet path: send_keyboard_packet -> passthrough -> recorded backend.
+
+namespace {
+  constexpr std::uint8_t kLang1 = SS_KBE_FLAG_NON_NORMALIZED | SS_KBE_FLAG_LANG1;
+  constexpr std::uint8_t kLang2 = SS_KBE_FLAG_NON_NORMALIZED | SS_KBE_FLAG_LANG2;
+  constexpr std::uint16_t kHangul = 0x15;
+  constexpr std::uint16_t kHanja = 0x19;
+}  // namespace
+
+TEST_F(KeyboardPassthroughTest, ForwardsValidLangKeysWithTheirFlags) {
+  for (const auto &[key_code, flags] : {std::pair {kHangul, kLang1}, std::pair {kHanja, kLang2}}) {
+    press(key_code, 0, flags);
+    release(key_code, 0, flags);
+
+    const auto events = taken_events();
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0].key_code, key_code);
+    EXPECT_FALSE(events[0].release);
+    EXPECT_EQ(events[0].flags, flags);
+    EXPECT_EQ(events[1].key_code, key_code);
+    EXPECT_TRUE(events[1].release);
+    // The release must carry the same wire identity, or the host holds a different key.
+    EXPECT_EQ(events[1].flags, flags);
+  }
+}
+
+TEST_F(KeyboardPassthroughTest, DropsLangFlagsPairedWithTheWrongKeyCode) {
+  // LANG1 belongs to 0x15 only and LANG2 to 0x19 only.
+  press(kHanja, 0, kLang1);
+  press(kHangul, 0, kLang2);
+  press(VKEY_A, 0, kLang1);
+  EXPECT_TRUE(taken().empty());
+
+  // Nothing may be left held, otherwise a later release would emit a phantom key.
+  input::testing::release_held_keys();
+  EXPECT_TRUE(taken().empty());
+}
+
+TEST_F(KeyboardPassthroughTest, DropsEventsWithBothLangFlagsSet) {
+  constexpr std::uint8_t both = SS_KBE_FLAG_NON_NORMALIZED | SS_KBE_FLAG_LANG1 | SS_KBE_FLAG_LANG2;
+
+  press(kHangul, 0, both);
+  press(kHanja, 0, both);
+  EXPECT_TRUE(taken().empty());
+
+  input::testing::release_held_keys();
+  EXPECT_TRUE(taken().empty());
+}
+
+TEST_F(KeyboardPassthroughTest, SyntheticModifiersDoNotInheritLangFlags) {
+  // The client claims shift is held, so Sunshine synthesizes it around the key.
+  press(kHangul, MODIFIER_SHIFT, kLang1);
+
+  const auto events = taken_events();
+  ASSERT_EQ(events.size(), 3u);
+
+  EXPECT_EQ(events[0].key_code, VKEY_SHIFT);
+  EXPECT_FALSE(events[0].release);
+  // A synthesized shift is a different physical key, so it must not claim to be Hangul.
+  EXPECT_EQ(events[0].flags, SS_KBE_FLAG_NON_NORMALIZED);
+
+  EXPECT_EQ(events[1].key_code, kHangul);
+  EXPECT_FALSE(events[1].release);
+  EXPECT_EQ(events[1].flags, kLang1);
+
+  EXPECT_EQ(events[2].key_code, VKEY_SHIFT);
+  EXPECT_TRUE(events[2].release);
+  EXPECT_EQ(events[2].flags, SS_KBE_FLAG_NON_NORMALIZED);
+}
+
+TEST_F(KeyboardPassthroughTest, ReleasesHeldLangKeysWithTheOriginalFlags) {
+  press(kHangul, 0, kLang1);
+  EXPECT_EQ(taken_events().size(), 1u);
+
+  input::testing::release_held_keys();
+
+  const auto events = taken_events();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].key_code, kHangul);
+  EXPECT_TRUE(events[0].release);
+  EXPECT_EQ(events[0].flags, kLang1);
+}
+
+TEST_F(KeyboardPassthroughTest, OrdinaryKeysAreUnchangedByLangHandling) {
+  press(VKEY_A, 0, SS_KBE_FLAG_NON_NORMALIZED);
+  release(VKEY_A, 0, SS_KBE_FLAG_NON_NORMALIZED);
+
+  const auto events = taken_events();
+  ASSERT_EQ(events.size(), 2u);
+  EXPECT_EQ(events[0].key_code, VKEY_A);
+  EXPECT_EQ(events[0].flags, SS_KBE_FLAG_NON_NORMALIZED);
+  EXPECT_EQ(events[1].key_code, VKEY_A);
+  EXPECT_TRUE(events[1].release);
+  EXPECT_EQ(events[1].flags, SS_KBE_FLAG_NON_NORMALIZED);
+}
