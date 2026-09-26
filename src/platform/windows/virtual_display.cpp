@@ -208,6 +208,9 @@ namespace virtual_display {
           m_targets.erase(id.string());
         }
 
+        if (!result.ok) {
+          BOOST_LOG(error) << "Virtual display driver would not remove a display (error "sv << result.error << ')';
+        }
         return result.ok;
       }
 

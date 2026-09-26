@@ -1137,6 +1137,7 @@ namespace virtual_display {
       if (impl.state != state_e::active) {
         // Nothing may be asked of the driver, and the obligation stays with
         // whatever finishes the lease.
+        BOOST_LOG(warning) << "The display made to replace the streamed one is left for the end of the lease to remove"sv;
         return false;
       }
 

@@ -340,9 +340,21 @@ namespace stream_resize {
       if (restored) {
         first_frame = m_steps->restore_video(generation, from);
         restored = first_frame.has_value();
+        if (!restored) {
+          BOOST_LOG(warning) << "Stream resize "sv << request.id << ": the encoder did not come back at the old size"sv;
+        }
+      } else if (!stopping()) {
+        BOOST_LOG(warning) << "Stream resize "sv << request.id << ": the old display configuration could not be applied again"sv;
       }
     }
-    restored = restored && !stopping() && m_steps->remove_new_display(generation);
+    if (restored && !stopping()) {
+      restored = m_steps->remove_new_display(generation);
+      if (!restored) {
+        BOOST_LOG(warning) << "Stream resize "sv << request.id << ": the new display could not be removed"sv;
+      }
+    } else {
+      restored = false;
+    }
 
     if (!restored) {
       if (stopping()) {
