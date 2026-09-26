@@ -28,6 +28,12 @@ namespace rtsp_stream {
   struct launch_session_t;
 }
 
+#ifdef _WIN32
+namespace display_device {
+  struct SingleDisplayConfigState;
+}
+#endif
+
 namespace display_device {
   /**
    * @brief Initialize the implementation and perform the initial state recovery (if needed).
@@ -208,6 +214,29 @@ namespace display_device {
    * @examples_end
    */
   void revert_configuration();
+
+#ifdef _WIN32
+  /**
+   * @brief A saved configuration with the given displays taken out, as it is written to disk.
+   *
+   * The saved configuration is read back only when Sunshine starts, to put
+   * back what an earlier run left changed. The virtual displays that run made
+   * are gone by then, and a configuration naming one of them cannot be put
+   * back: undoing a session's changes starts by returning to the session's
+   * topology, which a missing display rules out, and every later
+   * configuration tries that same undo first. Nothing is lost by leaving them
+   * out, since there is nothing to restore on a display that no longer exists.
+   *
+   * An initial topology that would be left empty is kept as it was. A
+   * modified topology left empty is replaced by the initial one, so whatever
+   * remains to be undone is undone there.
+   *
+   * @param state The configuration being saved.
+   * @param device_ids The displays to take out.
+   * @return The configuration without them.
+   */
+  [[nodiscard]] SingleDisplayConfigState without_displays(SingleDisplayConfigState state, const StringSet &device_ids);
+#endif
 
   /**
    * @brief Reset persisted display state and the captured initial state.

@@ -12,9 +12,11 @@
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <mutex>
 #include <regex>
 #include <string_view>
+#include <vector>
 
 // lib includes
 #include <boost/algorithm/string.hpp>
@@ -33,6 +35,7 @@
 
 // platform-specific includes
 #ifdef _WIN32
+  #include <display_device/windows/json.h>
   #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
@@ -72,6 +75,39 @@ namespace display_device {
       std::chrono::milliseconds config_revert_delay {0};
       std::unique_ptr<RetryScheduler<SettingsManagerInterface>> sm_instance {nullptr};
     } DD_DATA;
+
+#ifdef _WIN32
+    /**
+     * @brief The virtual displays this process has configured.
+     *
+     * None of them outlives the process: the driver removes a display once
+     * Sunshine stops answering its watchdog, and every lease makes a new one.
+     */
+    struct {
+      std::mutex mutex {};
+      StringSet device_ids {};
+    } VIRTUAL_DISPLAYS;
+
+    /**
+     * @brief Note a virtual display that a configuration is about to name.
+     *
+     * @param device_id The display's device id.
+     */
+    void remember_virtual_display(const std::string &device_id) {
+      std::lock_guard lock {VIRTUAL_DISPLAYS.mutex};
+      VIRTUAL_DISPLAYS.device_ids.insert(device_id);
+    }
+
+    /**
+     * @brief The virtual displays noted so far.
+     *
+     * @return Their device ids.
+     */
+    StringSet remembered_virtual_displays() {
+      std::lock_guard lock {VIRTUAL_DISPLAYS.mutex};
+      return VIRTUAL_DISPLAYS.device_ids;
+    }
+#endif
 
     /**
      * @brief Helper class for capturing audio context when the API demands it.
@@ -674,13 +710,64 @@ namespace display_device {
      * @param video_config User's video related configuration.
      * @return An interface or nullptr if the OS does not support the interface.
      */
+#ifdef _WIN32
+    /**
+     * @brief Writes the display configuration to disk without the virtual displays in it.
+     *
+     * See without_displays() for why. Only what is written changes: the
+     * settings manager keeps the configuration it was handed in memory, and
+     * restores from that while this process runs and the displays are there.
+     */
+    class without_virtual_displays_t: public SettingsPersistenceInterface {
+    public:
+      explicit without_virtual_displays_t(std::shared_ptr<SettingsPersistenceInterface> file):
+          m_file {std::move(file)} {
+      }
+
+      [[nodiscard]] bool store(const std::vector<std::uint8_t> &data) override {
+        const auto device_ids {remembered_virtual_displays()};
+        if (device_ids.empty()) {
+          return m_file->store(data);
+        }
+
+        // Saved as it came when it cannot be rewritten. A configuration that
+        // may not be restorable after a restart still beats having none.
+        SingleDisplayConfigState state;
+        if (std::string error; !fromJson({std::begin(data), std::end(data)}, state, &error)) {
+          BOOST_LOG(warning) << "Could not read the display configuration being saved, so it is saved with its virtual displays: " << error;
+          return m_file->store(data);
+        }
+
+        bool written {false};
+        const auto json {toJson(without_displays(std::move(state), device_ids), 2u, &written)};
+        if (!written) {
+          BOOST_LOG(warning) << "Could not write the display configuration without its virtual displays, so it is saved with them.";
+          return m_file->store(data);
+        }
+
+        return m_file->store({std::begin(json), std::end(json)});
+      }
+
+      [[nodiscard]] std::optional<std::vector<std::uint8_t>> load() const override {
+        return m_file->load();
+      }
+
+      [[nodiscard]] bool clear() override {
+        return m_file->clear();
+      }
+
+    private:
+      std::shared_ptr<SettingsPersistenceInterface> m_file;
+    };
+#endif
+
     std::unique_ptr<SettingsManagerInterface> make_settings_manager([[maybe_unused]] const std::filesystem::path &persistence_filepath, [[maybe_unused]] const config::video_t &video_config) {
 #ifdef _WIN32
       return std::make_unique<SettingsManager>(
         std::make_shared<WinDisplayDevice>(std::make_shared<WinApiLayer>()),
         std::make_shared<sunshine_audio_context_t>(),
         std::make_unique<PersistentState>(
-          std::make_shared<FileSettingsPersistence>(persistence_filepath)
+          std::make_shared<without_virtual_displays_t>(std::make_shared<FileSettingsPersistence>(persistence_filepath))
         ),
         WinWorkarounds {
           .m_hdr_blank_delay = video_config.dd.wa.hdr_toggle_delay != std::chrono::milliseconds::zero() ? std::make_optional(video_config.dd.wa.hdr_toggle_delay) : std::nullopt
@@ -1071,6 +1158,13 @@ namespace display_device {
     auto settled {std::make_shared<std::atomic<bool>>(false)};
     auto applied {outcome->get_future()};
 
+#ifdef _WIN32
+    // Noted before applying, which saves a configuration naming the display
+    if (const auto leased {virtual_display::manager().output_override()}; leased && *leased == config.m_device_id) {
+      remember_virtual_display(config.m_device_id);
+    }
+#endif
+
     {
       std::lock_guard lock {DD_DATA.mutex};
       if (!DD_DATA.sm_instance) {
@@ -1149,6 +1243,48 @@ namespace display_device {
       return settings_iface.resetPersistence();
     });
   }
+
+#ifdef _WIN32
+  SingleDisplayConfigState without_displays(SingleDisplayConfigState state, const StringSet &device_ids) {
+    const auto is_gone {[&device_ids](const std::string &device_id) {
+      return device_ids.contains(device_id);
+    }};
+    const auto strip {[&is_gone](const ActiveTopology &topology) {
+      ActiveTopology stripped;
+      for (const auto &group : topology) {
+        std::vector<std::string> kept;
+        std::ranges::remove_copy_if(group, std::back_inserter(kept), is_gone);
+        if (!kept.empty()) {
+          stripped.push_back(std::move(kept));
+        }
+      }
+      return stripped;
+    }};
+
+    auto &initial {state.m_initial};
+    if (auto topology {strip(initial.m_topology)}; !topology.empty()) {
+      initial.m_topology = std::move(topology);
+      std::erase_if(initial.m_primary_devices, is_gone);
+    }
+
+    auto &modified {state.m_modified};
+    modified.m_topology = strip(modified.m_topology);
+    if (modified.m_topology.empty()) {
+      modified.m_topology = initial.m_topology;
+    }
+    std::erase_if(modified.m_original_modes, [&is_gone](const auto &entry) {
+      return is_gone(entry.first);
+    });
+    std::erase_if(modified.m_original_hdr_states, [&is_gone](const auto &entry) {
+      return is_gone(entry.first);
+    });
+    if (is_gone(modified.m_original_primary_device)) {
+      modified.m_original_primary_device.clear();
+    }
+
+    return state;
+  }
+#endif
 
   EnumeratedDeviceList enumerate_devices() {
     std::lock_guard lock {DD_DATA.mutex};

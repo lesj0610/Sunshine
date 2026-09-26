@@ -14,6 +14,11 @@
 #include <src/display_device.h>
 #include <src/rtsp.h>
 
+// platform-specific includes
+#ifdef _WIN32
+  #include <display_device/windows/types.h>
+#endif
+
 namespace {
   using config_option_e = config::video_t::dd_t::config_option_e;
   using device_prep_t = display_device::SingleDisplayConfiguration::DevicePreparation;
@@ -519,3 +524,92 @@ namespace {
     }
   }
 }  // namespace
+
+#ifdef _WIN32
+namespace {
+  using display_device::ActiveTopology;
+  using display_device::SingleDisplayConfigState;
+  using display_device::StringSet;
+
+  // A monitor and a second display, and the virtual display being streamed,
+  // which the driver put on the desktop when it created it
+  const std::string MONITOR {"{monitor}"};
+  const std::string SECOND {"{second}"};
+  const std::string VIRTUAL {"{virtual}"};
+  const StringSet VIRTUAL_ONLY {VIRTUAL};
+  const ActiveTopology REAL_ONLY {{MONITOR}, {SECOND}};
+
+  /**
+   * @brief What an only-display session on the virtual display saves.
+   */
+  SingleDisplayConfigState only_display_state() {
+    SingleDisplayConfigState state;
+    state.m_initial.m_topology = {{MONITOR}, {SECOND}, {VIRTUAL}};
+    state.m_initial.m_primary_devices = {MONITOR};
+    state.m_modified.m_topology = {{VIRTUAL}};
+    state.m_modified.m_original_modes = {{VIRTUAL, {{1920, 1080}, {60, 1}}}};
+    state.m_modified.m_original_hdr_states = {{VIRTUAL, hdr_state_e::Disabled}};
+    return state;
+  }
+}  // namespace
+
+TEST(WithoutDisplays, LeavesNothingToUndoOnTheVirtualDisplay) {
+  const auto state {display_device::without_displays(only_display_state(), VIRTUAL_ONLY)};
+
+  EXPECT_EQ(state.m_initial.m_topology, REAL_ONLY);
+  EXPECT_EQ(state.m_initial.m_primary_devices, StringSet {MONITOR});
+  EXPECT_EQ(state.m_modified.m_topology, REAL_ONLY);
+  EXPECT_FALSE(state.m_modified.hasModifications());
+}
+
+TEST(WithoutDisplays, KeepsWhatWasChangedOnRealDisplays) {
+  auto state {only_display_state()};
+  state.m_modified.m_topology = {{MONITOR}, {SECOND}, {VIRTUAL}};
+  state.m_modified.m_original_primary_device = MONITOR;
+
+  state = display_device::without_displays(std::move(state), VIRTUAL_ONLY);
+
+  EXPECT_EQ(state.m_modified.m_topology, REAL_ONLY);
+  EXPECT_EQ(state.m_modified.m_original_primary_device, MONITOR);
+  EXPECT_TRUE(state.m_modified.m_original_modes.empty());
+  EXPECT_TRUE(state.m_modified.m_original_hdr_states.empty());
+}
+
+TEST(WithoutDisplays, TakesTheVirtualDisplayOutOfADuplicatedGroup) {
+  auto state {only_display_state()};
+  state.m_initial.m_topology = {{MONITOR, VIRTUAL}, {SECOND}};
+
+  state = display_device::without_displays(std::move(state), VIRTUAL_ONLY);
+
+  EXPECT_EQ(state.m_initial.m_topology, REAL_ONLY);
+}
+
+TEST(WithoutDisplays, ForgetsTheVirtualDisplayAsOriginalPrimary) {
+  auto state {only_display_state()};
+  state.m_modified.m_original_primary_device = VIRTUAL;
+
+  state = display_device::without_displays(std::move(state), VIRTUAL_ONLY);
+
+  EXPECT_TRUE(state.m_modified.m_original_primary_device.empty());
+  EXPECT_FALSE(state.m_modified.hasModifications());
+}
+
+TEST(WithoutDisplays, KeepsAnInitialTopologyThatWouldBeLeftEmpty) {
+  auto state {only_display_state()};
+  state.m_initial.m_topology = {{VIRTUAL}};
+  state.m_initial.m_primary_devices = {VIRTUAL};
+
+  state = display_device::without_displays(std::move(state), VIRTUAL_ONLY);
+
+  EXPECT_EQ(state.m_initial.m_topology, ActiveTopology {{VIRTUAL}});
+  EXPECT_EQ(state.m_initial.m_primary_devices, StringSet {VIRTUAL});
+}
+
+TEST(WithoutDisplays, LeavesOtherConfigurationsAlone) {
+  auto state {only_display_state()};
+  state.m_modified.m_topology = {{MONITOR}};
+  state.m_modified.m_original_modes = {{MONITOR, {{2560, 1440}, {144, 1}}}};
+
+  EXPECT_EQ(display_device::without_displays(state, StringSet {"{other}"}), state);
+}
+#endif
