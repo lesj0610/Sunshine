@@ -7,10 +7,16 @@
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdint>
+#include <functional>
+#include <future>
+#include <iterator>
 #include <mutex>
 #include <regex>
 #include <string_view>
+#include <vector>
 
 // lib includes
 #include <boost/algorithm/string.hpp>
@@ -22,11 +28,14 @@
 
 // local includes
 #include "audio.h"
+#include "config.h"
 #include "platform/common.h"
 #include "rtsp.h"
+#include "virtual_display.h"
 
 // platform-specific includes
 #ifdef _WIN32
+  #include <display_device/windows/json.h>
   #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
@@ -44,6 +53,21 @@ namespace display_device {
     constexpr std::chrono::milliseconds DEFAULT_RETRY_INTERVAL {5000};
 
     /**
+     * @brief How long a caller waits for a configuration to take effect (see configure_timeout).
+     */
+    constexpr std::chrono::milliseconds APPLY_TIMEOUT {configure_timeout};
+
+    /**
+     * @brief How long a caller waits for a configuration to be restored (see revert_timeout).
+     *
+     * Only used where the answer matters, which is when a virtual display is
+     * waiting to be removed. Removing it first would take away the display
+     * the restore works against, so the restore has to finish, and the usual
+     * revert delay would mean holding the display for no reason.
+     */
+    constexpr std::chrono::milliseconds REVERT_TIMEOUT {revert_timeout};
+
+    /**
      * @brief A global for the settings manager interface and other settings whose lifetime is managed by `display_device::init(...)`.
      */
     struct {
@@ -51,6 +75,39 @@ namespace display_device {
       std::chrono::milliseconds config_revert_delay {0};
       std::unique_ptr<RetryScheduler<SettingsManagerInterface>> sm_instance {nullptr};
     } DD_DATA;
+
+#ifdef _WIN32
+    /**
+     * @brief The virtual displays this process has configured.
+     *
+     * None of them outlives the process: the driver removes a display once
+     * Sunshine stops answering its watchdog, and every lease makes a new one.
+     */
+    struct {
+      std::mutex mutex {};
+      StringSet device_ids {};
+    } VIRTUAL_DISPLAYS;
+
+    /**
+     * @brief Note a virtual display that a configuration is about to name.
+     *
+     * @param device_id The display's device id.
+     */
+    void remember_virtual_display(const std::string &device_id) {
+      std::lock_guard lock {VIRTUAL_DISPLAYS.mutex};
+      VIRTUAL_DISPLAYS.device_ids.insert(device_id);
+    }
+
+    /**
+     * @brief The virtual displays noted so far.
+     *
+     * @return Their device ids.
+     */
+    StringSet remembered_virtual_displays() {
+      std::lock_guard lock {VIRTUAL_DISPLAYS.mutex};
+      return VIRTUAL_DISPLAYS.device_ids;
+    }
+#endif
 
     /**
      * @brief Helper class for capturing audio context when the API demands it.
@@ -653,13 +710,64 @@ namespace display_device {
      * @param video_config User's video related configuration.
      * @return An interface or nullptr if the OS does not support the interface.
      */
+#ifdef _WIN32
+    /**
+     * @brief Writes the display configuration to disk without the virtual displays in it.
+     *
+     * See without_displays() for why. Only what is written changes: the
+     * settings manager keeps the configuration it was handed in memory, and
+     * restores from that while this process runs and the displays are there.
+     */
+    class without_virtual_displays_t: public SettingsPersistenceInterface {
+    public:
+      explicit without_virtual_displays_t(std::shared_ptr<SettingsPersistenceInterface> file):
+          m_file {std::move(file)} {
+      }
+
+      [[nodiscard]] bool store(const std::vector<std::uint8_t> &data) override {
+        const auto device_ids {remembered_virtual_displays()};
+        if (device_ids.empty()) {
+          return m_file->store(data);
+        }
+
+        // Saved as it came when it cannot be rewritten. A configuration that
+        // may not be restorable after a restart still beats having none.
+        SingleDisplayConfigState state;
+        if (std::string error; !fromJson({std::begin(data), std::end(data)}, state, &error)) {
+          BOOST_LOG(warning) << "Could not read the display configuration being saved, so it is saved with its virtual displays: " << error;
+          return m_file->store(data);
+        }
+
+        bool written {false};
+        const auto json {toJson(without_displays(std::move(state), device_ids), 2u, &written)};
+        if (!written) {
+          BOOST_LOG(warning) << "Could not write the display configuration without its virtual displays, so it is saved with them.";
+          return m_file->store(data);
+        }
+
+        return m_file->store({std::begin(json), std::end(json)});
+      }
+
+      [[nodiscard]] std::optional<std::vector<std::uint8_t>> load() const override {
+        return m_file->load();
+      }
+
+      [[nodiscard]] bool clear() override {
+        return m_file->clear();
+      }
+
+    private:
+      std::shared_ptr<SettingsPersistenceInterface> m_file;
+    };
+#endif
+
     std::unique_ptr<SettingsManagerInterface> make_settings_manager([[maybe_unused]] const std::filesystem::path &persistence_filepath, [[maybe_unused]] const config::video_t &video_config) {
 #ifdef _WIN32
       return std::make_unique<SettingsManager>(
         std::make_shared<WinDisplayDevice>(std::make_shared<WinApiLayer>()),
         std::make_shared<sunshine_audio_context_t>(),
         std::make_unique<PersistentState>(
-          std::make_shared<FileSettingsPersistence>(persistence_filepath)
+          std::make_shared<without_virtual_displays_t>(std::make_shared<FileSettingsPersistence>(persistence_filepath))
         ),
         WinWorkarounds {
           .m_hdr_blank_delay = video_config.dd.wa.hdr_toggle_delay != std::chrono::milliseconds::zero() ? std::make_optional(video_config.dd.wa.hdr_toggle_delay) : std::nullopt
@@ -757,9 +865,126 @@ namespace display_device {
       },
                                     scheduler_option);
     }
+
+    /**
+     * @brief Restore the saved configuration and wait to hear whether it took.
+     *
+     * The ordinary revert is deliberately unhurried: it waits out a delay and
+     * then keeps retrying in the background, and never tells anyone how it
+     * went. That is fine when nothing is waiting on it. It is not fine when a
+     * virtual display is being taken away, because removing the display
+     * before the restore has run leaves the restore working against a display
+     * that is no longer there.
+     *
+     * @param timeout How long to wait for a final answer.
+     * @return True once the configuration is restored, false if it failed or
+     *         had not finished in time.
+     */
+    /**
+     * @brief Turn a revert result into what the transaction expects.
+     *
+     * @param result What the display stack said.
+     * @return Nothing while the API is busy, otherwise whether it restored.
+     */
+    std::optional<bool> to_attempt_result(SettingsManagerInterface::RevertResult result) {
+      using enum SettingsManagerInterface::RevertResult;
+      if (result == ApiTemporarilyUnavailable) {
+        return std::nullopt;
+      }
+      if (result != Ok) {
+        BOOST_LOG(error) << "Failed to revert display device configuration.";
+        return false;
+      }
+      return true;
+    }
+
+    /**
+     * @brief Restore now, from a caller that holds none of the display stack's locks.
+     *
+     * @return Nothing while the API is busy, otherwise whether it restored.
+     */
+    std::optional<bool> restore_once() {
+      std::lock_guard lock {DD_DATA.mutex};
+      if (!DD_DATA.sm_instance) {
+        // Platform is not supported, so there was nothing to restore.
+        return true;
+      }
+
+      return to_attempt_result(DD_DATA.sm_instance->execute([](auto &settings_iface) {
+        return settings_iface.revertSettings();
+      }));
+    }
+
+    /**
+     * @brief Keep retrying inside the display stack until the caller is done.
+     *
+     * The scheduler holds its own lock while it runs this, so the attempt is
+     * built from the interface it hands over rather than by asking the
+     * scheduler again, which would deadlock on that same lock.
+     *
+     * @param finish Called with one attempt. Returns true when it wants no more.
+     * @return False if there is no scheduler to retry on.
+     */
+    bool start_restore_retries(std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)> finish) {
+      std::lock_guard lock {DD_DATA.mutex};
+      if (!DD_DATA.sm_instance) {
+        return false;
+      }
+
+      DD_DATA.sm_instance->schedule([finish](auto &settings_iface, auto &stop_token) {
+        const bool done {finish([&settings_iface] {
+          return to_attempt_result(settings_iface.revertSettings());
+        })};
+
+        if (done) {
+          stop_token.requestStop();
+        }
+      },
+                                    {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}, .m_execution = SchedulerOptions::Execution::ScheduledOnly});
+      return true;
+    }
+
+    /**
+     * @brief The one restore that orders itself against the virtual display.
+     */
+    virtual_display::restore_transaction_t &restore_transaction() {
+      static virtual_display::restore_transaction_t instance {
+        [] {
+          return restore_once();
+        },
+        [](std::function<bool(virtual_display::restore_transaction_t::attempt_fn_t)> finish) {
+          return start_restore_retries(std::move(finish));
+        },
+        [](std::uint64_t generation) {
+          return virtual_display::manager().release_generation(generation);
+        }
+      };
+      return instance;
+    }
+
   }  // namespace
 
   std::unique_ptr<platf::deinit_t> init(const std::filesystem::path &persistence_filepath, const config::video_t &video_config) {
+    // When the driver drops a display mid-session, whatever is streaming it
+    // is streaming nothing, and the host is left configured for a display
+    // that no longer exists. Neither is the lease's to put right, so it asks.
+    virtual_display::manager().set_fault_handler([] {
+      BOOST_LOG(error) << "The virtual display being streamed is gone. Ending the session.";
+
+      // Ended first: a session capturing a display that no longer exists
+      // cannot be left running while the host is reconfigured underneath it.
+      rtsp_stream::terminate_sessions();
+
+      // Restores the configuration and then gives up the lease, in that
+      // order, so nothing can take a new one until this has finished.
+      revert_configuration();
+    });
+
+    // A restore still being retried belongs to a scheduler that is about to
+    // be replaced, so it is settled before that happens rather than being
+    // left waiting for a retry that can never come.
+    restore_transaction().abandon();
+
     std::lock_guard lock {DD_DATA.mutex};
     // We can support re-init without any issues, however we should make sure to clean up first!
     revert_configuration_unlocked(revert_option_e::try_once);
@@ -821,6 +1046,36 @@ namespace display_device {
     return display_power->keepDisplayAwake(reason);
   }
 
+  std::string device_id_for_display_name(const std::string &display_name) {
+    if (display_name.empty()) {
+      return {};
+    }
+
+    std::lock_guard lock {DD_DATA.mutex};
+    if (!DD_DATA.sm_instance) {
+      return {};
+    }
+
+    const auto devices {DD_DATA.sm_instance->execute([](auto &settings_iface) {
+      return settings_iface.enumAvailableDevices();
+    })};
+
+    for (const auto &device : devices) {
+      if (device.m_display_name == display_name) {
+        return device.m_device_id;
+      }
+    }
+
+    return {};
+  }
+
+  std::string active_output_id(const config::video_t &video_config) {
+    if (const auto leased {virtual_display::manager().output_override()}) {
+      return *leased;
+    }
+    return video_config.output_name;
+  }
+
   std::string map_output_name(const std::string &output_name) {
     std::lock_guard lock {DD_DATA.mutex};
     if (!DD_DATA.sm_instance) {
@@ -841,58 +1096,137 @@ namespace display_device {
     return mapped_name;
   }
 
-  void configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+  std::optional<std::string> prepare_virtual_display(const rtsp_stream::launch_session_t &session) {
+    if (!virtual_display::enabled()) {
+      return std::nullopt;
+    }
+
+    // There is one capture output, so a virtual display can only be used by a
+    // session that has the host to itself. Sharing the first session's
+    // display would silently give this one that session's resolution, and
+    // taking a new one would move the running session's capture.
+    if (rtsp_stream::session_count() != 0 && !virtual_display::manager().leased()) {
+      return "another session is already streaming, and a virtual display cannot be shared";
+    }
+
+    const auto mode {virtual_display::requested_mode(session)};
+    auto result {virtual_display::manager().acquire(
+      session.client_name,
+      session.unique_id,
+      mode,
+      config::video.adapter_name
+    )};
+
+    if (const auto *error {std::get_if<virtual_display::error_e>(&result)}) {
+      return virtual_display::to_string(*error);
+    }
+
+    return std::nullopt;
+  }
+
+  bool stream_resize_supported() {
+    using enum config::video_t::dd_t::config_option_e;
+    const auto option {config::video.dd.configuration_option};
+    return virtual_display::manager().leased() && (option == ensure_primary || option == ensure_only_display);
+  }
+
+  bool configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
     const auto result {parse_configuration(video_config, session)};
     if (const auto *parsed_config {std::get_if<SingleDisplayConfiguration>(&result)}; parsed_config) {
-      configure_display(*parsed_config);
-      return;
+      return configure_display(*parsed_config);
     }
 
     if (const auto *disabled {std::get_if<configuration_disabled_tag_t>(&result)}; disabled) {
       BOOST_LOG(info) << "Display device configuration is disabled. Reverting any active display device configuration.";
       revert_configuration();
-      return;
+      return true;
     }
 
     BOOST_LOG(error) << "Failed to parse display device configuration. Display settings will not be changed.";
     // Error details should already be logged for failed_to_parse_tag_t case, and we also don't
     // want to revert active configuration in case we have any
+    return false;
   }
 
-  void configure_display(const SingleDisplayConfiguration &config) {
-    std::lock_guard lock {DD_DATA.mutex};
-    if (!DD_DATA.sm_instance) {
-      // Platform is not supported, nothing to do.
-      return;
+  bool configure_display(const SingleDisplayConfiguration &config) {
+    // The outcome is reported back through a promise rather than inferred
+    // from the call returning. Scheduling is not applying: a transient API
+    // failure retries in the background, and a caller that treated the
+    // scheduling as success would go on to capture a display whose mode had
+    // not been set.
+    auto outcome {std::make_shared<std::promise<bool>>()};
+    auto settled {std::make_shared<std::atomic<bool>>(false)};
+    auto applied {outcome->get_future()};
+
+#ifdef _WIN32
+    // Noted before applying, which saves a configuration naming the display
+    if (const auto leased {virtual_display::manager().output_override()}; leased && *leased == config.m_device_id) {
+      remember_virtual_display(config.m_device_id);
+    }
+#endif
+
+    {
+      std::lock_guard lock {DD_DATA.mutex};
+      if (!DD_DATA.sm_instance) {
+        // Platform is not supported, so there was nothing to apply and
+        // nothing went wrong.
+        return true;
+      }
+
+      BOOST_LOG(info) << "Scheduling display device configuration:\n"
+                      << toJson(config);
+
+      DD_DATA.sm_instance->schedule([config, outcome, settled](auto &settings_iface, auto &stop_token) {
+        using enum SettingsManagerInterface::ApplyResult;
+
+        // We only want to keep retrying in case of a transient errors.
+        // In other cases, when we either fail or succeed we just want to stop...
+        const auto result {settings_iface.applySettings(config)};
+        if (result == Ok) {
+          BOOST_LOG(info) << "Display device configuration applied successfully.";
+        } else if (result == ApiTemporarilyUnavailable) {
+          BOOST_LOG(warning) << "Display device configuration API is temporarily unavailable. Will retry.";
+        } else {
+          BOOST_LOG(error) << "Display device configuration failed with result: " << apply_result_name(result);
+        }
+
+        if (result != ApiTemporarilyUnavailable) {
+          if (!settled->exchange(true)) {
+            outcome->set_value(result == Ok);
+          }
+          stop_token.requestStop();
+        }
+      },
+                                    {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
     }
 
-    BOOST_LOG(info) << "Scheduling display device configuration:\n"
-                    << toJson(config);
+    // Waited on outside the lock: retries run on the scheduler's own thread,
+    // which needs the interface this lock guards.
+    if (applied.wait_for(APPLY_TIMEOUT) != std::future_status::ready) {
+      BOOST_LOG(error) << "Display device configuration did not settle within "
+                       << APPLY_TIMEOUT.count() << "ms.";
+      return false;
+    }
 
-    DD_DATA.sm_instance->schedule([config](auto &settings_iface, auto &stop_token) {
-      using enum SettingsManagerInterface::ApplyResult;
-
-      // We only want to keep retrying in case of a transient errors.
-      // In other cases, when we either fail or succeed we just want to stop...
-      const auto result {settings_iface.applySettings(config)};
-      if (result == Ok) {
-        BOOST_LOG(info) << "Display device configuration applied successfully.";
-      } else if (result == ApiTemporarilyUnavailable) {
-        BOOST_LOG(warning) << "Display device configuration API is temporarily unavailable. Will retry.";
-      } else {
-        BOOST_LOG(error) << "Display device configuration failed with result: " << apply_result_name(result);
-      }
-
-      if (result != ApiTemporarilyUnavailable) {
-        stop_token.requestStop();
-      }
-    },
-                                  {.m_sleep_durations = {DEFAULT_RETRY_INTERVAL}});
+    return applied.get();
   }
 
   void revert_configuration() {
-    std::lock_guard lock {DD_DATA.mutex};
-    revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
+    if (virtual_display::manager().state() == virtual_display::state_e::idle) {
+      std::lock_guard lock {DD_DATA.mutex};
+      revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
+      return;
+    }
+
+    // A virtual display is involved, so the order matters and the ordinary
+    // revert cannot be used: it returns before doing anything. The transaction
+    // restores first and gives the display back only once that has worked,
+    // and a second caller joins it rather than starting a competing one.
+    const auto generation {virtual_display::manager().generation()};
+    if (!restore_transaction().run(generation, REVERT_TIMEOUT)) {
+      BOOST_LOG(warning) << "The display configuration is not restored yet, so the virtual display stays "
+                            "until it is. No session can start in the meantime.";
+    }
   }
 
   bool reset_persistence() {
@@ -909,6 +1243,48 @@ namespace display_device {
       return settings_iface.resetPersistence();
     });
   }
+
+#ifdef _WIN32
+  SingleDisplayConfigState without_displays(SingleDisplayConfigState state, const StringSet &device_ids) {
+    const auto is_gone {[&device_ids](const std::string &device_id) {
+      return device_ids.contains(device_id);
+    }};
+    const auto strip {[&is_gone](const ActiveTopology &topology) {
+      ActiveTopology stripped;
+      for (const auto &group : topology) {
+        std::vector<std::string> kept;
+        std::ranges::remove_copy_if(group, std::back_inserter(kept), is_gone);
+        if (!kept.empty()) {
+          stripped.push_back(std::move(kept));
+        }
+      }
+      return stripped;
+    }};
+
+    auto &initial {state.m_initial};
+    if (auto topology {strip(initial.m_topology)}; !topology.empty()) {
+      initial.m_topology = std::move(topology);
+      std::erase_if(initial.m_primary_devices, is_gone);
+    }
+
+    auto &modified {state.m_modified};
+    modified.m_topology = strip(modified.m_topology);
+    if (modified.m_topology.empty()) {
+      modified.m_topology = initial.m_topology;
+    }
+    std::erase_if(modified.m_original_modes, [&is_gone](const auto &entry) {
+      return is_gone(entry.first);
+    });
+    std::erase_if(modified.m_original_hdr_states, [&is_gone](const auto &entry) {
+      return is_gone(entry.first);
+    });
+    if (is_gone(modified.m_original_primary_device)) {
+      modified.m_original_primary_device.clear();
+    }
+
+    return state;
+  }
+#endif
 
   EnumeratedDeviceList enumerate_devices() {
     std::lock_guard lock {DD_DATA.mutex};
@@ -929,7 +1305,7 @@ namespace display_device {
     }
 
     SingleDisplayConfiguration config;
-    config.m_device_id = video_config.output_name;
+    config.m_device_id = active_output_id(video_config);
     config.m_device_prep = *device_prep;
 
     const auto hdr_state {parse_hdr_option(video_config, session)};

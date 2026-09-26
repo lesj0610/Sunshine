@@ -782,6 +782,7 @@ namespace config {
     {},  // output_name
 
     {
+      false,  // virtual_display
       video_t::dd_t::config_option_e::disabled,  // configuration_option
       video_t::dd_t::resolution_option_e::automatic,  // resolution_option
       {},  // manual_resolution
@@ -1699,6 +1700,7 @@ namespace config {
     string_f(vars, "adapter_name", video.adapter_name);
     string_f(vars, "output_name", video.output_name);
 
+    bool_f(vars, "dd_virtual_display", video.dd.virtual_display);
     generic_f(vars, "dd_configuration_option", video.dd.configuration_option, dd::config_option_from_view);
     generic_f(vars, "dd_resolution_option", video.dd.resolution_option, dd::resolution_option_from_view);
     string_f(vars, "dd_manual_resolution", video.dd.manual_resolution);
