@@ -147,6 +147,16 @@ namespace display_device {
   inline constexpr std::chrono::milliseconds configure_timeout {15000};
 
   /**
+   * @brief How long revert_configuration() waits for a virtual display's configuration to be restored.
+   *
+   * The display is only given back once the restore has worked, so the
+   * caller waits for it, after one attempt made on the spot. A restore that
+   * has not worked by then keeps being retried, and the display stays until
+   * it does.
+   */
+  inline constexpr std::chrono::milliseconds revert_timeout {15000};
+
+  /**
    * @brief Configure the display device based on the user configuration and the session information.
    * @note This is a convenience method for calling similar method of a different signature.
    *

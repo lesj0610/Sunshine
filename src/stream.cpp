@@ -2533,6 +2533,11 @@ namespace stream {
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
 
+      // The hang timer is for the threads above. The display restore below
+      // can wait longer than it allows, so it gets a timer of its own.
+      task_pool.cancel(force_kill);
+      fg.disable();
+
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
@@ -2555,6 +2560,22 @@ namespace stream {
         }
 
         if (revert_display_config) {
+          // With a virtual display the restore is waited for, up to
+          // display_device::revert_timeout after a first attempt. Under the
+          // timer above, a slow one ended with Sunshine killing itself
+          // mid-restore, and the host was left configured for a display that
+          // went away with it. This timer allows for the wait and still ends a
+          // restore that never comes back.
+          auto revert_task = []() {
+            BOOST_LOG(fatal) << "Hang detected! Restoring the display configuration did not finish."sv;
+            logging::log_flush();
+            lifetime::debug_trap();
+          };
+          auto revert_kill = task_pool.pushDelayed(revert_task, display_device::revert_timeout + 10s).task_id;
+          auto revert_fg = util::fail_guard([&revert_kill]() {
+            task_pool.cancel(revert_kill);
+          });
+
           display_device::revert_configuration();
         }
 

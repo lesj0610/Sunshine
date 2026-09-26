@@ -55,14 +55,14 @@ namespace display_device {
     constexpr std::chrono::milliseconds APPLY_TIMEOUT {configure_timeout};
 
     /**
-     * @brief How long a caller waits for a configuration to be restored.
+     * @brief How long a caller waits for a configuration to be restored (see revert_timeout).
      *
      * Only used where the answer matters, which is when a virtual display is
      * waiting to be removed. Removing it first would take away the display
      * the restore works against, so the restore has to finish, and the usual
      * revert delay would mean holding the display for no reason.
      */
-    constexpr std::chrono::milliseconds REVERT_TIMEOUT {15000};
+    constexpr std::chrono::milliseconds REVERT_TIMEOUT {revert_timeout};
 
     /**
      * @brief A global for the settings manager interface and other settings whose lifetime is managed by `display_device::init(...)`.
