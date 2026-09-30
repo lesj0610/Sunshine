@@ -138,6 +138,14 @@ namespace rtsp_stream {
    * @brief Terminates all running streaming sessions.
    */
   void terminate_sessions();
+
+  /**
+   * @brief Whether a client is streaming right now.
+   *
+   * @param cert The client's certificate.
+   * @return True if a running session belongs to it.
+   */
+  bool client_is_streaming(std::string_view cert);
   /**
    * @brief Terminate active sessions associated with a client certificate.
    *

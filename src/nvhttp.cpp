@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -23,6 +24,7 @@
 #include <Simple-Web-Server/server_http.hpp>
 
 // local includes
+#include "clipboard.h"
 #include "config.h"
 #include "display_device.h"
 #include "file_handler.h"
@@ -1264,6 +1266,11 @@ namespace nvhttp {
     const uint32_t codec_mode_flags = get_codec_mode_flags();
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
 
+    // Fork extension: the client may share its clipboard through /clipboard
+    if (clipboard::supported()) {
+      tree.put("root.SunshineClipboard", 1);
+    }
+
     if (!config::nvhttp.external_ip.empty()) {
       tree.put("root.ExternalIP", config::nvhttp.external_ip);
     }
@@ -1698,6 +1705,107 @@ namespace nvhttp {
     response->close_connection_after_response = true;
   }
 
+  /**
+   * @brief The clipboard sequence number right after the client last wrote the clipboard, plus one.
+   *
+   * Zero until the client has written it. The client does not need what it
+   * just copied sent back, and would take the copy for a new one.
+   */
+  std::atomic<std::uint64_t> clipboard_written_by_client {0};
+
+  /**
+   * @brief Whether the client behind the request being answered is the one streaming.
+   *
+   * @return True if a running session belongs to the client certificate the connection was verified with.
+   */
+  bool clipboard_client_allowed() {
+    std::string cert;
+    {
+      std::lock_guard lock {client_auth_mutex()};
+      cert = last_verified_client_cert;
+    }
+    return !cert.empty() && rtsp_stream::client_is_streaming(cert);
+  }
+
+  /**
+   * @brief Send the streaming client what the host clipboard holds.
+   *
+   * The client says which clipboard sequence number it last saw. Nothing is
+   * sent while that is still current, or when the only change since is the
+   * client's own copy. The current sequence number goes with every answer.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void get_clipboard(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+
+    if (!clipboard::supported() || !clipboard_client_allowed()) {
+      response->write(SimpleWeb::StatusCode::client_error_forbidden);
+      return;
+    }
+
+    const auto sequence {clipboard::sequence()};
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("X-Clipboard-Serial", std::to_string(sequence));
+
+    const auto args {request->parse_query_string()};
+    const auto since {args.find("since")};
+    const bool seen {since != args.end() && since->second == std::to_string(sequence)};
+    if (seen || clipboard_written_by_client.load() == std::uint64_t {sequence} + 1) {
+      response->write(SimpleWeb::StatusCode::success_no_content, headers);
+      return;
+    }
+
+    const auto content {clipboard::read()};
+    if (!content) {
+      response->write(SimpleWeb::StatusCode::success_no_content, headers);
+      return;
+    }
+
+    headers.emplace("Content-Type", std::string {clipboard::mime_type(content->kind)});
+    response->write(SimpleWeb::StatusCode::success_ok, content->data, headers);
+  }
+
+  /**
+   * @brief Put what the streaming client copied on the host clipboard.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void post_clipboard(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+
+    if (!clipboard::supported() || !clipboard_client_allowed()) {
+      response->write(SimpleWeb::StatusCode::client_error_forbidden);
+      return;
+    }
+
+    const auto type {request->header.find("Content-Type")};
+    const auto kind {type != request->header.end() ? clipboard::kind_of(type->second) : std::nullopt};
+    if (!kind) {
+      response->write(SimpleWeb::StatusCode::client_error_unsupported_media_type);
+      return;
+    }
+
+    auto data {request->content.string()};
+    if (data.empty() || data.size() > clipboard::max_content_bytes) {
+      response->write(SimpleWeb::StatusCode::client_error_payload_too_large);
+      return;
+    }
+
+    const auto sequence {clipboard::write({*kind, std::move(data)})};
+    if (!sequence) {
+      response->write(SimpleWeb::StatusCode::server_error_service_unavailable);
+      return;
+    }
+
+    clipboard_written_by_client = std::uint64_t {*sequence} + 1;
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("X-Clipboard-Serial", std::to_string(*sequence));
+    response->write(SimpleWeb::StatusCode::success_ok, headers);
+  }
+
   void setup(const std::string &pkey, const std::string &cert) {
     conf_intern.pkey = pkey;
     conf_intern.servercert = cert;
@@ -1813,6 +1921,11 @@ namespace nvhttp {
       resume(host_audio, resp, req);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
+    https_server.resource["^/clipboard$"]["GET"] = get_clipboard;
+    https_server.resource["^/clipboard$"]["POST"] = post_clipboard;
+
+    // Bounded, now that a request can carry a clipboard image
+    https_server.config.max_request_streambuf_size = clipboard::max_content_bytes + 64 * 1024;
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);

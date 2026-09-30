@@ -710,6 +710,19 @@ namespace rtsp_stream {
     }
 
     /**
+     * @brief Whether a client is streaming right now.
+     *
+     * @param cert The client's certificate.
+     * @return True if a running session belongs to it.
+     */
+    bool streaming_client(std::string_view cert) {
+      auto lg = _session_slots.lock();
+      return std::any_of(_session_slots->begin(), _session_slots->end(), [cert](const auto &slot) {
+        return stream::session::client_cert(*slot) == cert && stream::session::state(*slot) == stream::session::state_e::RUNNING;
+      });
+    }
+
+    /**
      * @brief Clear by cert state.
      *
      * @param cert Certificate data or object used by the operation.
@@ -847,6 +860,10 @@ namespace rtsp_stream {
   void terminate_sessions() {
     server.clear(true);
     input::terminate_gamepads();
+  }
+
+  bool client_is_streaming(std::string_view cert) {
+    return server.streaming_client(cert);
   }
 
   /**
