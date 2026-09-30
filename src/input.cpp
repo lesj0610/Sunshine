@@ -165,7 +165,16 @@ namespace input {
   }
 
   static task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
-  static std::unordered_map<key_press_id_t, bool> key_press {};
+
+  /**
+   * @brief Press state retained so releases and repeats use the key's original identity.
+   */
+  struct key_press_state_t {
+    bool pressed = false;  ///< Whether the key is held.
+    bool extended = false;  ///< Whether its press identified an extended key.
+  };
+
+  static std::unordered_map<key_press_id_t, key_press_state_t> key_press {};
   static std::array<std::uint8_t, 5> mouse_press {};
 
   static platf::input_t platf_input;
@@ -177,6 +186,26 @@ namespace input {
    */
   std::function<void(const testing::keyboard_event_t &)> &keyboard_sink() {
     static std::function<void(const testing::keyboard_event_t &)> sink;
+    return sink;
+  }
+
+  /**
+   * @brief Return the optional callback for observing queued packet dispatch in tests.
+   *
+   * @return Mutable test callback.
+   */
+  std::function<void(std::uint32_t)> &input_packet_hook() {
+    static std::function<void(std::uint32_t)> hook;
+    return hook;
+  }
+
+  /**
+   * @brief Return the optional callback for observing input task scheduling in tests.
+   *
+   * @return Mutable test callback.
+   */
+  std::function<void(std::shared_ptr<input_t>)> &input_task_sink() {
+    static std::function<void(std::shared_ptr<input_t>)> sink;
     return sink;
   }
 #endif
@@ -300,6 +329,7 @@ namespace input {
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
     std::mutex input_queue_lock;  ///< Input queue lock.
+    bool input_task_scheduled {};  ///< Whether one worker task owns packet dispatch for this stream; guarded by input_queue_lock.
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;  ///< Mouse left button timeout.
 
@@ -1074,15 +1104,16 @@ namespace input {
    * @param key_code Platform keycode to emit.
    * @param release Whether the key event is a release.
    * @param flags Bit flags that modify the requested operation.
+   * @param extended Whether the client identified an extended key.
    */
-  void emit_keyboard_update(uint16_t key_code, bool release, uint8_t flags) {
+  void emit_keyboard_update(uint16_t key_code, bool release, uint8_t flags, bool extended = false) {
 #ifdef SUNSHINE_TESTS
     if (keyboard_sink()) {
-      keyboard_sink()(testing::keyboard_event_t {key_code, release, flags});
+      keyboard_sink()(testing::keyboard_event_t {key_code, release, flags, extended});
       return;
     }
 #endif
-    platf::keyboard_update(platf_input, key_code, release, flags);
+    platf::keyboard_update(platf_input, key_code, release, flags, extended);
   }
 
   /**
@@ -1092,8 +1123,9 @@ namespace input {
    * @param release Whether the key or button event is a release.
    * @param flags Bit flags that modify the requested operation.
    * @param synthetic_modifiers Synthetic modifiers.
+   * @param extended Whether the client identified an extended key.
    */
-  void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, uint8_t synthetic_modifiers) {
+  void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, uint8_t synthetic_modifiers, bool extended) {
     // The LANG bits identify one specific physical key. A synthesized modifier is
     // a different key, so it must not inherit them.
     const auto modifier_flags = platf::keyboard::without_lang_flags(flags);
@@ -1111,7 +1143,7 @@ namespace input {
       }
     }
 
-    emit_keyboard_update(map_keycode(key_code), release, flags);
+    emit_keyboard_update(map_keycode(key_code), release, flags, extended);
 
     if (!release) {
       // Raise any synthetic modifier keys we pressed
@@ -1136,12 +1168,13 @@ namespace input {
    */
   void repeat_key(uint16_t key_code, uint8_t flags, uint8_t synthetic_modifiers) {
     // If key no longer pressed, stop repeating
-    if (!key_press[make_kpid(key_code, flags)]) {
+    const auto state = key_press[make_kpid(key_code, flags)];
+    if (!state.pressed) {
       key_press_repeat_id = nullptr;
       return;
     }
 
-    send_key_and_modifiers(key_code, false, flags, synthetic_modifiers);
+    send_key_and_modifiers(key_code, false, flags, synthetic_modifiers, state.extended);
 
     key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, key_code, flags, synthetic_modifiers).task_id;
   }
@@ -1197,14 +1230,16 @@ namespace input {
       }
     }
 
-    auto &pressed = key_press[make_kpid(keyCode, packet->flags)];
-    if (!pressed) {
+    auto &state = key_press[make_kpid(keyCode, packet->flags)];
+    if (!state.pressed) {
       if (!release) {
         // A new key has been pressed down, we need to check for key combo's
         // If a key-combo has been pressed down, don't pass it through
         if (input->shortcutFlags == input_t::SHORTCUT && apply_shortcut(keyCode) > 0) {
           return;
         }
+
+        state.extended = (modifiers & MODIFIER_EXTENDED) != 0;
 
         if (key_press_repeat_id) {
           task_pool.cancel(key_press_repeat_id);
@@ -1224,9 +1259,9 @@ namespace input {
       return;
     }
 
-    pressed = !release;
+    state.pressed = !release;
 
-    send_key_and_modifiers(keyCode, release, packet->flags, synthetic_modifiers);
+    send_key_and_modifiers(keyCode, release, packet->flags, synthetic_modifiers, state.extended);
 
     // Track the modifier state the client is holding, not the remapped host key.
     // This is compared against packet->modifiers above, which is client-side, so a
@@ -1334,7 +1369,7 @@ namespace input {
    * @param packet The controller arrival packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_ARRIVAL_PACKET packet) {
-    if (!config::input.controller) {
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -1484,7 +1519,7 @@ namespace input {
    * @param packet The controller touch packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_TOUCH_PACKET packet) {
-    if (!config::input.controller) {
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -1517,7 +1552,7 @@ namespace input {
    * @param packet The controller motion packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_MOTION_PACKET packet) {
-    if (!config::input.controller) {
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -1549,7 +1584,7 @@ namespace input {
    * @param packet The controller battery packet.
    */
   void passthrough(std::shared_ptr<input_t> &input, PSS_CONTROLLER_BATTERY_PACKET packet) {
-    if (!config::input.controller) {
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -1580,7 +1615,7 @@ namespace input {
    * @param packet Protocol packet being processed.
    */
   void passthrough(std::shared_ptr<input_t> &input, PNV_MULTI_CONTROLLER_PACKET packet) {
-    if (!config::input.controller) {
+    if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
       return;
     }
 
@@ -2042,10 +2077,34 @@ namespace input {
   }
 
   /**
-   * @brief Called on a thread pool thread to process an input message.
-   * @param input The input context pointer.
+   * @brief Process a bounded batch of queued packets for one stream.
+   *
+   * @param input Retained stream input state.
    */
-  void passthrough_next_message(std::shared_ptr<input_t> input) {
+  void passthrough_queued_messages(std::shared_ptr<input_t> input);
+
+  /**
+   * @brief Queue one packet-processing task for a stream.
+   *
+   * @param input Retained stream input state.
+   */
+  void schedule_input_packet_task(const std::shared_ptr<input_t> &input) {
+#ifdef SUNSHINE_TESTS
+    if (const auto &sink = input_task_sink(); sink) {
+      sink(input);
+      return;
+    }
+#endif
+    task_pool.push(passthrough_queued_messages, input);
+  }
+
+  /**
+   * @brief Process one queued input packet for a stream.
+   *
+   * @param input Retained stream input state.
+   * @return True if a packet was processed, or false when the stream queue is empty.
+   */
+  bool passthrough_next_message(std::shared_ptr<input_t> &input) {
     // 'entry' backs the 'payload' pointer, so they must remain in scope together
     std::vector<uint8_t> entry;
     PNV_INPUT_HEADER payload;
@@ -2058,7 +2117,8 @@ namespace input {
 
       // If all entries have already been processed, nothing to do
       if (input->input_queue.empty()) {
-        return;
+        input->input_task_scheduled = false;
+        return false;
       }
 
       // Pop off the first entry, which we will send
@@ -2088,6 +2148,12 @@ namespace input {
 
     // Print the final input packet
     input::print((void *) payload);
+
+#ifdef SUNSHINE_TESTS
+    if (const auto &hook = input_packet_hook(); hook) {
+      hook(util::endian::little(payload->magic));
+    }
+#endif
 
     // Send the batched input to the OS
     switch (util::endian::little(payload->magic)) {
@@ -2136,6 +2202,31 @@ namespace input {
         passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
         break;
     }
+    return true;
+  }
+
+  void passthrough_queued_messages(std::shared_ptr<input_t> input) {
+    // Bound each turn so other task-pool work can run during sustained input.
+    constexpr std::size_t packets_per_task = 32;
+    for (std::size_t processed = 0; processed < packets_per_task; ++processed) {
+      if (!passthrough_next_message(input)) {
+        return;
+      }
+    }
+
+    // Keep ownership until the next task is queued. New packets arriving meanwhile
+    // see input_task_scheduled and do not create a competing worker.
+    bool has_more;
+    {
+      std::lock_guard lock {input->input_queue_lock};
+      has_more = !input->input_queue.empty();
+      if (!has_more) {
+        input->input_task_scheduled = false;
+      }
+    }
+    if (has_more) {
+      schedule_input_packet_task(input);
+    }
   }
 
   /**
@@ -2158,11 +2249,18 @@ namespace input {
       return;
     }
 
+    bool schedule_task = false;
     {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
+      std::lock_guard lock {input->input_queue_lock};
       input->input_queue.push_back(std::move(input_data));
+      if (!input->input_task_scheduled) {
+        input->input_task_scheduled = true;
+        schedule_task = true;
+      }
     }
-    task_pool.push(passthrough_next_message, input);
+    if (schedule_task) {
+      schedule_input_packet_task(input);
+    }
   }
 
   /**
@@ -2181,13 +2279,13 @@ namespace input {
    * @brief Release every pressed keyboard key tracked by Sunshine.
    */
   void reset_keyboard_keys() {
-    for (auto &[key, pressed] : key_press) {
-      if (pressed) {
+    for (auto &[key, state] : key_press) {
+      if (state.pressed) {
         // key_press is keyed on the client's unmapped virtual-key code, but the press was
         // emitted through map_keycode(). Release the host key that actually went down,
         // otherwise a remapped modifier stays latched after the client disconnects.
-        emit_keyboard_update(map_keycode(vk_from_kpid(key) & 0x00FF), true, flags_from_kpid(key));
-        pressed = false;
+        emit_keyboard_update(map_keycode(vk_from_kpid(key) & 0x00FF), true, flags_from_kpid(key), state.extended);
+        state.pressed = false;
       }
     }
   }
@@ -2380,6 +2478,18 @@ namespace input {
         return -1;
       }
       return input->gamepads[client_index].id;
+    }
+
+    void set_input_packet_hook(std::function<void(std::uint32_t)> hook) {
+      input_packet_hook() = std::move(hook);
+    }
+
+    void set_input_task_sink(std::function<void(std::shared_ptr<input_t>)> sink) {
+      input_task_sink() = std::move(sink);
+    }
+
+    void process_queued_messages(std::shared_ptr<input_t> input) {
+      ::input::passthrough_queued_messages(std::move(input));
     }
 
     void set_keyboard_sink(std::function<void(const keyboard_event_t &)> sink) {
