@@ -24,6 +24,7 @@
 // platform includes
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <gio/gio.h>  // For RTKit
 #include <ifaddrs.h>
 #include <netinet/in.h>
@@ -31,6 +32,7 @@
 #include <pwd.h>
 #include <sys/resource.h>  // For setpriority
 #include <sys/socket.h>
+#include <unistd.h>
 
 #if !defined(__FreeBSD__)
   #include <sys/capability.h>
@@ -45,9 +47,7 @@
 // lib includes
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/host_name.hpp>
-#include <fcntl.h>
 #include <lizardbyte/common/env.h>
-#include <unistd.h>
 
 #ifdef SUNSHINE_BUILD_DRM
   #include <dirent.h>
@@ -64,6 +64,7 @@
 #include "src/globals.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/platform/permissions.h"
 #include "vaapi.h"
 
 #ifdef __GNUC__
@@ -153,6 +154,22 @@ namespace dyn {
 }  // namespace dyn
 
 namespace platf {
+  std::vector<permission_status_t> get_permission_statuses() {
+    // Match libvirtualhid's device paths and its read/write access check.
+    bool input_access = access("/dev/uinput", R_OK | W_OK) == 0;
+#ifndef __FreeBSD__
+    input_access = input_access || access("/dev/input/uinput", R_OK | W_OK) == 0;
+#endif
+    return {{"input", input_access ? "granted" : "denied", config::input.keyboard || config::input.mouse || config::input.controller, true}};
+  }
+
+  bool request_permission(std::string_view id) {
+    // Unix device access has no process-local permission prompt. The Web UI
+    // presents the group/device setup steps for this known permission.
+    (void) id;
+    return false;
+  }
+
   namespace {
     constexpr std::array privileged_gui_environment_variables {
       "GDK_PIXBUF_MODULEDIR",
@@ -1270,12 +1287,21 @@ namespace platf {
       case no_token:
         BOOST_LOG(fatal) << "Portal capture is awaiting user permission. "sv
                          << "The current session will attempt to use a fallback capture method."sv;
-        task_pool.push([]() {
-          if (!portal_display_names(false).empty()) {
-            platf::restart();
-          } else {
-            BOOST_LOG(error) << "[portalgrab] Portal session token was not negotiated."sv;
-          }
+        std::call_once(portal::xdg_worker_flag, []() {
+          portal::xdg_worker = std::jthread([]() {
+            try {
+              platf::set_thread_name("xdg_worker");
+              if (!portal_display_names(false).empty()) {
+                platf::restart();
+              } else {
+                BOOST_LOG(error) << "[portalgrab] Portal session token was not negotiated."sv;
+              }
+            } catch (const std::exception &e) {
+              BOOST_LOG(error) << "[portalgrab] Exception caught in xdg_worker: "sv << e.what();
+            } catch (...) {
+              BOOST_LOG(error) << "[portalgrab] Unknown exception caught in xdg_worker"sv;
+            }
+          });
         });
         return false;
       default:
@@ -1488,6 +1514,28 @@ namespace platf {
       BOOST_LOG(error) << "Failed to load EGL library symbols"sv;
       return nullptr;
     }
+
+#ifdef SUNSHINE_BUILD_PORTAL
+    class deinit_t: public platf::deinit_t {
+    public:
+      /**
+       * @brief Handle xdg_worker thread cleanup in destructor.
+       */
+      ~deinit_t() override {
+        try {
+          if (portal::xdg_worker.joinable()) {
+            // Make sure the worker's response loop sees shutdown before we block on join().
+            if (mail::man) {
+              mail::man->event<bool>(mail::shutdown)->raise(true);
+            }
+            portal::xdg_worker.join();
+          }
+        } catch (const std::exception &err) {
+          BOOST_LOG(error) << "[portalgrab] Exception while joining xdg_worker: "sv << err.what();
+        }
+      }
+    };
+#endif
 
     return std::make_unique<deinit_t>();
   }
