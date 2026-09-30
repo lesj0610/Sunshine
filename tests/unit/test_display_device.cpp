@@ -567,53 +567,54 @@ TEST(TopologyWithout, LeavesOtherTopologiesAloneAndMayEmptyOne) {
 TEST(WithoutDisplays, LeavesNothingToUndoOnTheVirtualDisplay) {
   const auto state {display_device::without_displays(only_display_state(), VIRTUAL_ONLY)};
 
-  EXPECT_EQ(state.m_initial.m_topology, REAL_ONLY);
-  EXPECT_EQ(state.m_initial.m_primary_devices, StringSet {MONITOR});
-  EXPECT_EQ(state.m_modified.m_topology, REAL_ONLY);
-  EXPECT_FALSE(state.m_modified.hasModifications());
+  ASSERT_TRUE(state);
+  EXPECT_EQ(state->m_initial.m_topology, REAL_ONLY);
+  EXPECT_EQ(state->m_initial.m_primary_devices, StringSet {MONITOR});
+  EXPECT_EQ(state->m_modified.m_topology, REAL_ONLY);
+  EXPECT_FALSE(state->m_modified.hasModifications());
 }
 
 TEST(WithoutDisplays, KeepsWhatWasChangedOnRealDisplays) {
-  auto state {only_display_state()};
-  state.m_modified.m_topology = {{MONITOR}, {SECOND}, {VIRTUAL}};
-  state.m_modified.m_original_primary_device = MONITOR;
+  auto input {only_display_state()};
+  input.m_modified.m_topology = {{MONITOR}, {SECOND}, {VIRTUAL}};
+  input.m_modified.m_original_primary_device = MONITOR;
 
-  state = display_device::without_displays(std::move(state), VIRTUAL_ONLY);
+  const auto state {display_device::without_displays(std::move(input), VIRTUAL_ONLY)};
 
-  EXPECT_EQ(state.m_modified.m_topology, REAL_ONLY);
-  EXPECT_EQ(state.m_modified.m_original_primary_device, MONITOR);
-  EXPECT_TRUE(state.m_modified.m_original_modes.empty());
-  EXPECT_TRUE(state.m_modified.m_original_hdr_states.empty());
+  ASSERT_TRUE(state);
+  EXPECT_EQ(state->m_modified.m_topology, REAL_ONLY);
+  EXPECT_EQ(state->m_modified.m_original_primary_device, MONITOR);
+  EXPECT_TRUE(state->m_modified.m_original_modes.empty());
+  EXPECT_TRUE(state->m_modified.m_original_hdr_states.empty());
 }
 
 TEST(WithoutDisplays, TakesTheVirtualDisplayOutOfADuplicatedGroup) {
-  auto state {only_display_state()};
-  state.m_initial.m_topology = {{MONITOR, VIRTUAL}, {SECOND}};
+  auto input {only_display_state()};
+  input.m_initial.m_topology = {{MONITOR, VIRTUAL}, {SECOND}};
 
-  state = display_device::without_displays(std::move(state), VIRTUAL_ONLY);
+  const auto state {display_device::without_displays(std::move(input), VIRTUAL_ONLY)};
 
-  EXPECT_EQ(state.m_initial.m_topology, REAL_ONLY);
+  ASSERT_TRUE(state);
+  EXPECT_EQ(state->m_initial.m_topology, REAL_ONLY);
 }
 
 TEST(WithoutDisplays, ForgetsTheVirtualDisplayAsOriginalPrimary) {
-  auto state {only_display_state()};
-  state.m_modified.m_original_primary_device = VIRTUAL;
+  auto input {only_display_state()};
+  input.m_modified.m_original_primary_device = VIRTUAL;
 
-  state = display_device::without_displays(std::move(state), VIRTUAL_ONLY);
+  const auto state {display_device::without_displays(std::move(input), VIRTUAL_ONLY)};
 
-  EXPECT_TRUE(state.m_modified.m_original_primary_device.empty());
-  EXPECT_FALSE(state.m_modified.hasModifications());
+  ASSERT_TRUE(state);
+  EXPECT_TRUE(state->m_modified.m_original_primary_device.empty());
+  EXPECT_FALSE(state->m_modified.hasModifications());
 }
 
-TEST(WithoutDisplays, KeepsAnInitialTopologyThatWouldBeLeftEmpty) {
-  auto state {only_display_state()};
-  state.m_initial.m_topology = {{VIRTUAL}};
-  state.m_initial.m_primary_devices = {VIRTUAL};
+TEST(WithoutDisplays, SavesNothingForAHostWithOnlyVirtualDisplays) {
+  auto input {only_display_state()};
+  input.m_initial.m_topology = {{VIRTUAL}};
+  input.m_initial.m_primary_devices = {VIRTUAL};
 
-  state = display_device::without_displays(std::move(state), VIRTUAL_ONLY);
-
-  EXPECT_EQ(state.m_initial.m_topology, ActiveTopology {{VIRTUAL}});
-  EXPECT_EQ(state.m_initial.m_primary_devices, StringSet {VIRTUAL});
+  EXPECT_FALSE(display_device::without_displays(std::move(input), VIRTUAL_ONLY));
 }
 
 TEST(WithoutDisplays, LeavesOtherConfigurationsAlone) {
@@ -621,6 +622,6 @@ TEST(WithoutDisplays, LeavesOtherConfigurationsAlone) {
   state.m_modified.m_topology = {{MONITOR}};
   state.m_modified.m_original_modes = {{MONITOR, {{2560, 1440}, {144, 1}}}};
 
-  EXPECT_EQ(display_device::without_displays(state, StringSet {"{other}"}), state);
+  EXPECT_EQ(display_device::without_displays(state, StringSet {"{other}"}), std::make_optional(state));
 }
 #endif

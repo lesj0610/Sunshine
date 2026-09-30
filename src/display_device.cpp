@@ -109,6 +109,102 @@ namespace display_device {
     }
 
     /**
+     * @brief The configuration the settings manager last saved or loaded, in full.
+     *
+     * The settings manager keeps its copy to itself. This one is kept as it
+     * passes through the persistence layer, so a restore that the settings
+     * manager cannot do can still tell what the host had.
+     */
+    struct {
+      std::mutex mutex {};
+      std::optional<SingleDisplayConfigState> state {};
+    } SAVED_STATE;
+
+    /**
+     * @brief Note what the settings manager now holds.
+     *
+     * @param state The configuration it saved or loaded, or nothing once cleared.
+     */
+    void note_saved_state(std::optional<SingleDisplayConfigState> state) {
+      std::lock_guard lock {SAVED_STATE.mutex};
+      SAVED_STATE.state = std::move(state);
+    }
+
+    /**
+     * @brief What the settings manager holds.
+     *
+     * @return The configuration, or nothing when none is saved.
+     */
+    std::optional<SingleDisplayConfigState> saved_state() {
+      std::lock_guard lock {SAVED_STATE.mutex};
+      return SAVED_STATE.state;
+    }
+
+    /**
+     * @brief Put back the host's own displays when the recorded layout names a virtual display that is gone.
+     *
+     * A virtual display ends up in the recorded layout when nothing else was
+     * on the desktop to leave, or when taking it off failed. Once a resize
+     * has replaced it, the settings manager can no longer restore that
+     * layout, and would keep trying while the lease waits. The layout without
+     * the virtual displays is set here instead. A host that had none of its
+     * own displays on the desktop is left with none once the lease gives its
+     * display back, which is how it was.
+     *
+     * @param settings_iface The settings manager, from inside the scheduler.
+     * @return True if the configuration is now back to what the host had.
+     */
+    bool restore_without_lost_virtual_displays(SettingsManagerInterface &settings_iface) {
+      const auto state {saved_state()};
+      const auto virtual_displays {remembered_virtual_displays()};
+      if (!state || virtual_displays.empty()) {
+        return false;
+      }
+
+      const auto &initial {state->m_initial.m_topology};
+      const auto target {topology_without(initial, virtual_displays)};
+      if (target == initial) {
+        // Not a layout this can put right
+        return false;
+      }
+
+      StringSet available;
+      for (const auto &device : settings_iface.enumAvailableDevices()) {
+        available.insert(device.m_device_id);
+      }
+      const bool lost {std::ranges::any_of(initial, [&](const auto &group) {
+        return std::ranges::any_of(group, [&](const std::string &device_id) {
+          return virtual_displays.contains(device_id) && !available.contains(device_id);
+        });
+      })};
+      if (!lost) {
+        // Every display it names is still there, so the settings manager can
+        // restore it once whatever stopped it passes
+        return false;
+      }
+
+      if (!target.empty()) {
+        WinDisplayDevice win_device {std::make_shared<WinApiLayer>()};
+        if (!win_device.setTopology(target)) {
+          BOOST_LOG(error) << "Could not put back the host's own displays without the virtual display that is gone.";
+          return false;
+        }
+      }
+
+      if (!settings_iface.resetPersistence()) {
+        BOOST_LOG(error) << "Put back the host's own displays, but could not clear the saved display configuration.";
+        return false;
+      }
+
+      if (target.empty()) {
+        BOOST_LOG(info) << "The host had no display of its own on the desktop, so there is no layout to put back.";
+      } else {
+        BOOST_LOG(info) << "Put back the host's own displays, without the virtual display that is gone.";
+      }
+      return true;
+    }
+
+    /**
      * @brief Take a new virtual display off the desktop before a session's first configuration.
      *
      * The driver puts a display on the desktop as soon as it creates it, and
@@ -118,7 +214,9 @@ namespace display_device {
      * resize has replaced it that display no longer exists: the restore fails
      * for good and keeps the lease, so no session can start. Taken off first,
      * the layout holds only the host's own displays, and the configuration
-     * puts the virtual display on the desktop itself.
+     * puts the virtual display on the desktop itself. A host with no display
+     * of its own on the desktop has to keep it there, and
+     * restore_without_lost_virtual_displays() covers that case.
      *
      * @param device_id The virtual display's device id.
      */
@@ -143,7 +241,7 @@ namespace display_device {
           return true;
         }
         if (!win_device.setTopology(without)) {
-          BOOST_LOG(warning) << "Could not take the virtual display off the desktop before configuring it. Restoring the display configuration after a resize may fail.";
+          BOOST_LOG(warning) << "Could not take the virtual display off the desktop before configuring it, so the layout restored after the session names it.";
           return false;
         }
         return true;
@@ -767,35 +865,72 @@ namespace display_device {
       }
 
       [[nodiscard]] bool store(const std::vector<std::uint8_t> &data) override {
-        const auto device_ids {remembered_virtual_displays()};
-        if (device_ids.empty()) {
-          return m_file->store(data);
-        }
-
-        // Saved as it came when it cannot be rewritten. A configuration that
-        // may not be restorable after a restart still beats having none.
+        // Saved as it came when it cannot be read. A configuration that may
+        // not be restorable after a restart still beats having none.
         SingleDisplayConfigState state;
         if (std::string error; !fromJson({std::begin(data), std::end(data)}, state, &error)) {
-          BOOST_LOG(warning) << "Could not read the display configuration being saved, so it is saved with its virtual displays: " << error;
-          return m_file->store(data);
+          BOOST_LOG(warning) << "Could not read the display configuration being saved, so it is saved as it came: " << error;
+          const bool stored {m_file->store(data)};
+          if (stored) {
+            note_saved_state(std::nullopt);
+          }
+          return stored;
         }
 
-        bool written {false};
-        const auto json {toJson(without_displays(std::move(state), device_ids), 2u, &written)};
-        if (!written) {
-          BOOST_LOG(warning) << "Could not write the display configuration without its virtual displays, so it is saved with them.";
-          return m_file->store(data);
+        const bool stored {write(state)};
+        if (stored) {
+          note_saved_state(std::move(state));
         }
-
-        return m_file->store({std::begin(json), std::end(json)});
+        return stored;
       }
 
       [[nodiscard]] std::optional<std::vector<std::uint8_t>> load() const override {
-        return m_file->load();
+        auto data {m_file->load()};
+
+        std::optional<SingleDisplayConfigState> state;
+        if (data && !data->empty()) {
+          if (SingleDisplayConfigState loaded; fromJson({std::begin(*data), std::end(*data)}, loaded)) {
+            state = std::move(loaded);
+          }
+        }
+        note_saved_state(std::move(state));
+
+        return data;
       }
 
       [[nodiscard]] bool clear() override {
-        return m_file->clear();
+        const bool cleared {m_file->clear()};
+        if (cleared) {
+          note_saved_state(std::nullopt);
+        }
+        return cleared;
+      }
+
+    private:
+      /**
+       * @brief Write a configuration to the file, without the virtual displays in it.
+       *
+       * @param state The configuration being saved.
+       * @return True once the file holds what a later start should restore.
+       */
+      [[nodiscard]] bool write(const SingleDisplayConfigState &state) {
+        const auto device_ids {remembered_virtual_displays()};
+        const auto without {without_displays(state, device_ids)};
+        if (!without) {
+          // Only virtual displays were on the desktop, so a later start has
+          // nothing to put back
+          return m_file->clear();
+        }
+
+        bool written {false};
+        const auto json {toJson(*without, 2u, &written)};
+        if (!written) {
+          BOOST_LOG(warning) << "Could not write the display configuration without its virtual displays, so it is saved with them.";
+          const auto full {toJson(state, 2u, &written)};
+          return written && m_file->store({std::begin(full), std::end(full)});
+        }
+
+        return m_file->store({std::begin(json), std::end(json)});
       }
 
     private:
@@ -847,6 +982,23 @@ namespace display_device {
     };
 
     /**
+     * @brief Revert through the settings manager, and past a virtual display that is gone if that fails.
+     *
+     * @param settings_iface The settings manager, from inside the scheduler.
+     * @return What the revert came to.
+     */
+    SettingsManagerInterface::RevertResult revert_settings(SettingsManagerInterface &settings_iface) {
+      const auto result {settings_iface.revertSettings()};
+#ifdef _WIN32
+      using enum SettingsManagerInterface::RevertResult;
+      if (result != Ok && result != ApiTemporarilyUnavailable && restore_without_lost_virtual_displays(settings_iface)) {
+        return Ok;
+      }
+#endif
+      return result;
+    }
+
+    /**
      * @brief Reverts the configuration based on the provided option.
      * @note This is function does not lock mutex.
      */
@@ -865,7 +1017,7 @@ namespace display_device {
 
       DD_DATA.sm_instance->schedule([try_once = (option == revert_option_e::try_once), tried_out_devices = StringSet {}](auto &settings_iface, auto &stop_token) mutable {
         if (try_once) {
-          std::ignore = settings_iface.revertSettings();
+          std::ignore = revert_settings(settings_iface);
           stop_token.requestStop();
           return;
         }
@@ -892,7 +1044,7 @@ namespace display_device {
         }
 
         using enum SettingsManagerInterface::RevertResult;
-        if (const auto result {settings_iface.revertSettings()}; result == Ok) {
+        if (const auto result {revert_settings(settings_iface)}; result == Ok) {
           stop_token.requestStop();
           return;
         } else if (result == ApiTemporarilyUnavailable) {
@@ -953,7 +1105,7 @@ namespace display_device {
       }
 
       return to_attempt_result(DD_DATA.sm_instance->execute([](auto &settings_iface) {
-        return settings_iface.revertSettings();
+        return revert_settings(settings_iface);
       }));
     }
 
@@ -975,7 +1127,7 @@ namespace display_device {
 
       DD_DATA.sm_instance->schedule([finish](auto &settings_iface, auto &stop_token) {
         const bool done {finish([&settings_iface] {
-          return to_attempt_result(settings_iface.revertSettings());
+          return to_attempt_result(revert_settings(settings_iface));
         })};
 
         if (done) {
@@ -1309,16 +1461,17 @@ namespace display_device {
     return stripped;
   }
 
-  SingleDisplayConfigState without_displays(SingleDisplayConfigState state, const StringSet &device_ids) {
+  std::optional<SingleDisplayConfigState> without_displays(SingleDisplayConfigState state, const StringSet &device_ids) {
     const auto is_gone {[&device_ids](const std::string &device_id) {
       return device_ids.contains(device_id);
     }};
 
     auto &initial {state.m_initial};
-    if (auto topology {topology_without(initial.m_topology, device_ids)}; !topology.empty()) {
-      initial.m_topology = std::move(topology);
-      std::erase_if(initial.m_primary_devices, is_gone);
+    initial.m_topology = topology_without(initial.m_topology, device_ids);
+    if (initial.m_topology.empty()) {
+      return std::nullopt;
     }
+    std::erase_if(initial.m_primary_devices, is_gone);
 
     auto &modified {state.m_modified};
     modified.m_topology = topology_without(modified.m_topology, device_ids);

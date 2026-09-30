@@ -237,15 +237,16 @@ namespace display_device {
    * configuration tries that same undo first. Nothing is lost by leaving them
    * out, since there is nothing to restore on a display that no longer exists.
    *
-   * An initial topology that would be left empty is kept as it was. A
-   * modified topology left empty is replaced by the initial one, so whatever
-   * remains to be undone is undone there.
+   * An initial topology left empty means the host had nothing but those
+   * displays on the desktop, and a later start has nothing to put back, so
+   * nothing is to be saved. A modified topology left empty is replaced by
+   * the initial one, so whatever remains to be undone is undone there.
    *
    * @param state The configuration being saved.
    * @param device_ids The displays to take out.
-   * @return The configuration without them.
+   * @return The configuration without them, or nothing when there is nothing to put back.
    */
-  [[nodiscard]] SingleDisplayConfigState without_displays(SingleDisplayConfigState state, const StringSet &device_ids);
+  [[nodiscard]] std::optional<SingleDisplayConfigState> without_displays(SingleDisplayConfigState state, const StringSet &device_ids);
 #endif
 
   /**
