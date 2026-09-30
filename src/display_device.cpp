@@ -107,6 +107,48 @@ namespace display_device {
       std::lock_guard lock {VIRTUAL_DISPLAYS.mutex};
       return VIRTUAL_DISPLAYS.device_ids;
     }
+
+    /**
+     * @brief Take a new virtual display off the desktop before a session's first configuration.
+     *
+     * The driver puts a display on the desktop as soon as it creates it, and
+     * the first configuration of a session records the desktop as it finds
+     * it as the layout to restore. With the virtual display in that layout,
+     * the restore at the end of the session has to bring it back, and once a
+     * resize has replaced it that display no longer exists: the restore fails
+     * for good and keeps the lease, so no session can start. Taken off first,
+     * the layout holds only the host's own displays, and the configuration
+     * puts the virtual display on the desktop itself.
+     *
+     * @param device_id The virtual display's device id.
+     */
+    void take_off_desktop(const std::string &device_id) {
+      std::lock_guard lock {DD_DATA.mutex};
+      if (!DD_DATA.sm_instance) {
+        return;
+      }
+
+      // Run by the scheduler, so it cannot interleave with a configuration or restore
+      std::ignore = DD_DATA.sm_instance->execute([&device_id](auto &) {
+        WinDisplayDevice win_device {std::make_shared<WinApiLayer>()};
+        const auto current {win_device.getCurrentTopology()};
+        const auto without {topology_without(current, StringSet {device_id})};
+        if (without == current) {
+          return true;
+        }
+        if (without.empty()) {
+          // A desktop with no display on it cannot be set, and the
+          // configuration replaces this one anyway
+          BOOST_LOG(info) << "The virtual display is the only display on the desktop, so it stays there until the configuration is applied.";
+          return true;
+        }
+        if (!win_device.setTopology(without)) {
+          BOOST_LOG(warning) << "Could not take the virtual display off the desktop before configuring it. Restoring the display configuration after a resize may fail.";
+          return false;
+        }
+        return true;
+      });
+    }
 #endif
 
     /**
@@ -1121,6 +1163,14 @@ namespace display_device {
       return virtual_display::to_string(*error);
     }
 
+#ifdef _WIN32
+    // Only when the configuration puts the display on the desktop itself
+    using enum config::video_t::dd_t::config_option_e;
+    if (const auto option {config::video.dd.configuration_option}; option == ensure_active || option == ensure_primary || option == ensure_only_display) {
+      take_off_desktop(std::get<virtual_display::display_t>(result).device_id);
+    }
+#endif
+
     return std::nullopt;
   }
 
@@ -1245,30 +1295,33 @@ namespace display_device {
   }
 
 #ifdef _WIN32
+  std::vector<std::vector<std::string>> topology_without(const std::vector<std::vector<std::string>> &topology, const StringSet &device_ids) {
+    std::vector<std::vector<std::string>> stripped;
+    for (const auto &group : topology) {
+      std::vector<std::string> kept;
+      std::ranges::remove_copy_if(group, std::back_inserter(kept), [&device_ids](const std::string &device_id) {
+        return device_ids.contains(device_id);
+      });
+      if (!kept.empty()) {
+        stripped.push_back(std::move(kept));
+      }
+    }
+    return stripped;
+  }
+
   SingleDisplayConfigState without_displays(SingleDisplayConfigState state, const StringSet &device_ids) {
     const auto is_gone {[&device_ids](const std::string &device_id) {
       return device_ids.contains(device_id);
     }};
-    const auto strip {[&is_gone](const ActiveTopology &topology) {
-      ActiveTopology stripped;
-      for (const auto &group : topology) {
-        std::vector<std::string> kept;
-        std::ranges::remove_copy_if(group, std::back_inserter(kept), is_gone);
-        if (!kept.empty()) {
-          stripped.push_back(std::move(kept));
-        }
-      }
-      return stripped;
-    }};
 
     auto &initial {state.m_initial};
-    if (auto topology {strip(initial.m_topology)}; !topology.empty()) {
+    if (auto topology {topology_without(initial.m_topology, device_ids)}; !topology.empty()) {
       initial.m_topology = std::move(topology);
       std::erase_if(initial.m_primary_devices, is_gone);
     }
 
     auto &modified {state.m_modified};
-    modified.m_topology = strip(modified.m_topology);
+    modified.m_topology = topology_without(modified.m_topology, device_ids);
     if (modified.m_topology.empty()) {
       modified.m_topology = initial.m_topology;
     }

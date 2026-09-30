@@ -553,6 +553,17 @@ namespace {
   }
 }  // namespace
 
+TEST(TopologyWithout, DropsTheDisplayAndTheGroupItLeavesEmpty) {
+  const ActiveTopology topology {{MONITOR}, {SECOND, VIRTUAL}, {VIRTUAL}};
+
+  EXPECT_EQ(display_device::topology_without(topology, VIRTUAL_ONLY), (ActiveTopology {{MONITOR}, {SECOND}}));
+}
+
+TEST(TopologyWithout, LeavesOtherTopologiesAloneAndMayEmptyOne) {
+  EXPECT_EQ(display_device::topology_without(REAL_ONLY, VIRTUAL_ONLY), REAL_ONLY);
+  EXPECT_TRUE(display_device::topology_without(ActiveTopology {{VIRTUAL}}, VIRTUAL_ONLY).empty());
+}
+
 TEST(WithoutDisplays, LeavesNothingToUndoOnTheVirtualDisplay) {
   const auto state {display_device::without_displays(only_display_state(), VIRTUAL_ONLY)};
 

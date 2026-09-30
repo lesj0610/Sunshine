@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 // lib includes
 #include <display_device/display_power_interface.h>
@@ -216,6 +217,15 @@ namespace display_device {
   void revert_configuration();
 
 #ifdef _WIN32
+  /**
+   * @brief A topology with the given displays taken out.
+   *
+   * @param topology The topology, as groups of device ids.
+   * @param device_ids The displays to take out.
+   * @return The topology without them, and without any group they leave empty.
+   */
+  [[nodiscard]] std::vector<std::vector<std::string>> topology_without(const std::vector<std::vector<std::string>> &topology, const StringSet &device_ids);
+
   /**
    * @brief A saved configuration with the given displays taken out, as it is written to disk.
    *
