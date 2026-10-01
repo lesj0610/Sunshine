@@ -19,6 +19,7 @@
 extern "C" {
   // clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
+#include <moonlight-common-c/src/StreamResize.h>
   // clang-format on
 }
 
@@ -32,10 +33,12 @@ extern "C" {
 #include "platform/common.h"
 #include "process.h"
 #include "stream.h"
+#include "stream_resize.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+#include "virtual_display.h"
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.
@@ -283,6 +286,16 @@ namespace stream {
 
     // Sunshine protocol extension
     SS_HDR_METADATA metadata;  ///< HDR10 metadata sent with the control message.
+  };
+
+  /**
+   * @brief Packed control message answering a stream resize request.
+   *
+   * A fork-only extension; the layout of the answer is StreamResize.h's.
+   */
+  struct control_stream_resize_result_t {
+    control_header_v2 header;  ///< Control message header preceding this payload.
+    std::uint8_t result[SS_STREAM_RESIZE_RESULT_LENGTH];  ///< The answer.
   };
 
   /**
@@ -549,6 +562,12 @@ namespace stream {
       platf::feedback_queue_t feedback_queue;  ///< Queue of controller feedback awaiting control-channel delivery.
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;  ///< Queue of HDR metadata awaiting control-channel delivery.
     } control;  ///< Runtime state for the encrypted GameStream control channel.
+
+    struct {
+      std::unique_ptr<stream_resize::coordinator_t> coordinator;  ///< Resizes the stream in place, when the host can.
+      safe::mail_raw_t::queue_t<stream_resize::result_t> results;  ///< Answers handed to the control thread.
+      stream_resize::outbox_t outbox;  ///< Answers the control thread has not got out yet. Only it touches this.
+    } resize;  ///< Resizing the stream without reconnecting.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
@@ -1157,6 +1176,74 @@ namespace stream {
   }
 
   /**
+   * @brief Send the answer to a stream resize request over the control channel.
+   *
+   * @param session Session the request came from.
+   * @param result The answer.
+   * @return 0 when the control message is queued; nonzero when no control peer is ready.
+   */
+  int send_stream_resize_result(session_t *session, const stream_resize::result_t &result) {
+    if (!session->control.peer) {
+      BOOST_LOG(warning) << "Couldn't send a stream resize answer, still waiting for PING from Moonlight"sv;
+      return -1;
+    }
+
+    control_stream_resize_result_t plaintext {};
+    plaintext.header.type = SS_STREAM_RESIZE_RESULT_PTYPE;
+    plaintext.header.payloadLength = sizeof(plaintext.result);
+
+    const SS_STREAM_RESIZE_RESULT wire {
+      result.id,
+      static_cast<std::uint16_t>(result.mode.width),
+      static_cast<std::uint16_t>(result.mode.height),
+      static_cast<std::uint16_t>(result.mode.fps),
+      static_cast<std::uint8_t>(result.status),
+      result.first_frame.has_value(),
+      result.first_frame.value_or(0),
+    };
+    ssStreamResizeWriteResult(&wire, plaintext.result);
+
+    std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+      encrypted_payload;
+
+    auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
+    if (payload.empty() || session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+      TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+      BOOST_LOG(warning) << "Couldn't send a stream resize answer to ["sv << addr << ':' << port << ']';
+
+      return -1;
+    }
+
+    return 0;
+  }
+
+  /**
+   * @brief Send every stream resize answer waiting for the control thread.
+   *
+   * An answer that does not go out is kept and tried again, with the ones
+   * after it held back so they stay in order.
+   *
+   * @param session Session to send them to.
+   * @return False once answers have been failing to go out for too long.
+   */
+  bool send_stream_resize_results(session_t *session) {
+    auto &results = session->resize.results;
+    while (results->peek()) {
+      session->resize.outbox.push(*results->pop());
+    }
+
+    if (!session->control.peer) {
+      // Still waiting for PING from Moonlight
+      return true;
+    }
+
+    return session->resize.outbox.flush([session](const stream_resize::result_t &result) {
+      return send_stream_resize_result(session, result) == 0;
+    },
+                                        std::chrono::steady_clock::now());
+  }
+
+  /**
    * @brief Run the broadcast control-channel worker thread.
    *
    * @param server RTSP server instance handling the request.
@@ -1207,6 +1294,37 @@ namespace stream {
         << "lastFrame [" << lastFrame << ']';
 
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
+    });
+
+    server->map(SS_STREAM_RESIZE_REQUEST_PTYPE, [](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(debug) << "type [STREAM_RESIZE_REQUEST]"sv;
+
+      SS_STREAM_RESIZE_REQUEST request {};
+      const auto verdict = ssStreamResizeReadRequest(payload.data(), payload.size(), &request);
+      if (verdict == SS_STREAM_RESIZE_REQUEST_DROP) {
+        BOOST_LOG(warning) << "Dropping a stream resize request without a usable id"sv;
+        return;
+      }
+
+      auto &coordinator = session->resize.coordinator;
+      if (!coordinator) {
+        // Not advertised, so a client has no business asking. It is answered
+        // anyway, so it does not wait for a resize that will never come.
+        const auto &monitor = session->config.monitor;
+        session->resize.results->raise(stream_resize::result_t {
+          request.requestId,
+          {monitor.width, monitor.height, monitor.framerate},
+          verdict == SS_STREAM_RESIZE_REQUEST_INVALID ? stream_resize::status_e::rejected_invalid : stream_resize::status_e::rejected_unsupported,
+        });
+        return;
+      }
+
+      if (verdict == SS_STREAM_RESIZE_REQUEST_INVALID) {
+        coordinator->reject_invalid(request.requestId);
+        return;
+      }
+
+      coordinator->submit({request.requestId, {request.width, request.height, request.fps}});
     });
 
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
@@ -1336,6 +1454,11 @@ namespace stream {
             pos = server->_sessions->erase(pos);
 
             if (session->control.peer) {
+              // A resize that ends the session says so first, so the client
+              // learns why it ended rather than just seeing it end.
+              send_stream_resize_results(session);
+              server->flush();
+
               {
                 auto ptslg = server->_peer_to_session.lock();
                 server->_peer_to_session->erase(session->control.peer);
@@ -1366,6 +1489,13 @@ namespace stream {
               auto hdr_info = hdr_queue->pop();
 
               send_hdr_mode(session, std::move(hdr_info));
+            }
+
+            if (!send_stream_resize_results(session)) {
+              // The client cannot tell what size the stream is without the
+              // answer, so the session is ended rather than left like that.
+              BOOST_LOG(error) << "Stream resize answers are not getting through to the client. Ending the session."sv;
+              session::stop(*session);
             }
           }
 
@@ -2177,6 +2307,161 @@ namespace stream {
     audio::capture(session->mail, session->config.audio, session);
   }
 
+  /**
+   * @brief How long a resize waits for the video thread to run an encoder on the new display.
+   *
+   * Long enough for the capture to move to the display, for an encoder to
+   * start at the new size, and for a frame of the display to be encoded.
+   */
+  constexpr auto resize_video_timeout = 8s;
+
+  /**
+   * @brief The longest a resize can take to be answered with every step running to its limit.
+   *
+   * The longest way through is a resize whose encoder does not run at the new
+   * size: the display is created, the configuration and the encoder are
+   * switched, both are switched back, and the new display is removed before
+   * the answer goes out. The lease runs with the default timeouts.
+   */
+  constexpr auto resize_longest_answer = virtual_display::longest_prepare_replacement(virtual_display::timeouts_t {}) +
+                                         2 * display_device::configure_timeout + 2 * resize_video_timeout +
+                                         virtual_display::longest_abandon_replacement(virtual_display::timeouts_t {});
+
+  // A resize that is slow but still moving must be answered for what it did,
+  // and only one stuck past every step's limit may end the session.
+  static_assert(resize_longest_answer <= stream_resize::options_t {}.decide_within, "A resize with every step at its limit must still be decided in time");
+
+  /**
+   * @brief What a resize does on this host.
+   *
+   * The new display comes from the virtual display lease, the desktop is
+   * moved onto it through the display configuration, and the encoder is
+   * rebuilt by the session's video thread, which answers through the mail.
+   */
+  class resize_steps_t: public stream_resize::steps_t {
+  public:
+    /**
+     * @param session The session being resized.
+     * @param launch The launch request, for the display configuration it asked for.
+     */
+    resize_steps_t(session_t *session, const rtsp_stream::launch_session_t &launch):
+        m_session {session},
+        m_changes {session->mail->event<video::config_change_t>(mail::video_config_change)},
+        m_acks {session->mail->queue<video::config_ack_t>(mail::video_config_ack)},
+        m_enable_hdr {launch.enable_hdr},
+        m_enable_sops {launch.enable_sops},
+        m_shown {launch.width, launch.height, launch.fps} {
+    }
+
+    bool create_display(std::uint64_t, const stream_resize::stream_mode_t &mode) override {
+      const auto result = virtual_display::manager().prepare_replacement({mode.width, mode.height, mode.fps * 1000});
+      if (const auto *error = std::get_if<virtual_display::error_e>(&result)) {
+        BOOST_LOG(warning) << "Stream resize: "sv << virtual_display::to_string(*error);
+        return false;
+      }
+
+      m_target = mode;
+      return true;
+    }
+
+    bool switch_topology(std::uint64_t) override {
+      // Named before the configuration moves the desktop, so a capture that
+      // loses the old display looks for the new one.
+      virtual_display::manager().use_replacement(true);
+      return display_device::configure_display(config::video, launch_for(m_target));
+    }
+
+    std::optional<std::uint32_t> switch_video(std::uint64_t, const stream_resize::stream_mode_t &mode) override {
+      return apply_video(mode);
+    }
+
+    bool remove_old_display(std::uint64_t) override {
+      m_shown = m_target;
+      return virtual_display::manager().commit_replacement();
+    }
+
+    bool restore_topology(std::uint64_t) override {
+      virtual_display::manager().use_replacement(false);
+      return display_device::configure_display(config::video, launch_for(m_shown));
+    }
+
+    std::optional<std::uint32_t> restore_video(std::uint64_t, const stream_resize::stream_mode_t &mode) override {
+      return apply_video(mode);
+    }
+
+    bool remove_new_display(std::uint64_t) override {
+      return virtual_display::manager().abandon_replacement();
+    }
+
+    void end_session() override {
+      session::stop(*m_session);
+    }
+
+    void interrupt() override {
+      // Nothing the video thread says matters any more
+      m_acks->stop();
+    }
+
+  private:
+    /**
+     * @brief Ask the video thread for a new encoder on the display the stream should show, and wait for it.
+     *
+     * @param mode What to encode at.
+     * @return The first frame the new encoder encoded, once a frame captured
+     *         from that display was encoded at the mode, or nothing.
+     */
+    std::optional<std::uint32_t> apply_video(const stream_resize::stream_mode_t &mode) {
+      // The capture has to be on the display the configuration just put the
+      // desktop on, and it is named here rather than left for the capture to
+      // guess: the display it was on may well still be there.
+      const auto output_name = display_device::map_output_name(display_device::active_output_id(config::video));
+      if (output_name.empty()) {
+        BOOST_LOG(warning) << "Stream resize: the display to capture is not on the desktop"sv;
+        return std::nullopt;
+      }
+
+      const auto generation = ++m_video_generation;
+      m_changes->raise(video::config_change_t {generation, mode.width, mode.height, mode.fps, output_name});
+
+      const auto ack = stream_resize::await_video_ack(generation, resize_video_timeout, [this](std::chrono::milliseconds wait) -> std::optional<stream_resize::video_ack_t> {
+        auto ack = m_acks->pop(wait);
+        if (!ack) {
+          return std::nullopt;
+        }
+        return stream_resize::video_ack_t {ack->generation, ack->applied, ack->first_frame};
+      });
+      if (!ack || !ack->applied) {
+        return std::nullopt;
+      }
+      return ack->first_frame;
+    }
+
+    /**
+     * @brief The launch request as it would read for a mode, for the display configuration.
+     *
+     * @param mode The mode.
+     * @return A launch session carrying only what the display configuration reads.
+     */
+    rtsp_stream::launch_session_t launch_for(const stream_resize::stream_mode_t &mode) const {
+      rtsp_stream::launch_session_t launch {};
+      launch.width = mode.width;
+      launch.height = mode.height;
+      launch.fps = mode.fps;
+      launch.enable_hdr = m_enable_hdr;
+      launch.enable_sops = m_enable_sops;
+      return launch;
+    }
+
+    session_t *m_session;
+    safe::mail_raw_t::event_t<video::config_change_t> m_changes;
+    safe::mail_raw_t::queue_t<video::config_ack_t> m_acks;
+    bool m_enable_hdr;
+    bool m_enable_sops;
+    stream_resize::stream_mode_t m_shown;  ///< The leased display's mode.
+    stream_resize::stream_mode_t m_target {};  ///< The replacement's mode.
+    std::uint64_t m_video_generation {0};
+  };
+
   namespace session {
     std::atomic_uint running_sessions;  ///< Running sessions.
 
@@ -2205,6 +2490,10 @@ namespace stream {
         return;
       }
 
+      if (session.resize.coordinator) {
+        session.resize.coordinator->request_stop();
+      }
+
       session.shutdown_event->raise(true);
     }
 
@@ -2212,6 +2501,14 @@ namespace stream {
      * @brief Wait for worker threads owned by the session to exit.
      */
     void join(session_t &session) {
+      // Before the hang timer: a resize step can take as long as the display
+      // configuration it waits on. It is not undone, because the revert below
+      // restores the configuration and removes every display the lease holds.
+      if (session.resize.coordinator) {
+        BOOST_LOG(debug) << "Waiting for a stream resize to end..."sv;
+        session.resize.coordinator->stop();
+      }
+
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
       // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
       // The alternative is that Sunshine can never start another session until it's manually restarted.
@@ -2236,9 +2533,22 @@ namespace stream {
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
 
+      // The hang timer is for the threads above. The display restore below
+      // can wait longer than it allows, so it gets a timer of its own.
+      task_pool.cancel(force_kill);
+      fg.disable();
+
       // If this is the last session, invoke the platform callbacks
       if (--running_sessions == 0) {
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
+
+        // A virtual display belongs to the session, not to the app. Keeping it
+        // while an app stays running would leave a display nothing is
+        // streaming, and the next session could not create its own.
+        if (virtual_display::manager().leased()) {
+          revert_display_config = true;
+        }
+
         if (proc::proc.running()) {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
           system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
@@ -2250,6 +2560,22 @@ namespace stream {
         }
 
         if (revert_display_config) {
+          // With a virtual display the restore is waited for, up to
+          // display_device::revert_timeout after a first attempt. Under the
+          // timer above, a slow one ended with Sunshine killing itself
+          // mid-restore, and the host was left configured for a display that
+          // went away with it. This timer allows for the wait and still ends a
+          // restore that never comes back.
+          auto revert_task = []() {
+            BOOST_LOG(fatal) << "Hang detected! Restoring the display configuration did not finish."sv;
+            logging::log_flush();
+            lifetime::debug_trap();
+          };
+          auto revert_kill = task_pool.pushDelayed(revert_task, display_device::revert_timeout + 10s).task_id;
+          auto revert_fg = util::fail_guard([&revert_kill]() {
+            task_pool.cancel(revert_kill);
+          });
+
           display_device::revert_configuration();
         }
 
@@ -2377,6 +2703,17 @@ namespace stream {
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
 
       session->mail = std::move(mail);
+
+      session->resize.results = session->mail->queue<stream_resize::result_t>(mail::stream_resize_result);
+      if (display_device::stream_resize_supported()) {
+        session->resize.coordinator = std::make_unique<stream_resize::coordinator_t>(
+          std::make_unique<resize_steps_t>(session.get(), launch_session),
+          stream_resize::stream_mode_t {config.monitor.width, config.monitor.height, config.monitor.framerate},
+          [results = session->resize.results](const stream_resize::result_t &result) {
+            results->raise(result);
+          }
+        );
+      }
 
       return session;
     }
