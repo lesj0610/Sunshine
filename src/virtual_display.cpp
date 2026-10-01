@@ -1183,6 +1183,9 @@ namespace virtual_display {
     /// Whether the answer has been handed over. Guarded by the
     /// transaction's mutex, like completion_claimed.
     bool settled {false};
+
+    /// Retries that have failed so far. Guarded by the transaction's mutex.
+    int failed_retries {};
   };
 
   /**
@@ -1226,6 +1229,17 @@ namespace virtual_display {
       }
       run->completion_claimed = true;
       return true;
+    }
+
+    /**
+     * @brief Count a failed retry.
+     *
+     * @param run The run it was for.
+     * @return True once the run has used up its retries.
+     */
+    bool out_of_retries(const std::shared_ptr<restore_run_t> &run) {
+      std::lock_guard lock {mutex};
+      return ++run->failed_retries > restore_retries;
     }
 
     /**
@@ -1353,7 +1367,8 @@ namespace virtual_display {
           return true;
         }
 
-        if (!impl_t::try_attempt(attempt)) {
+        const bool restored {impl_t::try_attempt(attempt)};
+        if (!restored && !impl->out_of_retries(run)) {
           return false;
         }
 
@@ -1363,7 +1378,11 @@ namespace virtual_display {
           return true;
         }
 
-        impl->complete(run, true, true);
+        if (!restored) {
+          BOOST_LOG(warning) << "Restoring the display configuration keeps failing. The virtual display is "
+                                "given back anyway, since holding it would keep every later session out."sv;
+        }
+        impl->complete(run, true, restored);
         return true;
       };
 
@@ -1424,7 +1443,7 @@ namespace virtual_display {
       return;
     }
 
-    BOOST_LOG(warning) << "The display stack is going away while a restore is outstanding. "
+    BOOST_LOG(warning) << "Giving up on a restore that is still outstanding. "
                           "One last attempt, then the virtual display is given back either way, "
                           "since holding it would keep every later session out."sv;
 
@@ -1433,6 +1452,17 @@ namespace virtual_display {
     // session out.
     std::ignore = impl_t::try_attempt(m_impl->attempt);
     m_impl->complete(run, true, false);
+  }
+
+  void restore_transaction_t::settle(std::chrono::milliseconds timeout) {
+    std::shared_ptr<restore_run_t> run;
+    {
+      std::lock_guard lock {m_impl->mutex};
+      run = m_impl->current;
+    }
+    if (run && run->result.wait_for(timeout) != std::future_status::ready) {
+      abandon();
+    }
   }
 
   manager_t &manager() {

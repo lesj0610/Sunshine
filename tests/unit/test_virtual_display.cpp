@@ -1051,7 +1051,7 @@ TEST_F(RestoreTransactionTest, ARestoreThatWorksReleasesTheDisplayOnce) {
   EXPECT_EQ(fake->released_generations, std::vector<std::uint64_t> {7});
 }
 
-TEST_F(RestoreTransactionTest, TheDisplayIsHeldUntilTheRestoreSucceeds) {
+TEST_F(RestoreTransactionTest, ARestoreThatKeepsFailingGivesTheDisplayBackAnyway) {
   auto fake = std::make_shared<fake_restore_t>();
   fake->answer = false;
   auto transaction = make_transaction(fake);
@@ -1063,11 +1063,9 @@ TEST_F(RestoreTransactionTest, TheDisplayIsHeldUntilTheRestoreSucceeds) {
     EXPECT_EQ(fake->releases, 0);
   }
 
-  {
-    std::lock_guard lock {fake->mutex};
-    fake->answer = true;
+  for (int retry = 0; retry < virtual_display::restore_retries; ++retry) {
+    fake->drain();
   }
-  fake->drain();
 
   EXPECT_FALSE(transaction->pending());
   std::lock_guard lock {fake->mutex};
@@ -1123,24 +1121,36 @@ TEST_F(RestoreTransactionTest, ALateRestoreDoesNotReleaseTheNextLease) {
   EXPECT_EQ(fake->released_generations.front(), 5u);
 }
 
-TEST_F(RestoreTransactionTest, ASchedulerGoingAwayDoesNotStrandTheDisplay) {
-  auto fake = std::make_shared<fake_restore_t>();
-  fake->answer = false;
-  auto transaction = make_transaction(fake);
+TEST_F(RestoreTransactionTest, ARestoreNothingWillFinishDoesNotStrandTheDisplay) {
+  // Abandoned when the scheduler goes away, or settled before a new lease
+  const std::vector<std::function<void(virtual_display::restore_transaction_t &)>> endings {
+    [](auto &transaction) {
+      transaction.abandon();
+    },
+    [](auto &transaction) {
+      transaction.settle(10ms);
+    },
+  };
 
-  ASSERT_FALSE(transaction->run(9, 100ms));
-  ASSERT_TRUE(transaction->pending());
+  for (const auto &end : endings) {
+    auto fake = std::make_shared<fake_restore_t>();
+    fake->answer = false;
+    auto transaction = make_transaction(fake);
 
-  {
+    ASSERT_FALSE(transaction->run(9, 100ms));
+    ASSERT_TRUE(transaction->pending());
+
+    {
+      std::lock_guard lock {fake->mutex};
+      fake->scheduler_gone = true;
+    }
+    end(*transaction);
+
+    EXPECT_FALSE(transaction->pending());
     std::lock_guard lock {fake->mutex};
-    fake->scheduler_gone = true;
+    EXPECT_EQ(fake->releases, 1);
+    EXPECT_EQ(fake->released_generations.front(), 9u);
   }
-  transaction->abandon();
-
-  EXPECT_FALSE(transaction->pending());
-  std::lock_guard lock {fake->mutex};
-  EXPECT_EQ(fake->releases, 1);
-  EXPECT_EQ(fake->released_generations.front(), 9u);
 }
 
 TEST_F(RestoreTransactionTest, ABusyApiIsRetriedRatherThanTreatedAsFailure) {

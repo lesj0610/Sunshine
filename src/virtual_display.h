@@ -479,11 +479,20 @@ namespace virtual_display {
   };
 
   /**
+   * @brief How many times a restore that failed is retried before the display is given back anyway.
+   *
+   * Holding the display keeps every later session out, and what stops a
+   * restore, such as a display that has gone, may never pass.
+   */
+  inline constexpr int restore_retries {1};
+
+  /**
    * @brief Restores the display configuration, then gives the display back.
    *
    * Removing the virtual display before the saved configuration is restored
    * leaves the restore working against a display that is no longer there, so
-   * the two are ordered here and nowhere else.
+   * the two are ordered here and nowhere else. A restore that still fails
+   * after restore_retries gives the display back regardless.
    *
    * There is at most one restore in progress. A second caller joins the one
    * already running rather than replacing it, because the display stack only
@@ -531,8 +540,8 @@ namespace virtual_display {
      *
      * @param generation The lease this is being done for.
      * @param timeout How long to wait for a final answer.
-     * @return True once restored. False means it is still being retried, and
-     *         the display stays where it is until it succeeds.
+     * @return True once restored. False means it is still being retried, or
+     *         that it gave up and the display was given back without it.
      */
     bool run(std::uint64_t generation, std::chrono::milliseconds timeout);
 
@@ -546,12 +555,24 @@ namespace virtual_display {
     /**
      * @brief Nothing can retry any more, so stop expecting one.
      *
-     * Used when the display stack is torn down or replaced. One last restore
+     * Used when the display stack is torn down or replaced, or its saved
+     * configuration is dropped. One last restore
      * is attempted, and the display is given back either way, since leaving a
      * lease held by a transaction that can no longer finish would keep every
      * later session out.
      */
     void abandon();
+
+    /**
+     * @brief Wait for a restore in progress, and abandon it if it does not finish.
+     *
+     * Used before a new lease is taken. Nothing streams the display a
+     * restore holds by then, so one still going once the wait is over must
+     * not keep the new session out.
+     *
+     * @param timeout How long to wait.
+     */
+    void settle(std::chrono::milliseconds timeout);
 
   private:
     struct impl_t;
