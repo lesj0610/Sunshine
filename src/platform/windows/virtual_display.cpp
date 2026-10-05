@@ -22,6 +22,7 @@
 #include <sudovda-ioctl.h>
 
 // local includes
+#include "misc.h"
 #include "src/logging.h"
 #include "src/virtual_display.h"
 #include "utf_utils.h"
@@ -253,6 +254,7 @@ namespace virtual_display {
         // Asked of libdisplaydevice, so the id is the one the display
         // configuration will look the display up by. Every path is searched,
         // since the display may not be on the desktop yet.
+        platf::follow_input_desktop();
         const display_device::WinApiLayer api;
         const auto data = api.queryDisplayConfig(display_device::QueryType::All);
         if (!data) {
@@ -395,15 +397,21 @@ namespace virtual_display {
        * @return The names, or nothing while the path is not active or incomplete.
        */
       static std::optional<identity_t> find_path(const LUID &luid, UINT target_id) {
+        // Windows answers only a thread on the input desktop, which at the
+        // sign-in and lock screens is not the one Sunshine's threads start on
+        platf::follow_input_desktop();
+
         UINT32 path_count = 0;
         UINT32 mode_count = 0;
-        if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) {
-          return std::nullopt;
-        }
+        auto status = GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &path_count, &mode_count);
 
         std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
         std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
-        if (QueryDisplayConfig(QDC_ALL_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr) != ERROR_SUCCESS) {
+        if (status == ERROR_SUCCESS) {
+          status = QueryDisplayConfig(QDC_ALL_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr);
+        }
+        if (status != ERROR_SUCCESS) {
+          BOOST_LOG(warning) << "Could not read the display configuration to find the virtual display (error "sv << status << ')';
           return std::nullopt;
         }
         paths.resize(path_count);

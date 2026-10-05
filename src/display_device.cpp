@@ -35,6 +35,8 @@
 
 // platform-specific includes
 #ifdef _WIN32
+  #include "platform/windows/misc.h"
+
   #include <display_device/windows/json.h>
   #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer.h>
@@ -77,6 +79,31 @@ namespace display_device {
     } DD_DATA;
 
 #ifdef _WIN32
+    /**
+     * @brief The Windows display API, called from the input desktop.
+     *
+     * Windows refuses display configuration calls from a thread on any other
+     * desktop. Sunshine's threads start on the user's desktop, so at the
+     * sign-in and lock screens every call failed: a virtual display never
+     * counted as up and could not be configured, and every session was
+     * refused. Capture follows the input desktop the same way.
+     *
+     * A thread stays on the desktop it was moved to, so the calls that
+     * follow a query on the same thread need no move of their own.
+     */
+    class input_desktop_api_t: public WinApiLayer {
+    public:
+      [[nodiscard]] std::optional<PathAndModeData> queryDisplayConfig(QueryType type) const override {
+        platf::follow_input_desktop();
+        return WinApiLayer::queryDisplayConfig(type);
+      }
+
+      [[nodiscard]] LONG setDisplayConfig(std::vector<DISPLAYCONFIG_PATH_INFO> paths, std::vector<DISPLAYCONFIG_MODE_INFO> modes, UINT32 flags) override {
+        platf::follow_input_desktop();
+        return WinApiLayer::setDisplayConfig(std::move(paths), std::move(modes), flags);
+      }
+    };
+
     /**
      * @brief The virtual displays this process has configured.
      *
@@ -191,7 +218,7 @@ namespace display_device {
 
       const auto target {topology_without(state->m_initial.m_topology, leave_out)};
       if (!target.empty()) {
-        WinDisplayDevice win_device {std::make_shared<WinApiLayer>()};
+        WinDisplayDevice win_device {std::make_shared<input_desktop_api_t>()};
         if (!win_device.setTopology(target)) {
           BOOST_LOG(error) << "Could not put back what is left of the host's displays:\n"
                            << toJson(target);
@@ -236,7 +263,7 @@ namespace display_device {
 
       // Run by the scheduler, so it cannot interleave with a configuration or restore
       std::ignore = DD_DATA.sm_instance->execute([&device_id](auto &) {
-        WinDisplayDevice win_device {std::make_shared<WinApiLayer>()};
+        WinDisplayDevice win_device {std::make_shared<input_desktop_api_t>()};
         const auto current {win_device.getCurrentTopology()};
         const auto without {topology_without(current, StringSet {device_id})};
         if (without == current) {
@@ -949,7 +976,7 @@ namespace display_device {
     std::unique_ptr<SettingsManagerInterface> make_settings_manager([[maybe_unused]] const std::filesystem::path &persistence_filepath, [[maybe_unused]] const config::video_t &video_config) {
 #ifdef _WIN32
       return std::make_unique<SettingsManager>(
-        std::make_shared<WinDisplayDevice>(std::make_shared<WinApiLayer>()),
+        std::make_shared<WinDisplayDevice>(std::make_shared<input_desktop_api_t>()),
         std::make_shared<sunshine_audio_context_t>(),
         std::make_unique<PersistentState>(
           std::make_shared<without_virtual_displays_t>(std::make_shared<FileSettingsPersistence>(persistence_filepath))
