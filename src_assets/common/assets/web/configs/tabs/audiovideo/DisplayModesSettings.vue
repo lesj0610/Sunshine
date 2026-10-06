@@ -25,6 +25,15 @@ const config = ref(props.config)
     ></Checkbox>
   </div>
 
+  <!--data_saver-->
+  <div class="mb-3">
+    <Checkbox id="data_saver"
+      locale-prefix="config"
+      v-model="config.data_saver"
+      default="false"
+    ></Checkbox>
+  </div>
+
   <!--minimum_fps_target-->
   <div class="mb-3">
     <label for="minimum_fps_target" class="form-label">{{ $t("config.minimum_fps_target") }}</label>

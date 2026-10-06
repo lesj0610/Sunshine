@@ -2492,6 +2492,14 @@ namespace video {
     std::chrono::duration<double, std::milli> max_frametime {1000.0 / minimum_fps_target};
     BOOST_LOG(info) << "Minimum FPS target set to ~"sv << minimum_fps_target << "fps ("sv << max_frametime.count() << "ms)"sv;
 
+    // With data_saver, a picture left unchanged is sharpened for a moment
+    // and then repeated rarely. Each repeat costs a few packets however
+    // little changed, since it carries the parity the client asks for.
+    constexpr auto idle_repeat_interval = 1s;
+    constexpr auto sharpen_time = 1s;
+    auto last_image = std::chrono::steady_clock::now();
+    auto last_encode = last_image;
+
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
@@ -2514,10 +2522,12 @@ namespace video {
 
     while (true) {
       bool requested_idr_frame = false;
+      bool recovering = false;
 
       while (invalidate_ref_frames_events->peek()) {
         if (auto frames = invalidate_ref_frames_events->pop(0ms)) {
           session->invalidate_ref_frames(frames->first, frames->second);
+          recovering = true;
         }
       }
 
@@ -2543,6 +2553,7 @@ namespace video {
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
+          last_image = std::chrono::steady_clock::now();
           // Only an image of the display being encoded counts. One captured
           // before a reinitialization can still be queued, and after a
           // resize it is of the other display, which has another size.
@@ -2554,6 +2565,9 @@ namespace video {
           }
         } else if (!images->running()) {
           break;
+        } else if (const auto now = std::chrono::steady_clock::now(); config::video.data_saver && !recovering && now - last_image >= sharpen_time && now - last_encode < idle_repeat_interval) {
+          // Waiting in short steps, so a request that comes in meanwhile is not held up
+          continue;
         }
       }
 
@@ -2580,6 +2594,7 @@ namespace video {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
       }
+      last_encode = std::chrono::steady_clock::now();
       encoded(captured);
 
       session->request_normal_frame();

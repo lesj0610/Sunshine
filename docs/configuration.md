@@ -1584,6 +1584,40 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### data_saver
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Use less data while nothing on screen changes, and on the audio.
+
+            An unchanged picture is normally repeated at `minimum_fps_target` to sharpen it, and every repeat
+            carries the parity packets the client asks for, so a still screen keeps sending most of a megabit
+            per second. With this setting it is sharpened for a second after the last change and then repeated
+            once a second. A change on screen, or the pointer moving, is still sent at once, so neither waits.
+
+            Stereo audio stays at 96 Kbps, where a client asking for a video bitrate of 15 Mbps or more would
+            otherwise get 512 Kbps. The video keeps the share of the bitrate it was given, so the difference is
+            saved.
+
+            @note{Surround audio is left as the client asks, since its two qualities are laid out differently.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            data_saver = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ## Network
 
 ### upnp

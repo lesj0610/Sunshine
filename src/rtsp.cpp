@@ -1384,6 +1384,14 @@ namespace rtsp_stream {
       config.monitor.bitrate = (int) configuredBitrateKbps;
     }
 
+    // Lowered after the video's share was worked out, so the difference is
+    // saved rather than given to the video. Only stereo: the two surround
+    // qualities are laid out differently, and the client expects the one it asked for.
+    if (config::video.data_saver && config.audio.channels == 2 && config.audio.flags[audio::config_t::HIGH_QUALITY]) {
+      BOOST_LOG(info) << "Data saver: stereo audio at the lower bitrate"sv;
+      config.audio.flags[audio::config_t::HIGH_QUALITY] = false;
+    }
+
     if (config.monitor.videoFormat == 1 && video::active_hevc_mode == 1) {
       BOOST_LOG(warning) << "HEVC is disabled, yet the client requested HEVC"sv;
 
