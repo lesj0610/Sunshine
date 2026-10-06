@@ -222,6 +222,7 @@ namespace config {
 
     int max_bitrate;  ///< Maximum bitrate ceiling in kbps for bitrate requested from the client.
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
+    bool adaptive_bitrate;  ///< Lower the bitrate while the network cannot carry the stream, keeping frame rate and resolution.
   };
 
   /**

@@ -672,6 +672,12 @@ namespace NVENC_NAMESPACE {
                      << frame_size_format % (client_config.bitrate / 8. / client_config.framerate) << " kB";
     log_created_encoder(init_params, enc_config, config, client_config, buffer_format);
 
+    reconfigure_state.config = enc_config;
+    reconfigure_state.init_params = init_params;
+    reconfigure_state.init_params.encodeConfig = &reconfigure_state.config;
+    reconfigure_state.initial_bitrate = enc_config.rcParams.averageBitRate;
+    reconfigure_state.initial_vbv_size = enc_config.rcParams.vbvBufferSize;
+
     encoder_state = {};
     fail_guard.disable();
     return true;
@@ -706,6 +712,7 @@ namespace NVENC_NAMESPACE {
 
     encoder_state = {};
     encoder_params = {};
+    reconfigure_state = {};
   }
 
   ::nvenc::nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
@@ -824,6 +831,34 @@ namespace NVENC_NAMESPACE {
         BOOST_LOG(error) << "NvEnc: NvEncInvalidateRefFrames() " << i << " failed: " << last_nvenc_error_string;
         return false;
       }
+    }
+
+    return true;
+  }
+
+  bool nvenc_base::set_bitrate(std::uint32_t kbps) {
+    if (!encoder || !reconfigure_state.initial_bitrate || kbps == 0) {
+      return false;
+    }
+
+    auto &rc_params = reconfigure_state.config.rcParams;
+    const auto previous = rc_params;
+
+    // The VBV buffer was sized from the bitrate, so it scales with it
+    const std::uint64_t bitrate = static_cast<std::uint64_t>(kbps) * 1000;
+    rc_params.averageBitRate = static_cast<std::uint32_t>(bitrate);
+    if (reconfigure_state.initial_vbv_size) {
+      rc_params.vbvBufferSize = static_cast<std::uint32_t>(reconfigure_state.initial_vbv_size * bitrate / reconfigure_state.initial_bitrate);
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS params = {.version = NV_ENC_RECONFIGURE_PARAMS_VER};
+    params.reInitEncodeParams = reconfigure_state.init_params;
+    params.resetEncoder = 0;
+    params.forceIDR = 0;
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &params))) {
+      BOOST_LOG(error) << "NvEnc: NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;
+      rc_params = previous;
+      return false;
     }
 
     return true;

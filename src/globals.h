@@ -58,6 +58,7 @@ namespace mail {
   MAIL(touch_port);  ///< Touch port.
   MAIL(idr);  ///< IDR.
   MAIL(invalidate_ref_frames);  ///< Invalidate ref frames.
+  MAIL(video_bitrate);  ///< A bitrate for the running encoder, in Kbps, from the control thread.
   MAIL(gamepad_feedback);  ///< Gamepad feedback.
   MAIL(hdr);  ///< HDR.
   MAIL(video_config_change);  ///< A new size for the running stream, for the video thread.

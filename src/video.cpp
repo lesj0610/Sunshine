@@ -600,6 +600,16 @@ namespace video {
     }
 
     /**
+     * @brief Change the bitrate of the running NVENC encoder.
+     *
+     * @param kbps New bitrate in kilobits per second.
+     * @return True once the encoder runs at it.
+     */
+    bool set_bitrate(int kbps) override {
+      return device && device->nvenc && kbps > 0 && device->nvenc->set_bitrate(static_cast<std::uint32_t>(kbps));
+    }
+
+    /**
      * @brief Submit the next frame to NVENC and return the encoded payload.
      *
      * @param frame_index Monotonic frame index assigned by the video pipeline.
@@ -2414,6 +2424,7 @@ namespace video {
    * @brief Run one encode loop for a display capture stream.
    *
    * @param frame_nr Frame counter updated as frames are encoded.
+   * @param bitrate_kbps The bitrate the network last asked for, kept across encoders.
    * @param mail Session mail bus.
    * @param images Captured image event source.
    * @param config Video configuration.
@@ -2427,6 +2438,7 @@ namespace video {
    */
   void encode_run(
     int &frame_nr,  // Store progress of the frame number
+    std::optional<int> &bitrate_kbps,
     safe::mail_t mail,
     img_event_t images,
     config_t config,
@@ -2441,6 +2453,21 @@ namespace video {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
       return;
+    }
+
+    bool bitrate_warned = false;
+    const auto apply_bitrate = [&](int kbps) {
+      if (session->set_bitrate(kbps)) {
+        BOOST_LOG(debug) << "Encoder bitrate is now "sv << kbps << " Kbps"sv;
+      } else if (!std::exchange(bitrate_warned, true)) {
+        BOOST_LOG(warning) << "This encoder cannot change its bitrate while it runs, so the stream stays at "sv
+                           << config.bitrate << " Kbps"sv;
+      }
+    };
+
+    // A new encoder starts at the configured bitrate, and the network has not got any better for it
+    if (bitrate_kbps) {
+      apply_bitrate(*bitrate_kbps);
     }
 
     // As a workaround for NVENC hangs and to generally speed up encoder reinit,
@@ -2469,6 +2496,7 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto bitrate_events = mail->event<int>(mail::video_bitrate);
     auto config_changes = mail->event<config_change_t>(mail::video_config_change);
 
     {
@@ -2500,6 +2528,13 @@ namespace video {
 
       if (requested_idr_frame) {
         session->request_idr_frame();
+      }
+
+      if (bitrate_events->peek()) {
+        if (auto kbps = bitrate_events->pop()) {
+          bitrate_kbps = *kbps;
+          apply_bitrate(*kbps);
+        }
       }
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
@@ -3071,6 +3106,7 @@ namespace video {
     }
 
     int frame_nr = 1;
+    std::optional<int> bitrate_kbps;
 
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
@@ -3181,6 +3217,7 @@ namespace video {
       bool session_started = false;
       encode_run(
         frame_nr,
+        bitrate_kbps,
         mail,
         images,
         config,

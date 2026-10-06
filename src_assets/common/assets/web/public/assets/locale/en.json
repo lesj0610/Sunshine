@@ -114,6 +114,8 @@
     "adapter_name_desc_linux_3": "Replace ``renderD129`` with the device from above to lists the name and capabilities of the device. To be supported by Sunshine, it needs to have at the very minimum:",
     "adapter_name_desc_windows": "Manually specify a GPU to use for capture. If unset, the GPU is chosen automatically. We strongly recommend leaving this field blank to use automatic GPU selection! Note: This GPU must have a display connected and powered on. The appropriate values can be found using the following command:",
     "adapter_name_placeholder_windows": "Radeon RX 580 Series",
+    "adaptive_bitrate": "Adapt the bitrate to the network",
+    "adaptive_bitrate_desc": "While the network cannot carry the stream, lower the bitrate so the picture gets blurrier instead of freezing. The frame rate and resolution stay as they are, so the pointer keeps moving smoothly and input keeps getting through, and the bitrate climbs back once the network keeps up. It goes down to a fifth of the requested bitrate, and no lower than 1 Mbps. NVIDIA GPUs (NVENC) only for now.",
     "add": "Add",
     "address_family": "Address Family",
     "address_family_both": "IPv4+IPv6",

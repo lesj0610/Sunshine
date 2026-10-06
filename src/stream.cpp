@@ -7,8 +7,10 @@
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <optional>
 #include <queue>
+#include <sstream>
 #include <utility>
 
 // lib includes
@@ -24,6 +26,7 @@ extern "C" {
 }
 
 // local includes
+#include "bitrate_controller.h"
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
@@ -39,6 +42,10 @@ extern "C" {
 #include "thread_safe.h"
 #include "utility.h"
 #include "virtual_display.h"
+
+constexpr std::uint16_t SS_FRAME_FEC_STATUS_PTYPE = 0x5502;  ///< Client report on how much of a frame arrived (Sunshine protocol extension).
+constexpr std::size_t SS_FRAME_FEC_STATUS_MIN_SIZE = 18;  ///< Bytes of that report up to the packet counts, which are big-endian.
+constexpr std::uint32_t ADAPTIVE_BITRATE_PING_INTERVAL_MS = 100;  ///< How often the host pings while fitting the bitrate to the network.
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.
@@ -526,6 +533,8 @@ namespace stream {
 
       safe::mail_raw_t::event_t<bool> idr_events;  ///< Event requesting an instantaneous decoder refresh frame.
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
+      safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a bitrate for the encoder, in Kbps.
+      std::optional<bitrate_controller_t> bitrate_controller;  ///< Fits the bitrate to the network, when that is enabled.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
     } video;  ///< Video worker thread state for the active stream.
@@ -716,6 +725,17 @@ namespace stream {
       rtsp_stream::launch_session_clear(session_p->launch_session_id);
 
       session_p->control.peer = peer;
+
+      if (config::video.adaptive_bitrate) {
+        auto &controller = session_p->video.bitrate_controller.emplace(session_p->config.monitor.bitrate, std::chrono::steady_clock::now());
+
+        // The round trip time is measured on acknowledgements of the host's
+        // reliable packets, which are rare unless it pings
+        enet_peer_ping_interval(peer, ADAPTIVE_BITRATE_PING_INTERVAL_MS);
+
+        BOOST_LOG(info) << "Adaptive bitrate: between "sv << controller.floor_kbps() << " and "sv << controller.kbps()
+                        << " Kbps, as the network allows"sv;
+      }
 
       // Use the local address from the control connection as the source address
       // for other communications to the client. This is necessary to ensure
@@ -1244,6 +1264,37 @@ namespace stream {
   }
 
   /**
+   * @brief Fit the bitrate to what the network carries, if that is enabled.
+   *
+   * @param session Session whose stream to adjust.
+   */
+  void adapt_bitrate(session_t *session) {
+    auto &controller = session->video.bitrate_controller;
+    if (!controller) {
+      return;
+    }
+
+    std::optional<std::chrono::milliseconds> rtt;
+    if (session->control.peer) {
+      rtt = std::chrono::milliseconds {session->control.peer->roundTripTime};
+    }
+
+    const auto change {controller->update(std::chrono::steady_clock::now(), rtt)};
+    if (!change) {
+      return;
+    }
+
+    std::ostringstream why;
+    why << "packet loss "sv << std::fixed << std::setprecision(1) << change->loss_percent << "%, unrecovered frames "sv << change->lost_frames;
+    if (change->rtt && change->base_rtt) {
+      why << ", round trip "sv << change->rtt->count() << " ms against "sv << change->base_rtt->count() << " ms idle"sv;
+    }
+    BOOST_LOG(info) << "Adaptive bitrate: "sv << change->kbps << " Kbps ("sv << why.str() << ')';
+
+    session->video.bitrate_events->raise(change->kbps);
+  }
+
+  /**
    * @brief Run the broadcast control-channel worker thread.
    *
    * @param server RTSP server instance handling the request.
@@ -1251,6 +1302,21 @@ namespace stream {
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
+
+      // Every 100ms, which is often enough to follow the network
+      adapt_bitrate(session);
+    });
+
+    server->map(SS_FRAME_FEC_STATUS_PTYPE, [](session_t *session, const std::string_view &payload) {
+      if (!session->video.bitrate_controller || payload.size() < SS_FRAME_FEC_STATUS_MIN_SIZE) {
+        return;
+      }
+
+      const auto field {[&payload](std::size_t offset) {
+        return (static_cast<std::uint8_t>(payload[offset]) << 8) | static_cast<std::uint8_t>(payload[offset + 1]);
+      }};
+      // Data and parity packets sent, and those missing before the last one that arrived
+      session->video.bitrate_controller->frame_received(field(10) + field(12), field(8));
     });
 
     server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
@@ -1280,6 +1346,9 @@ namespace stream {
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
+      if (session->video.bitrate_controller) {
+        session->video.bitrate_controller->frame_lost();
+      }
       session->video.idr_events->raise(true);
     });
 
@@ -1293,6 +1362,9 @@ namespace stream {
         << "firstFrame [" << firstFrame << ']' << std::endl
         << "lastFrame [" << lastFrame << ']';
 
+      if (session->video.bitrate_controller) {
+        session->video.bitrate_controller->frame_lost();
+      }
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
     });
 
@@ -2656,6 +2728,7 @@ namespace stream {
 
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+      session->video.bitrate_events = mail->event<int>(mail::video_bitrate);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {

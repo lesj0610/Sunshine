@@ -1551,6 +1551,39 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### adaptive_bitrate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Lower the bitrate while the network cannot carry the stream, and raise it again once it can.
+
+            A network that falls behind makes frames queue up, so the picture freezes and input lags behind
+            it. A lower bitrate makes every frame smaller instead, so the picture gets blurrier while the frame
+            rate and resolution stay as they are. Sunshine judges the network by what the client already
+            reports: packets missing from each frame, requests to recover lost frames, and how long the control
+            connection's round trips take compared with an idle network.
+
+            @note{The bitrate goes down to a fifth of what the client asked for, and no lower than 1 Mbps.}
+            @note{Needs an encoder that can change its bitrate while it runs, which for now is NVENC on NVIDIA
+            GPUs. Other encoders keep the requested bitrate and say so in the log.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            adaptive_bitrate = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ## Network
 
 ### upnp
