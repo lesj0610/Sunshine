@@ -45,6 +45,7 @@
       "adapter_name": "",
       "output_name": "",
       "dd_configuration_option": "disabled",
+      "dd_virtual_display": "disabled",
       "dd_resolution_option": "auto",
       "dd_manual_resolution": "",
       "dd_refresh_rate_option": "auto",
@@ -59,7 +60,9 @@
         "refresh_rate_only": []
       },
       "max_bitrate": 0,
-      "minimum_fps_target": 0
+      "minimum_fps_target": 0,
+      "adaptive_bitrate": "disabled",
+      "data_saver": "disabled"
     }
   },
   {

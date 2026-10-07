@@ -3,6 +3,7 @@
  * @brief Miscellaneous definitions for Windows.
  */
 // standard includes
+#include <array>
 #include <csignal>
 #include <filesystem>
 #include <iomanip>
@@ -251,6 +252,28 @@ namespace platf {
     CloseDesktop(hDesk);
 
     return hDesk;
+  }
+
+  void follow_input_desktop() {
+    const auto name_of = [](HDESK desktop) {
+      std::array<wchar_t, 256> name {};
+      if (!desktop || !GetUserObjectInformationW(desktop, UOI_NAME, name.data(), sizeof(name), nullptr)) {
+        return std::wstring {};
+      }
+      return std::wstring {name.data()};
+    };
+
+    const auto input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (!input) {
+      // Not allowed to see it, so not allowed to move to it either
+      return;
+    }
+    const bool there {name_of(input) == name_of(GetThreadDesktop(GetCurrentThreadId()))};
+    CloseDesktop(input);
+
+    if (!there) {
+      syncThreadDesktop();
+    }
   }
 
   /**

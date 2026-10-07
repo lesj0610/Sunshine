@@ -52,13 +52,18 @@ namespace mail {
   MAIL(video_packets);  ///< Video packets.
   MAIL(audio_packets);  ///< Audio packets.
   MAIL(switch_display);  ///< Switch display.
+  MAIL(retarget_display);  ///< The display a resize wants captured, by name.
 
   // Local mail
   MAIL(touch_port);  ///< Touch port.
   MAIL(idr);  ///< IDR.
   MAIL(invalidate_ref_frames);  ///< Invalidate ref frames.
+  MAIL(video_bitrate);  ///< A bitrate for the running encoder, in Kbps, from the control thread.
   MAIL(gamepad_feedback);  ///< Gamepad feedback.
   MAIL(hdr);  ///< HDR.
+  MAIL(video_config_change);  ///< A new size for the running stream, for the video thread.
+  MAIL(video_config_ack);  ///< Whether the video thread applied a config change.
+  MAIL(stream_resize_result);  ///< Answers to stream resize requests, for the control thread.
 #undef MAIL
 
 }  // namespace mail

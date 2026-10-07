@@ -207,6 +207,7 @@ namespace config {
         std::vector<mode_remapping_entry_t> refresh_rate_only;  ///< To be use when only `refresh_rate_option` is set to `automatic`.
       };
 
+      bool virtual_display;  ///< Stream a virtual display created for the session instead of a physical one.
       config_option_e configuration_option;  ///< Display-preparation mode selected by configuration.
       resolution_option_e resolution_option;  ///< Resolution-selection mode selected by configuration.
       std::string manual_resolution;  ///< Manual resolution in case `resolution_option == resolution_option_e::manual`.
@@ -221,6 +222,8 @@ namespace config {
 
     int max_bitrate;  ///< Maximum bitrate ceiling in kbps for bitrate requested from the client.
     double minimum_fps_target;  ///< Lowest framerate that will be used when streaming. Range 0-1000, 0 = half of client's requested framerate.
+    bool adaptive_bitrate;  ///< Lower the bitrate while the network cannot carry the stream, keeping frame rate and resolution.
+    bool data_saver;  ///< Repeat an unchanged picture rarely, and keep stereo audio at its lower bitrate.
   };
 
   /**

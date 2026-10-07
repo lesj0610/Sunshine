@@ -77,6 +77,15 @@ function addRemappingEntry() {
                 </select>
               </div>
 
+              <!-- Virtual display -->
+              <div class="mb-3" v-if="config.dd_configuration_option !== 'disabled'">
+                <Checkbox id="dd_virtual_display"
+                  locale-prefix="config"
+                  v-model="config.dd_virtual_display"
+                  default="false"
+                ></Checkbox>
+              </div>
+
               <!-- Resolution option -->
               <div class="mb-3" v-if="config.dd_configuration_option !== 'disabled'">
                 <label for="dd_resolution_option" class="form-label">

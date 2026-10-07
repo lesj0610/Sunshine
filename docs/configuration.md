@@ -1151,6 +1151,47 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### dd_virtual_display
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Stream a display created for the session instead of one of the displays attached to the host.
+
+            The resolution the client asks for does not have to be a mode any attached monitor supports. The
+            display is created when the session starts and removed when it ends.
+
+            What happens to the attached monitors depends on `dd_configuration_option`. With `verify_only` or
+            `ensure_active` they are left as they are. `ensure_primary` makes the virtual display the primary
+            one, and `ensure_only_display` deactivates them for the duration of the stream. Pick one of the
+            first two to leave the host's screens alone.
+
+            @note{Requires the SudoVDA virtual display driver. The Windows installer can set it up on AMD64,
+            where it is an optional feature that is off unless chosen. If the driver is missing or does not
+            answer, the session is refused with a 503 rather than served from an attached monitor, since that
+            monitor's resolution would then be changed instead.}
+            @note{Only one session at a time can use a virtual display, because Sunshine captures one output.
+            A second session is refused while the first holds it.}
+            @note{Has no effect while `dd_configuration_option` is `disabled`, since nothing would then set
+            the new display's resolution.}
+            @note{Applies to Windows only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            dd_virtual_display = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### dd_resolution_option
 
 <table>
@@ -1507,6 +1548,73 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>1-1000</td>
         <td>Specify your own value. The real minimum may differ from this value.</td>
+    </tr>
+</table>
+
+### adaptive_bitrate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Lower the bitrate while the network cannot carry the stream, and raise it again once it can.
+
+            A network that falls behind makes frames queue up, so the picture freezes and input lags behind
+            it. A lower bitrate makes every frame smaller instead, so the picture gets blurrier while the frame
+            rate and resolution stay as they are. Sunshine judges the network by what the client already
+            reports: packets missing from each frame, requests to recover lost frames, and how long the control
+            connection's round trips take compared with an idle network.
+
+            @note{The bitrate goes down to a fifth of what the client asked for, and no lower than 1 Mbps.}
+            @note{Needs an encoder that can change its bitrate while it runs, which for now is NVENC on NVIDIA
+            GPUs. Other encoders keep the requested bitrate and say so in the log.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            adaptive_bitrate = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### data_saver
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Use less data while nothing on screen changes, and on the audio.
+
+            An unchanged picture is normally repeated at `minimum_fps_target` to sharpen it, and every repeat
+            carries the parity packets the client asks for, so a still screen keeps sending most of a megabit
+            per second. With this setting it is sharpened for a second after the last change and then repeated
+            once a second. A change on screen, or the pointer moving, is still sent at once, so neither waits.
+
+            Stereo audio stays at 96 Kbps, where a client asking for a video bitrate of 15 Mbps or more would
+            otherwise get 512 Kbps. The video keeps the share of the bitrate it was given, so the difference is
+            saved.
+
+            @note{Surround audio is left as the client asks, since its two qualities are laid out differently.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            data_saver = enabled
+            @endcode</td>
     </tr>
 </table>
 
