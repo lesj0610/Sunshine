@@ -756,19 +756,19 @@ TEST_F(VirtualHidDeviceTest, TranslatesMouseAndKeyboardInput) {
   EXPECT_FALSE(keyboard_event.uses_normalized_key_code);
   EXPECT_EQ(keyboard_event.scan_code, 0);
 
-  // The Korean IME keys share their virtual key codes with the Japanese ones, so the host
-  // submits the Hangul/Hanja scan code explicitly instead of trusting the active layout.
+  // The Korean IME keys go out as their virtual keys, never as a scan code that
+  // Windows would translate through whichever keyboard table is active.
   platf::virtualhid::keyboard_update(*context(), 0x15, false, SS_KBE_FLAG_NON_NORMALIZED | SS_KBE_FLAG_LANG1);
-  EXPECT_EQ(context()->keyboard->last_submitted_event().scan_code, 0xF2);
-  EXPECT_TRUE(context()->keyboard->last_submitted_event().pressed);
-  platf::virtualhid::keyboard_update(*context(), 0x15, true, SS_KBE_FLAG_NON_NORMALIZED | SS_KBE_FLAG_LANG1);
-  EXPECT_EQ(context()->keyboard->last_submitted_event().scan_code, 0xF2);
-  EXPECT_FALSE(context()->keyboard->last_submitted_event().pressed);
-
-  platf::virtualhid::keyboard_update(*context(), 0x19, false, SS_KBE_FLAG_NON_NORMALIZED | SS_KBE_FLAG_LANG2);
-  EXPECT_EQ(context()->keyboard->last_submitted_event().scan_code, 0xF1);
+  keyboard_event = context()->keyboard->last_submitted_event();
+  EXPECT_EQ(keyboard_event.key_code, 0x15);
+  EXPECT_EQ(keyboard_event.scan_code, 0);
+  EXPECT_FALSE(keyboard_event.uses_normalized_key_code);
+  EXPECT_FALSE(keyboard_event.prefer_native_scan_code);
   platf::virtualhid::keyboard_update(*context(), 0x19, true, SS_KBE_FLAG_NON_NORMALIZED | SS_KBE_FLAG_LANG2);
-  EXPECT_EQ(context()->keyboard->last_submitted_event().scan_code, 0xF1);
+  keyboard_event = context()->keyboard->last_submitted_event();
+  EXPECT_EQ(keyboard_event.key_code, 0x19);
+  EXPECT_EQ(keyboard_event.scan_code, 0);
+  EXPECT_FALSE(keyboard_event.prefer_native_scan_code);
 
   // Restore an ordinary release so the shared assertions below still hold.
   platf::virtualhid::keyboard_update(*context(), 0x41, true, SS_KBE_FLAG_NON_NORMALIZED);
