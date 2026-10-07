@@ -1,6 +1,6 @@
 /**
  * @file src/platform/keyboard_lang_keys.h
- * @brief Korean IME key (LANG1/LANG2) protocol validation and scan code mapping.
+ * @brief Korean IME key (LANG1/LANG2) protocol validation.
  *
  * The streaming protocol identifies keys by Windows virtual key code, which is
  * ambiguous for the Korean and Japanese IME keys: VK_HANGUL and VK_KANA are both
@@ -9,29 +9,17 @@
  * the client observed (0x90 and 0x91 respectively).
  *
  * This header holds the platform-independent part of that handling so it can be
- * unit tested without a Windows toolchain. Only the Windows input backend acts on
- * the resulting scan code.
+ * unit tested without a Windows toolchain.
  */
 #pragma once
 
 // standard includes
 #include <cstdint>
-#include <optional>
 
 // lib includes
 #include <moonlight-common-c/src/Limelight.h>
 
 namespace platf::keyboard {
-
-  /**
-   * @brief Windows scan code for the Hangul/English toggle key.
-   */
-  constexpr std::uint16_t lang1_scan_code = 0xF2;
-
-  /**
-   * @brief Windows scan code for the Hanja conversion key.
-   */
-  constexpr std::uint16_t lang2_scan_code = 0xF1;
 
   /**
    * @brief Virtual key code a client must pair with SS_KBE_FLAG_LANG1.
@@ -112,26 +100,6 @@ namespace platf::keyboard {
    */
   constexpr bool should_schedule_repeat(std::uint8_t flags) {
     return !has_lang_flag(flags);
-  }
-
-  /**
-   * @brief Resolve the Windows scan code for a Korean IME key event.
-   *
-   * @param key_code Virtual key code from the keyboard packet, masked to one byte.
-   * @param flags Keyboard packet flags from the client.
-   * @return The scan code to submit, or no value when this is not a valid LANG event.
-   */
-  constexpr std::optional<std::uint16_t> lang_scan_code(std::uint16_t key_code, std::uint8_t flags) {
-    if (is_malformed_lang_event(key_code, flags)) {
-      return std::nullopt;
-    }
-    if ((flags & SS_KBE_FLAG_LANG1) != 0) {
-      return lang1_scan_code;
-    }
-    if ((flags & SS_KBE_FLAG_LANG2) != 0) {
-      return lang2_scan_code;
-    }
-    return std::nullopt;
   }
 
 }  // namespace platf::keyboard

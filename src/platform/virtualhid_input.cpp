@@ -316,12 +316,12 @@ namespace platf::virtualhid {
       event.uses_normalized_key_code = (static_cast<std::byte>(flags) & static_cast<std::byte>(SS_KBE_FLAG_NON_NORMALIZED)) == std::byte {};
       event.prefer_native_scan_code = config::input.always_send_scancodes;
 
-      // The Korean IME keys share their virtual key codes with the Japanese ones,
-      // so the active keyboard layout cannot tell them apart. When the client
-      // tagged the event with a LANG flag, submit the Korean scan code directly
-      // instead of letting the layout translate the ambiguous key code.
-      if (const auto scan_code = platf::keyboard::lang_scan_code(modcode, flags)) {
-        event.scan_code = *scan_code;
+      // A LANG flag marks the Korean Hangul or Hanja key. Windows translates a
+      // scan code through whichever keyboard table is active, which does not
+      // reliably give VK_HANGUL or VK_HANJA, so submit the virtual key itself.
+      if (platf::keyboard::has_lang_flag(flags)) {
+        event.uses_normalized_key_code = false;
+        event.prefer_native_scan_code = false;
       }
 #else
       (void) flags;
