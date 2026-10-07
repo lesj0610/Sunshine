@@ -749,9 +749,30 @@ TEST_F(VirtualHidDeviceTest, TranslatesMouseAndKeyboardInput) {
 #ifdef _WIN32
   EXPECT_TRUE(keyboard_event.uses_normalized_key_code);
   EXPECT_TRUE(keyboard_event.prefer_native_scan_code);
+  // An ordinary key must not gain an explicit scan code from the Korean IME handling.
+  EXPECT_EQ(keyboard_event.scan_code, 0);
   platf::virtualhid::keyboard_update(*context(), 0x41, true, SS_KBE_FLAG_NON_NORMALIZED);
   keyboard_event = context()->keyboard->last_submitted_event();
   EXPECT_FALSE(keyboard_event.uses_normalized_key_code);
+  EXPECT_EQ(keyboard_event.scan_code, 0);
+
+  // The Korean IME keys go out as their virtual keys, never as a scan code that
+  // Windows would translate through whichever keyboard table is active.
+  platf::virtualhid::keyboard_update(*context(), 0x15, false, SS_KBE_FLAG_NON_NORMALIZED | SS_KBE_FLAG_LANG1);
+  keyboard_event = context()->keyboard->last_submitted_event();
+  EXPECT_EQ(keyboard_event.key_code, 0x15);
+  EXPECT_EQ(keyboard_event.scan_code, 0);
+  EXPECT_FALSE(keyboard_event.uses_normalized_key_code);
+  EXPECT_FALSE(keyboard_event.prefer_native_scan_code);
+  platf::virtualhid::keyboard_update(*context(), 0x19, true, SS_KBE_FLAG_NON_NORMALIZED | SS_KBE_FLAG_LANG2);
+  keyboard_event = context()->keyboard->last_submitted_event();
+  EXPECT_EQ(keyboard_event.key_code, 0x19);
+  EXPECT_EQ(keyboard_event.scan_code, 0);
+  EXPECT_FALSE(keyboard_event.prefer_native_scan_code);
+
+  // Restore an ordinary release so the shared assertions below still hold.
+  platf::virtualhid::keyboard_update(*context(), 0x41, true, SS_KBE_FLAG_NON_NORMALIZED);
+  keyboard_event = context()->keyboard->last_submitted_event();
 #else
   EXPECT_FALSE(keyboard_event.uses_normalized_key_code);
   EXPECT_FALSE(keyboard_event.prefer_native_scan_code);
