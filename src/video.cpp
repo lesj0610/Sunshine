@@ -262,8 +262,8 @@ namespace video {
     // Perform color conversion and scaling to the final size
     auto status = sws_scale_frame(sws.get(), requires_padding ? sws_output_frame.get() : sw_frame.get(), sws_input_frame.get());
     if (status < 0) {
-      char string[AV_ERROR_MAX_STRING_SIZE];
-      BOOST_LOG(error) << "Couldn't scale frame: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+      std::array<char, AV_ERROR_MAX_STRING_SIZE> string;
+      BOOST_LOG(error) << "Couldn't scale frame: "sv << av_make_error_string(string.data(), AV_ERROR_MAX_STRING_SIZE, status);
       return -1;
     }
 
@@ -286,10 +286,10 @@ namespace video {
     // If frame is not a software frame, it means we still need to transfer from main memory
     // to vram memory
     if (frame->hw_frames_ctx) {
-      auto status = av_hwframe_transfer_data(frame, sw_frame.get(), 0);
-      if (status < 0) {
-        char string[AV_ERROR_MAX_STRING_SIZE];
-        BOOST_LOG(error) << "Failed to transfer image data to hardware frame: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+      auto transfer_status = av_hwframe_transfer_data(frame, sw_frame.get(), 0);
+      if (transfer_status < 0) {
+        std::array<char, AV_ERROR_MAX_STRING_SIZE> string;
+        BOOST_LOG(error) << "Failed to transfer image data to hardware frame: "sv << av_make_error_string(string.data(), AV_ERROR_MAX_STRING_SIZE, transfer_status);
         return -1;
       }
     }
@@ -390,15 +390,15 @@ namespace video {
     auto status = av_opt_set_dict(sws.get(), &options);
     av_dict_free(&options);
     if (status < 0) {
-      char string[AV_ERROR_MAX_STRING_SIZE];
-      BOOST_LOG(error) << "Failed to set SWS options: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+      std::array<char, AV_ERROR_MAX_STRING_SIZE> string;
+      BOOST_LOG(error) << "Failed to set SWS options: "sv << av_make_error_string(string.data(), AV_ERROR_MAX_STRING_SIZE, status);
       return -1;
     }
 
     status = sws_init_context(sws.get(), nullptr, nullptr);
     if (status < 0) {
-      char string[AV_ERROR_MAX_STRING_SIZE];
-      BOOST_LOG(error) << "Failed to initialize SWS: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+      std::array<char, AV_ERROR_MAX_STRING_SIZE> string;
+      BOOST_LOG(error) << "Failed to initialize SWS: "sv << av_make_error_string(string.data(), AV_ERROR_MAX_STRING_SIZE, status);
       return -1;
     }
 
@@ -1736,7 +1736,7 @@ namespace video {
 
       auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
 
-      if (artificial_reinit && status != platf::capture_e::error) {
+      if (artificial_reinit && status != platf::capture_e::capture_error) {
         status = platf::capture_e::reinit;
 
         artificial_reinit = false;
@@ -1803,7 +1803,7 @@ namespace video {
             reinit_event.reset();
             continue;
           }
-        case platf::capture_e::error:
+        case platf::capture_e::capture_error:
         case platf::capture_e::ok:
         case platf::capture_e::timeout:
         case platf::capture_e::interrupted:
@@ -1837,8 +1837,8 @@ namespace video {
     // send the frame to the encoder
     auto ret = avcodec_send_frame(ctx.get(), frame);
     if (ret < 0) {
-      char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
-      BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
+      std::array<char, AV_ERROR_MAX_STRING_SIZE> err_str {0};
+      BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str.data(), AV_ERROR_MAX_STRING_SIZE, ret);
 
       return -1;
     }
@@ -2114,8 +2114,8 @@ namespace video {
 
           auto err = av_hwdevice_ctx_create_derived(&derived_context, platform_formats->avcodec_derived_dev_type, encoding_stream_context.get(), 0);
           if (err) {
-            char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
-            BOOST_LOG(error) << "Failed to derive device context: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, err);
+            std::array<char, AV_ERROR_MAX_STRING_SIZE> err_str {0};
+            BOOST_LOG(error) << "Failed to derive device context: "sv << av_make_error_string(err_str.data(), AV_ERROR_MAX_STRING_SIZE, err);
 
             return nullptr;
           }
@@ -2251,19 +2251,19 @@ namespace video {
       encode_device->init_codec_options(ctx.get(), &options);
 
       if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
-        char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+        std::array<char, AV_ERROR_MAX_STRING_SIZE> err_str {0};
 
         if (!video_format.fallback_options.empty() && retries == 0) {
           BOOST_LOG(info)
             << "Retrying with fallback configuration options for ["sv << video_format.name << "] after error: "sv
-            << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
+            << av_make_error_string(err_str.data(), AV_ERROR_MAX_STRING_SIZE, status);
 
           continue;
         } else {
           BOOST_LOG(error)
             << "Could not open codec ["sv
             << video_format.name << "]: "sv
-            << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
+            << av_make_error_string(err_str.data(), AV_ERROR_MAX_STRING_SIZE, status);
 
           return nullptr;
         }
@@ -2555,6 +2555,8 @@ namespace video {
         config.height,
         display->logical_width,
         display->logical_height,
+        display->env_offset_x,
+        display->env_offset_y,
       },
       display->env_width,
       display->env_height,
@@ -2602,13 +2604,7 @@ namespace video {
 
       BOOST_LOG(info) << "Creating encoder " << logging::bracket(encoder_name);
 
-      auto color_coding = colorspace.colorspace == colorspace_e::bt2020    ? "HDR (Rec. 2020 + SMPTE 2084 PQ)" :
-                          colorspace.colorspace == colorspace_e::rec601    ? "SDR (Rec. 601)" :
-                          colorspace.colorspace == colorspace_e::rec709    ? "SDR (Rec. 709)" :
-                          colorspace.colorspace == colorspace_e::bt2020sdr ? "SDR (Rec. 2020)" :
-                                                                             "unknown";
-
-      BOOST_LOG(info) << "Color coding: " << color_coding;
+      BOOST_LOG(info) << "Color coding: " << colorspace_to_string(colorspace.colorspace);
       BOOST_LOG(info) << "Color depth: " << colorspace.bit_depth << "-bit";
       BOOST_LOG(info) << "Color range: " << (colorspace.full_range ? "JPEG" : "MPEG");
     }
@@ -2722,19 +2718,19 @@ namespace video {
     }
 
     if (!disp) {
-      return encode_e::error;
+      return encode_e::capture_error;
     }
 
     auto img = disp->alloc_img();
     if (!img || disp->dummy_img(img.get())) {
-      return encode_e::error;
+      return encode_e::capture_error;
     }
 
     std::vector<sync_session_t> synced_sessions;
     for (auto &ctx : synced_session_ctxs) {
       auto synced_session = make_synced_session(disp.get(), encoder, *img, *ctx);
       if (!synced_session) {
-        return encode_e::error;
+        return encode_e::capture_error;
       }
 
       synced_sessions.emplace_back(std::move(*synced_session));
@@ -2742,7 +2738,7 @@ namespace video {
 
     auto ec = platf::capture_e::ok;
     while (encode_session_ctx_queue.running()) {
-      auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
+      auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&captured_image, bool frame_captured) -> bool {
         while (encode_session_ctx_queue.peek()) {
           auto encode_session_ctx = encode_session_ctx_queue.pop();
           if (!encode_session_ctx) {
@@ -2751,9 +2747,9 @@ namespace video {
 
           synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*encode_session_ctx)));
 
-          auto encode_session = make_synced_session(disp.get(), encoder, *img, *synced_session_ctxs.back());
+          auto encode_session = make_synced_session(disp.get(), encoder, *captured_image, *synced_session_ctxs.back());
           if (!encode_session) {
-            ec = platf::capture_e::error;
+            ec = platf::capture_e::capture_error;
             return false;
           }
 
@@ -2783,7 +2779,7 @@ namespace video {
             ctx->idr_events->pop();
           }
 
-          if (frame_captured && pos->session->convert(*img)) {
+          if (frame_captured && pos->session->convert(*captured_image)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             ctx->shutdown_event->raise(true);
 
@@ -2791,8 +2787,8 @@ namespace video {
           }
 
           std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
-          if (img) {
-            frame_timestamp = img->frame_timestamp;
+          if (captured_image) {
+            frame_timestamp = captured_image->frame_timestamp;
           }
 
           if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
@@ -2824,7 +2820,7 @@ namespace video {
       auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
       switch (status) {
         case platf::capture_e::reinit:
-        case platf::capture_e::error:
+        case platf::capture_e::capture_error:
         case platf::capture_e::ok:
         case platf::capture_e::timeout:
         case platf::capture_e::interrupted:
@@ -2847,14 +2843,14 @@ namespace video {
     auto lg = util::fail_guard([&]() {
       ctx.stop();
 
-      for (auto &ctx : synced_session_ctxs) {
-        ctx->shutdown_event->raise(true);
-        ctx->join_event->raise(true);
+      for (auto &session_ctx : synced_session_ctxs) {
+        session_ctx->shutdown_event->raise(true);
+        session_ctx->join_event->raise(true);
       }
 
-      for (auto &ctx : ctx.unsafe()) {
-        ctx.shutdown_event->raise(true);
-        ctx.join_event->raise(true);
+      for (auto &pending_ctx : ctx.unsafe()) {
+        pending_ctx.shutdown_event->raise(true);
+        pending_ctx.join_event->raise(true);
       }
     });
 
@@ -2915,7 +2911,7 @@ namespace video {
       // Wait for the display to be ready
       std::shared_ptr<platf::display_t> display;
       {
-        auto lg = ref->display_wp.lock();
+        auto display_lock = ref->display_wp.lock();
         if (ref->display_wp->expired()) {
           continue;
         }
@@ -3511,7 +3507,7 @@ namespace video {
   /**
    * @brief Callback signature for VA-API AVCodec hardware input initialization.
    */
-  typedef int (*vaapi_init_avcodec_hardware_input_buffer_fn)(platf::avcodec_encode_device_t *encode_device, AVBufferRef **hw_device_buf);
+  using vaapi_init_avcodec_hardware_input_buffer_fn = int (*)(platf::avcodec_encode_device_t *encode_device, AVBufferRef **hw_device_buf);
 
   /**
    * @brief Initialize AVCodec hardware input buffers for VA-API.
@@ -3532,8 +3528,8 @@ namespace video {
 
     auto status = av_hwdevice_ctx_create(&hw_device_buf, AV_HWDEVICE_TYPE_VAAPI, render_device.empty() ? nullptr : render_device.c_str(), nullptr, 0);
     if (status < 0) {
-      char string[AV_ERROR_MAX_STRING_SIZE];
-      BOOST_LOG(error) << "Failed to create a VAAPI device: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+      std::array<char, AV_ERROR_MAX_STRING_SIZE> string;
+      BOOST_LOG(error) << "Failed to create a VAAPI device: "sv << av_make_error_string(string.data(), AV_ERROR_MAX_STRING_SIZE, status);
       return -1;
     }
 
@@ -3585,8 +3581,8 @@ namespace video {
 
     auto status = av_hwdevice_ctx_create(&hw_device_buf, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 1 /* AV_CUDA_USE_PRIMARY_CONTEXT */);
     if (status < 0) {
-      char string[AV_ERROR_MAX_STRING_SIZE];
-      BOOST_LOG(error) << "Failed to create a CUDA device: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+      std::array<char, AV_ERROR_MAX_STRING_SIZE> string;
+      BOOST_LOG(error) << "Failed to create a CUDA device: "sv << av_make_error_string(string.data(), AV_ERROR_MAX_STRING_SIZE, status);
       return -1;
     }
 
@@ -3601,8 +3597,8 @@ namespace video {
 
     auto status = av_hwdevice_ctx_create(&hw_device_buf, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0);
     if (status < 0) {
-      char string[AV_ERROR_MAX_STRING_SIZE];
-      BOOST_LOG(error) << "Failed to create a VideoToolbox device: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+      std::array<char, AV_ERROR_MAX_STRING_SIZE> string;
+      BOOST_LOG(error) << "Failed to create a VideoToolbox device: "sv << av_make_error_string(string.data(), AV_ERROR_MAX_STRING_SIZE, status);
       return -1;
     }
 
@@ -3639,8 +3635,8 @@ namespace video {
 
     auto err = av_hwdevice_ctx_init(ctx_buf.get());
     if (err) {
-      char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
-      BOOST_LOG(error) << "Failed to create FFMpeg hardware device context: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, err);
+      std::array<char, AV_ERROR_MAX_STRING_SIZE> err_str {0};
+      BOOST_LOG(error) << "Failed to create FFMpeg hardware device context: "sv << av_make_error_string(err_str.data(), AV_ERROR_MAX_STRING_SIZE, err);
 
       return err;
     }
@@ -3693,57 +3689,59 @@ namespace video {
   }
 
   /**
-   * @brief Map base dev type values.
+   * @brief Map an FFmpeg hardware device type to Sunshine's capture memory type.
    */
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type) {
+    using enum platf::mem_type_e;
     switch (type) {
       case AV_HWDEVICE_TYPE_D3D11VA:
-        return platf::mem_type_e::dxgi;
+        return dxgi;
       case AV_HWDEVICE_TYPE_VAAPI:
-        return platf::mem_type_e::vaapi;
+        return vaapi;
 #ifdef SUNSHINE_BUILD_VULKAN
       case AV_HWDEVICE_TYPE_VULKAN:
-        return platf::mem_type_e::vulkan;
+        return vulkan;
 #endif
       case AV_HWDEVICE_TYPE_CUDA:
-        return platf::mem_type_e::cuda;
+        return cuda;
       case AV_HWDEVICE_TYPE_NONE:
-        return platf::mem_type_e::system;
+        return system;
       case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
-        return platf::mem_type_e::videotoolbox;
+        return videotoolbox;
       default:
-        return platf::mem_type_e::unknown;
+        return unknown;
     }
 
-    return platf::mem_type_e::unknown;
+    return unknown;
   }
 
   /**
-   * @brief Map pix fmt values.
+   * @brief Map an FFmpeg pixel format to Sunshine's pixel format.
    */
   platf::pix_fmt_e map_pix_fmt(AVPixelFormat fmt) {
+    using enum platf::pix_fmt_e;
     switch (fmt) {
       case AV_PIX_FMT_VUYX:
-        return platf::pix_fmt_e::ayuv;
+        return ayuv;
       case AV_PIX_FMT_XV30:
-        return platf::pix_fmt_e::y410;
+        return y410;
       case AV_PIX_FMT_YUV420P10:
-        return platf::pix_fmt_e::yuv420p10;
+        return yuv420p10;
       case AV_PIX_FMT_YUV420P:
-        return platf::pix_fmt_e::yuv420p;
+        return yuv420p;
       case AV_PIX_FMT_NV12:
-        return platf::pix_fmt_e::nv12;
+        return nv12;
       case AV_PIX_FMT_P010:
-        return platf::pix_fmt_e::p010;
+        return p010;
       case AV_PIX_FMT_YUV444P:
-        return platf::pix_fmt_e::yuv444p;
+        return yuv444p;
       case AV_PIX_FMT_YUV444P16:
-        return platf::pix_fmt_e::yuv444p16;
+        return yuv444p16;
       default:
-        return platf::pix_fmt_e::unknown;
+        return unknown;
     }
 
-    return platf::pix_fmt_e::unknown;
+    return unknown;
   }
 
 }  // namespace video

@@ -44,39 +44,39 @@ namespace crypto {
   /**
    * @brief Owning pointer for an OpenSSL X.509 certificate.
    */
-  using x509_t = util::safe_ptr<X509, X509_free>;
+  using x509_t = util::safe_ptr<X509, &X509_free>;
   /**
    * @brief Owning pointer for an OpenSSL certificate store.
    */
-  using x509_store_t = util::safe_ptr<X509_STORE, X509_STORE_free>;
+  using x509_store_t = util::safe_ptr<X509_STORE, &X509_STORE_free>;
   /**
    * @brief Owning pointer for an OpenSSL certificate verification context.
    */
-  using x509_store_ctx_t = util::safe_ptr<X509_STORE_CTX, X509_STORE_CTX_free>;
+  using x509_store_ctx_t = util::safe_ptr<X509_STORE_CTX, &X509_STORE_CTX_free>;
   /**
    * @brief Owning pointer for an OpenSSL cipher context.
    */
-  using cipher_ctx_t = util::safe_ptr<EVP_CIPHER_CTX, EVP_CIPHER_CTX_free>;
+  using cipher_ctx_t = util::safe_ptr<EVP_CIPHER_CTX, &EVP_CIPHER_CTX_free>;
   /**
    * @brief Owning pointer for an OpenSSL message digest context.
    */
-  using md_ctx_t = util::safe_ptr<EVP_MD_CTX, md_ctx_destroy>;
+  using md_ctx_t = util::safe_ptr<EVP_MD_CTX, &md_ctx_destroy>;
   /**
    * @brief Owning pointer for an OpenSSL BIO chain.
    */
-  using bio_t = util::safe_ptr<BIO, BIO_free_all>;
+  using bio_t = util::safe_ptr<BIO, &BIO_free_all>;
   /**
    * @brief Owning pointer for an OpenSSL public or private key.
    */
-  using pkey_t = util::safe_ptr<EVP_PKEY, EVP_PKEY_free>;
+  using pkey_t = util::safe_ptr<EVP_PKEY, &EVP_PKEY_free>;
   /**
    * @brief Owning pointer for an OpenSSL key-generation context.
    */
-  using pkey_ctx_t = util::safe_ptr<EVP_PKEY_CTX, EVP_PKEY_CTX_free>;
+  using pkey_ctx_t = util::safe_ptr<EVP_PKEY_CTX, &EVP_PKEY_CTX_free>;
   /**
    * @brief Owning pointer for an OpenSSL BIGNUM.
    */
-  using bignum_t = util::safe_ptr<BIGNUM, BN_free>;
+  using bignum_t = util::safe_ptr<BIGNUM, &BN_free>;
 
   /**
    * @brief Hashes the given plaintext using SHA-256.
@@ -251,10 +251,10 @@ namespace crypto {
       /**
        * @brief Construct an AES-ECB cipher helper with key material.
        *
-       * @param key AES key material used to initialize the cipher.
-       * @param padding Whether the cipher should use block padding.
+       * @param key_material AES key material used to initialize the cipher.
+       * @param use_padding Whether the cipher should use block padding.
        */
-      ecb_t(const aes_t &key, bool padding = true);
+      ecb_t(const aes_t &key_material, bool use_padding = true);
 
       /**
        * @brief Encrypt plaintext into the supplied ciphertext buffer.
@@ -294,10 +294,10 @@ namespace crypto {
       /**
        * @brief Construct an AES-GCM cipher helper with key material and IV state.
        *
-       * @param key AES key material used to initialize the cipher.
-       * @param padding Whether the cipher should use block padding.
+       * @param key_material AES key material used to initialize the cipher.
+       * @param use_padding Whether the cipher should use block padding.
        */
-      gcm_t(const crypto::aes_t &key, bool padding = true);
+      gcm_t(const crypto::aes_t &key_material, bool use_padding = true);
 
       /**
        * @brief Encrypts the plaintext using AES GCM mode.
@@ -350,10 +350,10 @@ namespace crypto {
       /**
        * @brief Construct an AES-CBC cipher helper with key material and IV state.
        *
-       * @param key AES key material used to initialize the cipher.
-       * @param padding Whether the cipher should use block padding.
+       * @param key_material AES key material used to initialize the cipher.
+       * @param use_padding Whether the cipher should use block padding.
        */
-      cbc_t(const crypto::aes_t &key, bool padding = true);
+      cbc_t(const crypto::aes_t &key_material, bool use_padding = true);
 
       /**
        * @brief Encrypts the plaintext using AES CBC mode.

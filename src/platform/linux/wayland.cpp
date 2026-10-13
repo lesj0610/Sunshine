@@ -42,7 +42,54 @@ namespace wl {
       .get_offset = gbm_bo_get_offset,
       .get_modifier = gbm_bo_get_modifier,
     };
+
+    int open_render_node(const char *path) {
+      return open(path, O_RDWR | O_CLOEXEC);
+    }
+
+    const gbm_device_accessors_t gbm_device_accessors {
+      .open_render_node = open_render_node,
+      .create_device = gbm_create_device,
+      .destroy_device = gbm_device_destroy,
+    };
   }  // namespace
+
+  gbm_device_t::~gbm_device_t() {
+    reset();
+  }
+
+  bool gbm_device_t::init(const std::string &render_path, const gbm_device_accessors_t &accessors) {
+    reset();
+    this->accessors = accessors;
+
+    drm_fd = accessors.open_render_node(render_path.c_str());
+    if (drm_fd < 0) {
+      BOOST_LOG(error) << "[wayland] Failed to open DRM render node: "sv << render_path;
+      return false;
+    }
+
+    device = accessors.create_device(drm_fd);
+    if (!device) {
+      BOOST_LOG(error) << "[wayland] Failed to create GBM device"sv;
+      reset();
+      return false;
+    }
+
+    return true;
+  }
+
+  void gbm_device_t::reset() {
+    if (device) {
+      accessors.destroy_device(device);
+      device = nullptr;
+    }
+
+    // gbm_device_destroy() does not close the descriptor the device was created from
+    if (drm_fd >= 0) {
+      close(drm_fd);
+      drm_fd = -1;
+    }
+  }
 
   // Helper to call C++ method from wayland C callback
   template<class T, class Method, Method m, class... Params>
@@ -181,6 +228,7 @@ namespace wl {
 
     viewport.width = width;
     viewport.height = height;
+    refresh_mhz = refresh;
   }
 
   void monitor_t::listen(zxdg_output_manager_v1 *output_manager) {
@@ -241,6 +289,7 @@ namespace wl {
     } else if (!std::strcmp(interface, zwlr_screencopy_manager_v1_interface.name)) {
       BOOST_LOG(info) << "[wayland] Found interface: "sv << interface << '(' << id << ") version "sv << version;
       screencopy_manager = (zwlr_screencopy_manager_v1 *) wl_registry_bind(registry, id, &zwlr_screencopy_manager_v1_interface, version);
+      screencopy_version = version;
 
       this->interface[WLR_EXPORT_DMABUF] = true;
     } else if (!std::strcmp(interface, zwp_linux_dmabuf_v1_interface.name)) {
@@ -258,25 +307,11 @@ namespace wl {
 
   // Initialize GBM
   bool dmabuf_t::init_gbm() {
-    if (gbm_device) {
+    if (gbm) {
       return true;
     }
 
-    auto render_path = platf::resolve_render_device();
-    int drm_fd = open(render_path.c_str(), O_RDWR);
-    if (drm_fd < 0) {
-      BOOST_LOG(error) << "[wayland] Failed to open DRM render node: "sv << render_path;
-      return false;
-    }
-
-    gbm_device = gbm_create_device(drm_fd);
-    if (!gbm_device) {
-      close(drm_fd);
-      BOOST_LOG(error) << "[wayland] Failed to create GBM device"sv;
-      return false;
-    }
-
-    return true;
+    return gbm.init(platf::resolve_render_device(), gbm_device_accessors);
   }
 
   // Cleanup GBM
@@ -290,6 +325,37 @@ namespace wl {
       wl_buffer_destroy(current_wl_buffer);
       current_wl_buffer = nullptr;
     }
+  }
+
+  std::map<std::uint32_t, std::vector<std::uint64_t>> intersect_modifiers(
+    const std::map<std::uint32_t, std::vector<std::uint64_t>> &compositor_modifiers,
+    const std::map<std::uint32_t, std::vector<std::uint64_t>> &encoder_modifiers
+  ) {
+    std::map<std::uint32_t, std::vector<std::uint64_t>> result;
+
+    for (const auto &[format, comp_mods] : compositor_modifiers) {
+      auto it = encoder_modifiers.find(format);
+      if (it == encoder_modifiers.end()) {
+        continue;
+      }
+
+      const auto &enc_mods = it->second;
+      std::vector<std::uint64_t> common;
+
+      for (auto mod : comp_mods) {
+        if (std::find(enc_mods.begin(), enc_mods.end(), mod) != enc_mods.end()) {
+          common.push_back(mod);
+        }
+      }
+
+      if (!common.empty()) {
+        BOOST_LOG(debug) << "[wayland] Format 0x"sv << std::hex << format << std::dec
+                         << " has "sv << common.size() << " common modifiers"sv;
+        result[format] = std::move(common);
+      }
+    }
+
+    return result;
   }
 
   dmabuf_t::dmabuf_t():
@@ -313,10 +379,12 @@ namespace wl {
     zwp_linux_dmabuf_v1 *dmabuf_interface,
     const std::map<std::uint32_t, std::vector<std::uint64_t>> *supported_modifiers,
     wl_output *output,
-    bool blend_cursor
+    bool blend_cursor,
+    const std::map<std::uint32_t, std::vector<std::uint64_t>> *encoder_modifiers
   ) {
     this->dmabuf_interface = dmabuf_interface;
     this->supported_modifiers = supported_modifiers;
+    this->encoder_modifiers = encoder_modifiers;
     // Reset state
     shm_info.supported = false;
     dmabuf_info.supported = false;
@@ -344,11 +412,7 @@ namespace wl {
       frame.destroy();
     }
 
-    if (gbm_device) {
-      // We should close the DRM FD, but it's owned by GBM
-      gbm_device_destroy(gbm_device);
-      gbm_device = nullptr;
-    }
+    gbm.reset();
   }
 
   // Buffer format callback
@@ -419,16 +483,17 @@ namespace wl {
       return;
     }
 
-    // Create GBM buffer
-    if (supported_modifiers) {
-      auto it = supported_modifiers->find(dmabuf_info.format);
-      if (it != supported_modifiers->end() && !it->second.empty()) {
-        current_bo = gbm_bo_create_with_modifiers2(gbm_device, dmabuf_info.width, dmabuf_info.height, dmabuf_info.format, it->second.data(), it->second.size(), GBM_BO_USE_RENDERING);
+    // Create GBM buffer - prefer encoder-intersected modifiers when available
+    const std::map<std::uint32_t, std::vector<std::uint64_t>> *modifiers_to_use = encoder_modifiers ? encoder_modifiers : supported_modifiers;
+    if (modifiers_to_use) {
+      auto it = modifiers_to_use->find(dmabuf_info.format);
+      if (it != modifiers_to_use->end() && !it->second.empty()) {
+        current_bo = gbm_bo_create_with_modifiers2(gbm.get(), dmabuf_info.width, dmabuf_info.height, dmabuf_info.format, it->second.data(), it->second.size(), GBM_BO_USE_RENDERING);
       }
     }
 
     if (!current_bo) {
-      current_bo = gbm_bo_create(gbm_device, dmabuf_info.width, dmabuf_info.height, dmabuf_info.format, GBM_BO_USE_RENDERING);
+      current_bo = gbm_bo_create(gbm.get(), dmabuf_info.width, dmabuf_info.height, dmabuf_info.format, GBM_BO_USE_RENDERING);
     }
 
     if (!current_bo) {
@@ -509,7 +574,12 @@ namespace wl {
 
     // Start the actual copy
     zwp_linux_buffer_params_v1_destroy(params);
-    zwlr_screencopy_frame_v1_copy(frame, buffer);
+    if (self->with_damage) {
+      zwlr_screencopy_frame_v1_copy_with_damage(frame, buffer);
+    } else {
+      zwlr_screencopy_frame_v1_copy(frame, buffer);
+    }
+    self->pending_copy = frame;
   }
 
   // Buffer params failed callback
@@ -555,6 +625,7 @@ namespace wl {
     cleanup_gbm();
 
     zwlr_screencopy_frame_v1_destroy(frame);
+    pending_copy = nullptr;
     status = READY;
   }
 
@@ -568,7 +639,24 @@ namespace wl {
     next_frame->destroy();
 
     zwlr_screencopy_frame_v1_destroy(frame);
+    pending_copy = nullptr;
     status = REINIT;
+  }
+
+  bool dmabuf_t::cancel() {
+    if (!pending_copy) {
+      return false;
+    }
+
+    zwlr_screencopy_frame_v1_destroy(pending_copy);
+    pending_copy = nullptr;
+
+    // Same as a failed copy: the buffer the compositor was to fill is not needed anymore
+    cleanup_gbm();
+    get_next_frame()->destroy();
+
+    status = READY;
+    return true;
   }
 
   // Only called if using zwlr_screencopy_frame_v1_copy_with_damage()
@@ -592,7 +680,7 @@ namespace wl {
 
   frame_t::frame_t() {
     // File descriptors aren't open
-    std::fill_n(sd.fds, 4, -1);
+    sd.fds.fill(-1);
   };
 
   /**
