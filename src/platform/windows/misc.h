@@ -30,6 +30,16 @@ namespace platf {
   HDESK syncThreadDesktop();
 
   /**
+   * @brief Move the calling thread to the input desktop, unless it is there already.
+   *
+   * Windows refuses display configuration calls from a thread on any other
+   * desktop, which is where Sunshine's threads are at the sign-in and lock
+   * screens. Unlike syncThreadDesktop(), it does nothing and logs nothing
+   * when there is nothing to do, so it can come before every such call.
+   */
+  void follow_input_desktop();
+
+  /**
    * @brief Read the current Windows high-resolution performance counter.
    *
    * @return Raw QPC tick value from `QueryPerformanceCounter`.

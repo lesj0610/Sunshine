@@ -23,6 +23,7 @@ extern "C" {
 #include "display.h"
 #include "misc.h"
 #include "src/config.h"
+#include "src/local_cursor.h"
 #include "src/logging.h"
 #include "src/nvenc/nvenc_config.h"
 #include "src/nvenc/nvenc_dynamic_factory.h"
@@ -1399,6 +1400,8 @@ namespace platf::dxgi {
         return capture_e::capture_error;
       }
 
+      report_pointer_shape(shape_info, {std::begin(img_data), img_data.size()});
+
       auto alpha_cursor_img = make_cursor_alpha_image(img_data, shape_info);
       auto xor_cursor_img = make_cursor_xor_image(img_data, shape_info);
 
@@ -1411,6 +1414,8 @@ namespace platf::dxgi {
       cursor_alpha.set_pos(frame_info.PointerPosition.Position.x, frame_info.PointerPosition.Position.y, width, height, display_rotation, frame_info.PointerPosition.Visible);
 
       cursor_xor.set_pos(frame_info.PointerPosition.Position.x, frame_info.PointerPosition.Position.y, width, height, display_rotation, frame_info.PointerPosition.Visible);
+
+      local_cursor::set_visible(frame_info.PointerPosition.Visible);
     }
 
     const bool blend_mouse_cursor_flag = (cursor_alpha.visible || cursor_xor.visible) && cursor_visible;
@@ -1510,6 +1515,11 @@ namespace platf::dxgi {
             // Replace it with an image from pull_free_image_cb copying contents and freeing up the surface memory.
             // Save the shared pointer to the image in case the mouse cursor reappears.
             last_frame_action = lfa::replace_surface_with_img;
+          } else {
+            // Only the undrawn mouse cursor changed, so the picture is the one already sent.
+            // Clients that draw the cursor themselves move it all the time, and repeating the
+            // picture for every move would only cost bandwidth.
+            return capture_e::timeout;
           }
           // Use saved last image shared pointer as output image evading copy.
           out_frame_action = ofa::forward_last_img;

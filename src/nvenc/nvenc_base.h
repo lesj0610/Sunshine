@@ -75,6 +75,13 @@ namespace NVENC_NAMESPACE {
      */
     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) override;
 
+    /**
+     * @brief Change the bitrate of the running encoder with `NvEncReconfigureEncoder()`.
+     * @param kbps New bitrate in kilobits per second.
+     * @return `true` on success, `false` on error, which leaves the encoder as it was.
+     */
+    bool set_bitrate(std::uint32_t kbps) override;
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -129,6 +136,13 @@ namespace NVENC_NAMESPACE {
       uint32_t ref_frames_in_dpb = 0;
       bool rfi = false;
     } encoder_params;  ///< Current encoder dimensions, pixel format, and reference-frame settings.
+
+    struct {
+      NV_ENC_INITIALIZE_PARAMS init_params = {};
+      NV_ENC_CONFIG config = {};
+      uint32_t initial_bitrate = 0;  ///< Bits per second the encoder was created with.
+      uint32_t initial_vbv_size = 0;  ///< VBV buffer size it was created with, zero when left to the driver.
+    } reconfigure_state;  ///< What `set_bitrate()` hands back to the driver, with only the rate control changed.
 
     std::string last_nvenc_error_string;  ///< Last NVENC error string.
 
