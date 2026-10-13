@@ -87,8 +87,7 @@ namespace local_cursor {
 
     const int rows = type == monochrome ? height / 2 : height;
     const int min_pitch = type == monochrome ? (width + 7) / 8 : width * 4;
-    if (width <= 0 || rows <= 0 || pitch < min_pitch || max_pixels <= 0 ||
-        static_cast<std::size_t>(pitch) * (type == monochrome ? rows * 2 : rows) > data.size()) {
+    if (width <= 0 || rows <= 0 || pitch < min_pitch || max_pixels <= 0 || static_cast<std::size_t>(pitch) * (type == monochrome ? rows * 2 : rows) > data.size()) {
       return std::nullopt;
     }
 
