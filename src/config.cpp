@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -75,17 +76,18 @@ namespace config {
      * @return Parsed enum value, or the setting-specific default when the text is unknown.
      */
     nvenc::nvenc_two_pass twopass_from_view(const std::string_view &preset) {
+      using enum nvenc::nvenc_two_pass;
       if (preset == "disabled") {
-        return nvenc::nvenc_two_pass::disabled;
+        return disabled;
       }
       if (preset == "quarter_res") {
-        return nvenc::nvenc_two_pass::quarter_resolution;
+        return quarter_resolution;
       }
       if (preset == "full_res") {
-        return nvenc::nvenc_two_pass::full_resolution;
+        return full_resolution;
       }
       BOOST_LOG(warning) << "config: unknown nvenc_twopass value: " << preset;
-      return nvenc::nvenc_two_pass::quarter_resolution;
+      return quarter_resolution;
     }
 
     /**
@@ -778,6 +780,7 @@ namespace config {
     },
 
     {},  // capture
+    false,  // fp16_sdr_gamma_encoded
     {},  // encoder
     {},  // adapter_name
     {},  // output_name
@@ -807,6 +810,7 @@ namespace config {
     {},  // virtual_sink
     true,  // stream audio
     true,  // install_steam_drivers
+    false,  // external_audio
   };
 
   /**
@@ -1075,15 +1079,15 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void string_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::string &input) {
+  void string_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::string &destination) {
     auto it = vars.find(name);
     if (it == std::end(vars)) {
       return;
     }
 
-    input = std::move(it->second);
+    destination = std::move(it->second);
 
     vars.erase(it);
   }
@@ -1093,15 +1097,15 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    * @param f Converter applied to the raw configuration string.
    */
   template<typename T, typename F>
-  void generic_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, T &input, F &&f) {
+  void generic_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, T &destination, F &&f) {
     std::string tmp;
     string_f(vars, name, tmp);
     if (!tmp.empty()) {
-      input = f(tmp);
+      destination = f(tmp);
     }
   }
 
@@ -1110,16 +1114,16 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    * @param allowed_vals Accepted string values for this setting.
    */
-  void string_restricted_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::string &input, const std::vector<std::string_view> &allowed_vals) {
+  void string_restricted_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::string &destination, const std::vector<std::string_view> &allowed_vals) {
     std::string temp;
     string_f(vars, name, temp);
 
     for (auto &allowed_val : allowed_vals) {
       if (temp == allowed_val) {
-        input = std::move(temp);
+        destination = std::move(temp);
         return;
       }
     }
@@ -1158,9 +1162,9 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void path_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, fs::path &input) {
+  void path_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, fs::path &destination) {
     // appdata needs to be retrieved once only
     static auto appdata = platf::appdata();
 
@@ -1168,14 +1172,14 @@ namespace config {
     string_f(vars, name, temp);
 
     if (!temp.empty()) {
-      input = temp;
+      destination = temp;
     }
 
-    if (input.is_relative()) {
-      input = appdata / input;
+    if (destination.is_relative()) {
+      destination = appdata / destination;
     }
 
-    auto dir = input;
+    auto dir = destination;
     dir.remove_filename();
 
     // Ensure the directories exists
@@ -1189,14 +1193,14 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void path_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::string &input) {
-    fs::path temp = input;
+  void path_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::string &destination) {
+    fs::path temp = destination;
 
     path_f(vars, name, temp);
 
-    input = temp.string();
+    destination = temp.string();
   }
 
   /**
@@ -1221,16 +1225,16 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, int &input) {
+  void int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, int &destination) {
     auto it = vars.find(name);
 
     if (it == std::end(vars)) {
       return;
     }
 
-    input = parse_config_integer(it->second);
+    destination = parse_config_integer(it->second);
     vars.erase(it);
   }
 
@@ -1239,16 +1243,16 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::optional<int> &input) {
+  void int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::optional<int> &destination) {
     auto it = vars.find(name);
 
     if (it == std::end(vars)) {
       return;
     }
 
-    input = parse_config_integer(it->second);
+    destination = parse_config_integer(it->second);
     vars.erase(it);
   }
 
@@ -1257,15 +1261,15 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    * @param f Converter applied to the raw configuration string.
    */
   template<class F>
-  void int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, int &input, F &&f) {
+  void int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, int &destination, F &&f) {
     std::string tmp;
     string_f(vars, name, tmp);
     if (!tmp.empty()) {
-      input = f(tmp);
+      destination = f(tmp);
     }
   }
 
@@ -1274,15 +1278,15 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    * @param f Converter applied to the raw configuration string.
    */
   template<class F>
-  void int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::optional<int> &input, F &&f) {
+  void int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::optional<int> &destination, F &&f) {
     std::string tmp;
     string_f(vars, name, tmp);
     if (!tmp.empty()) {
-      input = f(tmp);
+      destination = f(tmp);
     }
   }
 
@@ -1291,17 +1295,17 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    * @param range Inclusive range accepted for the parsed value.
    */
-  void int_between_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, int &input, const std::pair<int, int> &range) {
-    int temp = input;
+  void int_between_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, int &destination, const std::pair<int, int> &range) {
+    int temp = destination;
 
     int_f(vars, name, temp);
 
     TUPLE_2D_REF(lower, upper, range);
     if (temp >= lower && temp <= upper) {
-      input = temp;
+      destination = temp;
     }
   }
 
@@ -1329,9 +1333,9 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void bool_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, bool &input) {
+  void bool_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, bool &destination) {
     std::string tmp;
     string_f(vars, name, tmp);
 
@@ -1339,7 +1343,7 @@ namespace config {
       return;
     }
 
-    input = to_bool(tmp);
+    destination = to_bool(tmp);
   }
 
   /**
@@ -1347,9 +1351,9 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void double_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, double &input) {
+  void double_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, double &destination) {
     std::string tmp;
     string_f(vars, name, tmp);
 
@@ -1364,7 +1368,7 @@ namespace config {
       return;
     }
 
-    input = val;
+    destination = val;
   }
 
   /**
@@ -1372,17 +1376,17 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    * @param range Inclusive range accepted for the parsed value.
    */
-  void double_between_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, double &input, const std::pair<double, double> &range) {
-    double temp = input;
+  void double_between_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, double &destination, const std::pair<double, double> &range) {
+    double temp = destination;
 
     double_f(vars, name, temp);
 
     TUPLE_2D_REF(lower, upper, range);
     if (temp >= lower && temp <= upper) {
-      input = temp;
+      destination = temp;
     }
   }
 
@@ -1391,9 +1395,9 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void list_string_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::vector<std::string> &input) {
+  void list_string_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::vector<std::string> &destination) {
     std::string string;
     string_f(vars, name, string);
 
@@ -1401,7 +1405,7 @@ namespace config {
       return;
     }
 
-    input.clear();
+    destination.clear();
 
     auto begin = std::cbegin(string);
     if (*begin == '[') {
@@ -1420,7 +1424,7 @@ namespace config {
       } else if (*pos == ']') {
         break;
       } else if (*pos == ',') {
-        input.emplace_back(begin, pos);
+        destination.emplace_back(begin, pos);
         pos = begin = std::find_if_not(pos + 1, std::cend(string), whitespace);
       } else {
         ++pos;
@@ -1428,7 +1432,7 @@ namespace config {
     }
 
     if (pos != begin) {
-      input.emplace_back(begin, pos);
+      destination.emplace_back(begin, pos);
     }
   }
 
@@ -1437,9 +1441,9 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void list_prep_cmd_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::vector<prep_cmd_t> &input) {
+  void list_prep_cmd_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::vector<prep_cmd_t> &destination) {
     std::string string;
     string_f(vars, name, string);
 
@@ -1461,7 +1465,7 @@ namespace config {
       auto undo_cmd = prep_cmd.get_optional<std::string>("undo"s);
       auto elevated = prep_cmd.get_optional<bool>("elevated"s);
 
-      input.emplace_back(do_cmd.value_or(""), undo_cmd.value_or(""), elevated.value_or(false));
+      destination.emplace_back(do_cmd.value_or(""), undo_cmd.value_or(""), elevated.value_or(false));
     }
   }
 
@@ -1470,9 +1474,9 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void list_int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::vector<int> &input) {
+  void list_int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::vector<int> &destination) {
     std::vector<std::string> list;
     list_string_f(vars, name, list);
 
@@ -1484,7 +1488,7 @@ namespace config {
     // The framerate list must be cleared before adding values from the file configuration.
     // If the list is not cleared, then the specified parameters do not affect the behavior of the sunshine server.
     // That is, if you set only 30 fps in the configuration file, it will not work because by default, during initialization the list includes 10, 30, 60, 90 and 120 fps.
-    input.clear();
+    destination.clear();
     for (auto &el : list) {
       std::string_view val = el;
 
@@ -1501,7 +1505,7 @@ namespace config {
       } else {
         tmp = (int) util::from_view(val);
       }
-      input.emplace_back(tmp);
+      destination.emplace_back(tmp);
     }
   }
 
@@ -1510,9 +1514,9 @@ namespace config {
    *
    * @param vars Parsed configuration entries; consumed keys are erased.
    * @param name Configuration key to consume.
-   * @param input Destination field updated when the setting exists and parses successfully.
+   * @param destination Destination field updated when the setting exists and parses successfully.
    */
-  void map_int_int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::unordered_map<int, int> &input) {
+  void map_int_int_f(std::unordered_map<std::string, std::string> &vars, const std::string &name, std::unordered_map<int, int> &destination) {
     std::vector<int> list;
     list_int_f(vars, name, list);
 
@@ -1527,7 +1531,7 @@ namespace config {
       auto key = list[x++];
       auto val = list[x++];
 
-      input.emplace(key, val);
+      destination.emplace(key, val);
     }
   }
 
@@ -1706,6 +1710,7 @@ namespace config {
     }
 
     string_f(vars, "capture", video.capture);
+    bool_f(vars, "fp16_sdr_gamma_encoded", video.fp16_sdr_gamma_encoded);
     string_f(vars, "encoder", video.encoder);
     string_f(vars, "adapter_name", video.adapter_name);
     string_f(vars, "output_name", video.output_name);
@@ -1751,6 +1756,7 @@ namespace config {
     string_f(vars, "virtual_sink", audio.virtual_sink);
     bool_f(vars, "stream_audio", audio.stream);
     bool_f(vars, "install_steam_audio_drivers", audio.install_steam_drivers);
+    bool_f(vars, "external_audio", audio.external_audio);
 
     string_restricted_f(vars, "origin_web_ui_allowed", nvhttp.origin_web_ui_allowed, {"pc"sv, "lan"sv, "wan"sv});
 
@@ -1802,7 +1808,7 @@ namespace config {
     }
 #endif
 
-    int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
+    int_between_f(vars, "fec_percentage", stream.fec_percentage, {0, 100});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 
@@ -2081,14 +2087,14 @@ namespace config {
     if (shortcut_launch) {
       if (!service_ctrl::is_service_running()) {
         // If the service isn't running, relaunch ourselves as admin to start it
-        WCHAR executable[MAX_PATH];
-        GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
+        std::array<WCHAR, MAX_PATH> executable;
+        GetModuleFileNameW(nullptr, executable.data(), executable.size());
 
         SHELLEXECUTEINFOW shell_exec_info {};
         shell_exec_info.cbSize = sizeof(shell_exec_info);
         shell_exec_info.fMask = SEE_MASK_NOASYNC | SEE_MASK_NO_CONSOLE | SEE_MASK_NOCLOSEPROCESS;
         shell_exec_info.lpVerb = L"runas";
-        shell_exec_info.lpFile = executable;
+        shell_exec_info.lpFile = executable.data();
         shell_exec_info.lpParameters = L"--shortcut-admin";
         shell_exec_info.nShow = SW_NORMAL;
         if (!ShellExecuteExW(&shell_exec_info)) {

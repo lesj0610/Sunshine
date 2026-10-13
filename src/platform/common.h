@@ -63,7 +63,7 @@ namespace boost {
     /**
      * @brief Map of environment variable names to values.
      */
-    typedef basic_environment<char> environment;
+    using environment = basic_environment<char>;
   }  // namespace process::v1
 }  // namespace boost
 #endif
@@ -389,6 +389,8 @@ namespace platf {
     int height;  ///< Frame or display height in pixels.
     int logical_width;  ///< Logical width after display scaling.
     int logical_height;  ///< Logical height after display scaling.
+    int env_offset_x {};  ///< Horizontal origin of the full input environment in native desktop coordinates.
+    int env_offset_y {};  ///< Vertical origin of the full input environment in native desktop coordinates.
   };
 
   // These values must match Limelight-internal.h's SS_FF_* constants!
@@ -396,7 +398,7 @@ namespace platf {
     /**
      * @brief Bitset containing platform capability flags.
      */
-    typedef uint32_t caps_t;
+    using caps_t = uint32_t;
 
     /**
      * @brief Capability bit indicating native pen and touch support.
@@ -609,13 +611,13 @@ namespace platf {
 
     /**
      * @brief Set the frame to be encoded.
-     * @note Implementations must take ownership of 'frame'.
+     * @note Implementations must take ownership of 'new_frame'.
      *
-     * @param frame Video or graphics frame being processed.
+     * @param new_frame Video or graphics frame being processed.
      * @param hw_frames_ctx FFmpeg hardware frames context associated with the frame.
      * @return Status from updating frame.
      */
-    virtual int set_frame(AVFrame *frame, AVBufferRef *hw_frames_ctx) {
+    virtual int set_frame(AVFrame *new_frame, AVBufferRef *hw_frames_ctx) {
       BOOST_LOG(error) << "Illegal call to hwdevice_t::set_frame(). Did you forget to override it?";
       return -1;
     };
@@ -673,7 +675,7 @@ namespace platf {
     reinit,  ///< Need to reinitialize
     timeout,  ///< Timeout
     interrupted,  ///< Capture was interrupted
-    error  ///< Error
+    capture_error  ///< Capture failed.
   };
 
   /**
@@ -710,7 +712,7 @@ namespace platf {
      * Calls to this callback and push_captured_image_cb must be synchronized as well.
      * @param cursor A pointer to the flag that indicates whether the cursor should be captured as well.
      * @retval capture_e::ok When stopping
-     * @retval capture_e::error On error
+     * @retval capture_e::capture_error On error
      * @retval capture_e::reinit When need of reinitialization
      */
     virtual capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) = 0;
@@ -785,6 +787,8 @@ namespace platf {
     // Offsets for when streaming a specific monitor. By default, they are 0.
     int offset_x {0};  ///< Horizontal capture offset in physical pixels.
     int offset_y {0};  ///< Vertical capture offset in physical pixels.
+    int env_offset_x {0};  ///< Horizontal origin of the full capture environment in native desktop coordinates.
+    int env_offset_y {0};  ///< Vertical origin of the full capture environment in native desktop coordinates.
     int env_width {0};  ///< Width of the full capture environment in physical pixels.
     int env_height {0};  ///< Height of the full capture environment in physical pixels.
     int env_logical_width {0};  ///< Width of the full capture environment after display scaling.
@@ -880,6 +884,8 @@ namespace platf {
 
   std::filesystem::path appdata();
 
+  std::filesystem::path get_xdg_restore_token_path();  ///< XDG restore token path.
+
   /**
    * @brief Return the hardware MAC address associated with a network address.
    *
@@ -892,14 +898,14 @@ namespace platf {
    * @brief Convert a socket address to a printable IP address.
    *
    * @param ip_addr Socket address to format.
-   * @return Value converted from sockaddr.
+   * @return Printable address, or an empty string for an unsupported address family.
    */
   std::string from_sockaddr(const sockaddr *const);
   /**
    * @brief Convert a socket address to a port and printable IP address.
    *
    * @param ip_addr Socket address to format.
-   * @return Value converted from sockaddr ex.
+   * @return Port in network byte order and printable address, or zero and an empty string for an unsupported family.
    */
   std::pair<std::uint16_t, std::string> from_sockaddr_ex(const sockaddr *const);
 
@@ -1155,6 +1161,15 @@ namespace platf {
    */
   void move_mouse(input_t &input, int deltaX, int deltaY);
   /**
+   * @brief Retarget the virtual mouse and move it relatively.
+   *
+   * @param input Platform input backend that receives the event.
+   * @param touch_port Desktop and streamed-display bounds for the pointer.
+   * @param deltaX Delta x.
+   * @param deltaY Delta y.
+   */
+  void move_mouse(input_t &input, const touch_port_t &touch_port, int deltaX, int deltaY);
+  /**
    * @brief Move the pointer to an absolute client-provided touch coordinate.
    *
    * @param input Platform input backend that receives the event.
@@ -1208,7 +1223,7 @@ namespace platf {
   /**
    * @brief Per-client input context allocated by a platform backend.
    */
-  typedef deinit_t client_input_t;
+  using client_input_t = deinit_t;
 
   /**
    * @brief Allocate a context to store per-client input data.

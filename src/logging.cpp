@@ -3,6 +3,7 @@
  * @brief Definitions for logging related functions.
  */
 // standard includes
+#include <array>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -65,9 +66,9 @@ namespace logging {
    */
   void formatter(const boost::log::record_view &view, boost::log::formatting_ostream &os) {
     constexpr const char *message = "Message";
-    constexpr const char *severity = "Severity";
+    constexpr const char *severity_attribute = "Severity";
 
-    auto log_level = view.attribute_values()[severity].extract<int>().get();
+    auto log_level = view.attribute_values()[severity_attribute].extract<int>().get();
 
     std::string_view log_type;
     switch (log_level) {
@@ -204,22 +205,22 @@ namespace logging {
     }
     av_log_set_callback([](void *ptr, int level, const char *fmt, va_list vl) {
       static int print_prefix = 1;
-      char buffer[1024];
+      std::array<char, 1024> buffer;
 
-      av_log_format_line(ptr, level, fmt, vl, buffer, sizeof(buffer), &print_prefix);
+      av_log_format_line(ptr, level, fmt, vl, buffer.data(), buffer.size(), &print_prefix);
       if (level <= AV_LOG_ERROR) {
         // We print AV_LOG_FATAL at the error level. FFmpeg prints things as fatal that
         // are expected in some cases, such as lack of codec support or similar things.
-        BOOST_LOG(error) << buffer;
+        BOOST_LOG(error) << buffer.data();
       } else if (level <= AV_LOG_WARNING) {
-        BOOST_LOG(warning) << buffer;
+        BOOST_LOG(warning) << buffer.data();
       } else if (level <= AV_LOG_INFO) {
-        BOOST_LOG(info) << buffer;
+        BOOST_LOG(info) << buffer.data();
       } else if (level <= AV_LOG_VERBOSE) {
         // AV_LOG_VERBOSE is less verbose than AV_LOG_DEBUG
-        BOOST_LOG(debug) << buffer;
+        BOOST_LOG(debug) << buffer.data();
       } else {
-        BOOST_LOG(verbose) << buffer;
+        BOOST_LOG(verbose) << buffer.data();
       }
     });
   }
