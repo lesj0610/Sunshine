@@ -42,6 +42,14 @@ install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/firewall/"
         DESTINATION "scripts"
         COMPONENT firewall)
 
+# Bundled virtual display driver, installed by sunshine-setup.ps1
+install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/sudovda/"
+        DESTINATION "scripts"
+        COMPONENT assets)
+install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/drivers/sudovda/"
+        DESTINATION "drivers/sudovda"
+        COMPONENT assets)
+
 # Sunshine assets
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/assets/"
         DESTINATION "${SUNSHINE_ASSETS_DIR}"
