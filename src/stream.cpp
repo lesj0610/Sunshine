@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -22,6 +23,7 @@
 extern "C" {
   // clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
+#include <moonlight-common-c/src/LocalCursor.h>
 #include <moonlight-common-c/src/StreamResize.h>
   // clang-format on
 }
@@ -32,6 +34,7 @@ extern "C" {
 #include "display_device.h"
 #include "globals.h"
 #include "input.h"
+#include "local_cursor.h"
 #include "logging.h"
 #include "network.h"
 #include "platform/common.h"
@@ -592,6 +595,12 @@ namespace stream {
       safe::mail_raw_t::queue_t<stream_resize::result_t> results;  ///< Answers handed to the control thread.
       stream_resize::outbox_t outbox;  ///< Answers the control thread has not got out yet. Only it touches this.
     } resize;  ///< Resizing the stream without reconnecting.
+
+    struct {
+      bool enabled {false};  ///< Whether the client draws the pointer itself.
+      std::optional<std::uint64_t> sent_serial;  ///< The pointer state the client last got, if any.
+      std::shared_ptr<const local_cursor::image_t> sent_image;  ///< The image the client last got.
+    } cursor;  ///< The pointer, for a client that draws it itself. Only the control thread touches this.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
@@ -1253,6 +1262,71 @@ namespace stream {
   }
 
   /**
+   * @brief Let a client draw the pointer itself, or go back to drawing it into the video for it.
+   *
+   * The host leaves the pointer out of the video while any client draws it itself.
+   *
+   * @param session Session of the client.
+   * @param enabled True when the client draws the pointer.
+   */
+  void set_local_cursor(session_t *session, bool enabled) {
+    // Only the control thread changes this
+    static int sessions_drawing_cursor = 0;
+
+    if (session->cursor.enabled == enabled) {
+      return;
+    }
+
+    session->cursor.enabled = enabled;
+    session->cursor.sent_serial.reset();
+    session->cursor.sent_image.reset();
+    sessions_drawing_cursor += enabled ? 1 : -1;
+    display_cursor = sessions_drawing_cursor == 0;
+    BOOST_LOG(info) << (enabled ? "The client draws the mouse pointer itself"sv : "The mouse pointer is drawn into the video again"sv);
+  }
+
+  /**
+   * @brief Tell a client that draws the pointer itself what changed about it.
+   *
+   * An update that does not go out is tried again with whatever the pointer
+   * looks like by then.
+   *
+   * @param session Session of the client.
+   */
+  void send_local_cursor(session_t *session) {
+    const auto state = local_cursor::state();
+    // There is nothing to draw until the capture has seen the pointer
+    if (!session->cursor.enabled || !state.image || session->cursor.sent_serial == state.serial) {
+      return;
+    }
+
+    const auto &image = *state.image;
+    const bool with_image = state.image != session->cursor.sent_image;
+    const LOCAL_CURSOR_UPDATE update {state.visible, with_image ? image.bgra.data() : nullptr, image.width, image.height, image.hot_x, image.hot_y, image.scale};
+
+    std::vector<std::uint8_t> plaintext(sizeof(control_header_v2) + SS_LOCAL_CURSOR_HEADER_LENGTH + (with_image ? image.bgra.size() : 0));
+    const control_header_v2 header {SS_LOCAL_CURSOR_UPDATE_PTYPE, static_cast<std::uint16_t>(plaintext.size() - sizeof(control_header_v2))};
+    std::memcpy(plaintext.data(), &header, sizeof(header));
+    ssLocalCursorWriteUpdateHeader(&update, plaintext.data() + sizeof(header));
+    if (with_image) {
+      std::ranges::copy(image.bgra, plaintext.begin() + sizeof(header) + SS_LOCAL_CURSOR_HEADER_LENGTH);
+    }
+
+    // Only the control thread sends these, so one buffer for the largest will do
+    static std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(control_header_v2) + SS_LOCAL_CURSOR_HEADER_LENGTH + SS_LOCAL_CURSOR_MAX_PIXELS * 4) + crypto::cipher::tag_size>
+      encrypted_payload;
+
+    auto payload = encode_control(session, std::string_view {reinterpret_cast<const char *>(plaintext.data()), plaintext.size()}, encrypted_payload);
+    if (payload.empty() || session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+      BOOST_LOG(debug) << "Couldn't send a pointer update, will try again"sv;
+      return;
+    }
+
+    session->cursor.sent_serial = state.serial;
+    session->cursor.sent_image = state.image;
+  }
+
+  /**
    * @brief Send every stream resize answer waiting for the control thread.
    *
    * An answer that does not go out is kept and tried again, with the ones
@@ -1381,6 +1455,18 @@ namespace stream {
         session->video.bitrate_controller->frame_lost();
       }
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
+    });
+
+    server->map(SS_LOCAL_CURSOR_REQUEST_PTYPE, [](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(debug) << "type [LOCAL_CURSOR_REQUEST]"sv;
+
+      bool enabled;
+      if (!ssLocalCursorReadRequest(payload.data(), payload.size(), &enabled)) {
+        BOOST_LOG(warning) << "Ignoring a malformed local cursor request"sv;
+        return;
+      }
+
+      set_local_cursor(session, enabled);
     });
 
     server->map(SS_STREAM_RESIZE_REQUEST_PTYPE, [](session_t *session, const std::string_view &payload) {
@@ -1539,6 +1625,7 @@ namespace stream {
 
           if (session->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
             pos = server->_sessions->erase(pos);
+            set_local_cursor(session, false);
 
             if (session->control.peer) {
               // A resize that ends the session says so first, so the client
@@ -1584,6 +1671,8 @@ namespace stream {
               BOOST_LOG(error) << "Stream resize answers are not getting through to the client. Ending the session."sv;
               session::stop(*session);
             }
+
+            send_local_cursor(session);
           }
 
           ++pos;
@@ -1625,6 +1714,7 @@ namespace stream {
         }
       }
 
+      set_local_cursor(session, false);
       session->shutdown_event->raise(true);
       session->controlEnd.raise(true);
     }

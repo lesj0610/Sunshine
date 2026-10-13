@@ -17,8 +17,10 @@
 // lib includes
 #include <boost/algorithm/string/join.hpp>
 #include <MinHook.h>
+#include <moonlight-common-c/src/LocalCursor.h>
 
 // local includes
+#include "src/local_cursor.h"
 #include "utf_utils.h"
 
 // Including Boost.Process before Windows.h prevents the definition of NTSTATUS, so we must define it ourselves.
@@ -1015,6 +1017,13 @@ namespace platf::dxgi {
       return type_str[type];
     } else {
       return "UNKNOWN";
+    }
+  }
+
+  void report_pointer_shape(const DXGI_OUTDUPL_POINTER_SHAPE_INFO &shape_info, std::span<const std::uint8_t> data) {
+    auto image = local_cursor::from_shape(static_cast<local_cursor::shape_type_e>(shape_info.Type), static_cast<int>(shape_info.Width), static_cast<int>(shape_info.Height), static_cast<int>(shape_info.Pitch), shape_info.HotSpot.x, shape_info.HotSpot.y, data, SS_LOCAL_CURSOR_MAX_PIXELS);
+    if (image) {
+      local_cursor::set_image(std::make_shared<const local_cursor::image_t>(std::move(*image)));
     }
   }
 

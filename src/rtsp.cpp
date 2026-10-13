@@ -1033,6 +1033,10 @@ namespace rtsp_stream {
 
     // Tell the client about our supported features
     auto feature_flags = (uint32_t) platf::get_capabilities();
+#ifdef _WIN32
+    // Only the Windows capture reports the pointer
+    feature_flags |= LI_FF_LOCAL_CURSOR;
+#endif
     if (display_device::stream_resize_supported()) {
       feature_flags |= LI_FF_STREAM_RESIZE;
     }
