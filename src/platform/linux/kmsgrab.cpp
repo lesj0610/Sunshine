@@ -3,6 +3,7 @@
  * @brief Definitions for KMS screen capture.
  */
 // standard includes
+#include <array>
 #include <errno.h>
 #include <fcntl.h>
 #include <filesystem>
@@ -23,6 +24,7 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "kms_plane.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -238,9 +240,9 @@ namespace platf {
           height {fb->height} {
         pixel_format = DRM_FORMAT_XRGB8888;
         modifier = DRM_FORMAT_MOD_INVALID;
-        std::fill_n(handles, 4, 0);
-        std::fill_n(pitches, 4, 0);
-        std::fill_n(offsets, 4, 0);
+        handles.fill(0);
+        pitches.fill(0);
+        offsets.fill(0);
         handles[0] = fb->handle;
         pitches[0] = fb->pitch;
       }
@@ -260,9 +262,9 @@ namespace platf {
         pixel_format = fb2->pixel_format;
         modifier = (fb2->flags & DRM_MODE_FB_MODIFIERS) ? fb2->modifier : DRM_FORMAT_MOD_INVALID;
 
-        memcpy(handles, fb2->handles, sizeof(handles));
-        memcpy(pitches, fb2->pitches, sizeof(pitches));
-        memcpy(offsets, fb2->offsets, sizeof(offsets));
+        std::copy_n(fb2->handles, handles.size(), handles.begin());
+        std::copy_n(fb2->pitches, pitches.size(), pitches.begin());
+        std::copy_n(fb2->offsets, offsets.size(), offsets.begin());
       }
 
       ~wrapper_fb() {
@@ -290,27 +292,27 @@ namespace platf {
       uint32_t height;  ///< Framebuffer height in pixels.
       uint32_t pixel_format;  ///< DRM fourcc pixel format for the framebuffer.
       uint64_t modifier;  ///< DRM format modifier describing framebuffer memory layout.
-      uint32_t handles[4];  ///< GEM handles for each framebuffer plane.
-      uint32_t pitches[4];  ///< Row stride in bytes for each framebuffer plane.
-      uint32_t offsets[4];  ///< Byte offset to the first pixel for each framebuffer plane.
+      std::array<uint32_t, 4> handles;  ///< GEM handles for each framebuffer plane.
+      std::array<uint32_t, 4> pitches;  ///< Row stride in bytes for each framebuffer plane.
+      std::array<uint32_t, 4> offsets;  ///< Byte offset to the first pixel for each framebuffer plane.
     };
 
     /**
      * @brief DRM plane resource list released with `drmModeFreePlaneResources`.
      */
-    using plane_res_t = util::safe_ptr<drmModePlaneRes, drmModeFreePlaneResources>;
+    using plane_res_t = util::safe_ptr<drmModePlaneRes, &drmModeFreePlaneResources>;
     /**
      * @brief DRM encoder pointer released with `drmModeFreeEncoder`.
      */
-    using encoder_t = util::safe_ptr<drmModeEncoder, drmModeFreeEncoder>;
+    using encoder_t = util::safe_ptr<drmModeEncoder, &drmModeFreeEncoder>;
     /**
      * @brief DRM resource list released with `drmModeFreeResources`.
      */
-    using res_t = util::safe_ptr<drmModeRes, drmModeFreeResources>;
+    using res_t = util::safe_ptr<drmModeRes, &drmModeFreeResources>;
     /**
      * @brief DRM plane pointer released with `drmModeFreePlane`.
      */
-    using plane_t = util::safe_ptr<drmModePlane, drmModeFreePlane>;
+    using plane_t = util::safe_ptr<drmModePlane, &drmModeFreePlane>;
     /**
      * @brief DRM framebuffer pointer released with `drmModeFreeFB2`.
      */
@@ -318,23 +320,23 @@ namespace platf {
     /**
      * @brief DRM CRTC pointer released with `drmModeFreeCrtc`.
      */
-    using crtc_t = util::safe_ptr<drmModeCrtc, drmModeFreeCrtc>;
+    using crtc_t = util::safe_ptr<drmModeCrtc, &drmModeFreeCrtc>;
     /**
      * @brief DRM object-property list released with `drmModeFreeObjectProperties`.
      */
-    using obj_prop_t = util::safe_ptr<drmModeObjectProperties, drmModeFreeObjectProperties>;
+    using obj_prop_t = util::safe_ptr<drmModeObjectProperties, &drmModeFreeObjectProperties>;
     /**
      * @brief DRM property pointer released with `drmModeFreeProperty`.
      */
-    using prop_t = util::safe_ptr<drmModePropertyRes, drmModeFreeProperty>;
+    using prop_t = util::safe_ptr<drmModePropertyRes, &drmModeFreeProperty>;
     /**
      * @brief DRM property-blob pointer released with `drmModeFreePropertyBlob`.
      */
-    using prop_blob_t = util::safe_ptr<drmModePropertyBlobRes, drmModeFreePropertyBlob>;
+    using prop_blob_t = util::safe_ptr<drmModePropertyBlobRes, &drmModeFreePropertyBlob>;
     /**
      * @brief DRM version pointer released with `drmFreeVersion`.
      */
-    using version_t = util::safe_ptr<drmVersion, drmFreeVersion>;
+    using version_t = util::safe_ptr<drmVersion, &drmFreeVersion>;
 
     /**
      * @brief Counter map keyed by DRM connector type.
@@ -508,13 +510,13 @@ namespace platf {
         this->plane.reset();
 
         for (; plane_p != end; ++plane_p) {
-          plane_t plane = drmModeGetPlane(fd, *plane_p);
-          if (!plane) {
+          plane_t next_plane = drmModeGetPlane(fd, *plane_p);
+          if (!next_plane) {
             BOOST_LOG(error) << "Couldn't get drm plane ["sv << (end - plane_p) << "]: "sv << strerror(errno);
             continue;
           }
 
-          this->plane = util::make_shared<plane_t>(plane.release());
+          this->plane = util::make_shared<plane_t>(next_plane.release());
           break;
         }
       }
@@ -577,6 +579,109 @@ namespace platf {
     };
 
     /**
+     * @brief Return whether a DRM fourcc value is a supported 32-bit KMS cursor format.
+     *
+     * @param fmt DRM pixel format to inspect.
+     * @return True when the format is one of the 8 accepted 32-bit cursor layouts,
+     *         otherwise false.
+     */
+    bool is_cursor_32bpp_format(uint32_t fmt) {
+      return fmt == DRM_FORMAT_XRGB8888 ||
+             fmt == DRM_FORMAT_XBGR8888 ||
+             fmt == DRM_FORMAT_RGBX8888 ||
+             fmt == DRM_FORMAT_BGRX8888 ||
+             fmt == DRM_FORMAT_ARGB8888 ||
+             fmt == DRM_FORMAT_ABGR8888 ||
+             fmt == DRM_FORMAT_RGBA8888 ||
+             fmt == DRM_FORMAT_BGRA8888;
+    }
+
+    /**
+     * @brief Convert a single 32-bit pixel to the little-endian ARGB8888 layout used by the capture pipeline.
+     *
+     * Rewrites the pixel in place to [B, G, R, A] byte order.
+     *
+     * @param[in,out] p Pointer to the source pixel bytes in the given format.
+     * @param[in] fmt DRM pixel format of the source pixel.
+     * @param[in] x_is_alpha True for cursor buffers where the kernel hardcodes DRM_FORMAT_HOST_XRGB8888
+     *                   (see virtgpu_gem.c) but the fourth byte actually carries per-pixel alpha.
+     *                   Set false for scanout buffers or formats with real alpha channels.
+     * @return true if the format is supported; false otherwise.
+     */
+    bool convert_pixel_to_argb8888(std::uint8_t *p, std::uint32_t fmt, bool x_is_alpha = false) {
+      const auto c0 = p[0];
+      const auto c1 = p[1];
+      const auto c2 = p[2];
+      const auto c3 = p[3];
+
+      std::uint8_t b;
+      std::uint8_t g;
+      std::uint8_t r;
+      std::uint8_t a;
+
+      switch (fmt) {
+        case DRM_FORMAT_XRGB8888:
+          b = c0;
+          g = c1;
+          r = c2;
+          a = x_is_alpha ? c3 : 255;
+          break;
+        case DRM_FORMAT_XBGR8888:
+          b = c2;
+          g = c1;
+          r = c0;
+          a = x_is_alpha ? c3 : 255;
+          break;
+        case DRM_FORMAT_RGBX8888:
+          b = c1;
+          g = c2;
+          r = c3;
+          a = x_is_alpha ? c0 : 255;
+          break;
+        case DRM_FORMAT_BGRX8888:
+          b = c3;
+          g = c2;
+          r = c1;
+          a = x_is_alpha ? c0 : 255;
+          break;
+
+        case DRM_FORMAT_ARGB8888:
+          b = c0;
+          g = c1;
+          r = c2;
+          a = c3;
+          break;
+        case DRM_FORMAT_ABGR8888:
+          b = c2;
+          g = c1;
+          r = c0;
+          a = c3;
+          break;
+        case DRM_FORMAT_RGBA8888:
+          b = c1;
+          g = c2;
+          r = c3;
+          a = c0;
+          break;
+        case DRM_FORMAT_BGRA8888:
+          b = c3;
+          g = c2;
+          r = c1;
+          a = c0;
+          break;
+
+        default:
+          return false;
+      }
+
+      p[0] = b;
+      p[1] = g;
+      p[2] = r;
+      p[3] = a;
+      return true;
+    }
+
+    /**
      * @brief DRM card, render node, and plane metadata used for KMS capture.
      */
     class card_t {
@@ -584,7 +689,7 @@ namespace platf {
       /**
        * @brief Internal connector metadata tuple used while selecting a monitor.
        */
-      using connector_interal_t = util::safe_ptr<drmModeConnector, drmModeFreeConnector>;
+      using connector_interal_t = util::safe_ptr<drmModeConnector, &drmModeFreeConnector>;
 
       /**
        * @brief Open a DRM connector and cache its monitor metadata.
@@ -1160,9 +1265,9 @@ namespace platf {
             this->env_logical_width = ::platf::kms::env_logical_width;
             this->env_logical_height = ::platf::kms::env_logical_height;
 
-            auto monitor = pos->crtc_to_monitor.find(plane->crtc_id);
-            if (monitor != std::end(pos->crtc_to_monitor)) {
-              auto &viewport = monitor->second.viewport;
+            auto monitor_pos = pos->crtc_to_monitor.find(plane->crtc_id);
+            if (monitor_pos != std::end(pos->crtc_to_monitor)) {
+              auto &viewport = monitor_pos->second.viewport;
 
               width = viewport.width;
               height = viewport.height;
@@ -1430,9 +1535,9 @@ namespace platf {
             return;
           }
 
-          // All known cursor planes in the wild are ARGB8888
-          if (fb->pixel_format != DRM_FORMAT_ARGB8888) {
-            BOOST_LOG(error) << "Unsupported non-ARGB8888 cursor format: "sv << fb->pixel_format;
+          // All known cursor planes in the wild are 32 bpp
+          if (!is_cursor_32bpp_format(fb->pixel_format)) {
+            BOOST_LOG(error) << "Unsupported cursor format: "sv << fb->pixel_format;
             captured_cursor.visible = false;
             cursor_plane_id = -1;
             return;
@@ -1512,6 +1617,17 @@ namespace platf {
 
           munmap(mapped_data, mapped_size);
 
+          if (fb->pixel_format != DRM_FORMAT_ARGB8888) {
+            // Convert the copied pixels to the format expected by the rest of code.
+            for (std::size_t i = 0; i < captured_cursor.pixels.size(); i += 4) {
+              convert_pixel_to_argb8888(
+                captured_cursor.pixels.data() + i,
+                fb->pixel_format,
+                true
+              );
+            }
+          }
+
           captured_cursor.visible = true;
           captured_cursor.src_w = src_w;
           captured_cursor.src_h = src_h;
@@ -1545,6 +1661,14 @@ namespace platf {
         plane_t plane = drmModeGetPlane(card.fd.el, plane_id);
         frame_timestamp = std::chrono::steady_clock::now();
 
+        // A plane that stays without a framebuffer will not get the picture back by itself:
+        // the compositor has moved it to another plane, or restarted. Pick a plane again.
+        if (const auto now = std::chrono::steady_clock::now(); empty_plane_timer.update(plane->fb_id != 0, now)) {
+          BOOST_LOG(info) << "Reinitializing capture: plane ["sv << plane_id << "] has had no framebuffer for "sv
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(empty_plane_timer.empty_for(now)).count() << "ms"sv;
+          return capture_e::reinit;
+        }
+
         auto fb = card.fb(plane.get());
         if (!fb) {
           // This can happen if the display is being reconfigured while streaming
@@ -1554,7 +1678,7 @@ namespace platf {
 
         if (!fb->handles[0]) {
           BOOST_LOG(error) << "Couldn't get handle for DRM Framebuffer ["sv << plane->fb_id << "]: Probably not permitted"sv;
-          return capture_e::error;
+          return capture_e::capture_error;
         }
 
         for (int y = 0; y < 4; ++y) {
@@ -1571,7 +1695,7 @@ namespace platf {
           file[y] = card.handleFD(fb->handles[y]);
           if (file[y].el < 0) {
             BOOST_LOG(error) << "Couldn't get primary file descriptor for Framebuffer ["sv << fb->fb_id << "]: "sv << strerror(errno);
-            return capture_e::error;
+            return capture_e::capture_error;
           }
 
           sd->fds[y] = file[y].el;
@@ -1604,6 +1728,8 @@ namespace platf {
       int img_height;  ///< Img height.
       int img_offset_x;  ///< Img offset x.
       int img_offset_y;  ///< Img offset y.
+
+      kms::empty_plane_timer_t empty_plane_timer {250ms};  ///< Reinitializes capture once the captured plane stays empty.
 
       int plane_id;  ///< Plane ID.
       int crtc_id;  ///< Crtc ID.
@@ -1670,7 +1796,17 @@ namespace platf {
         return 0;
       }
 
+      /**
+       * @brief Capture KMS frames until capture stops or the display needs reinitialization.
+       *
+       * @param push_captured_image_cb Callback receiving a captured image or a capture timeout.
+       * @param pull_free_image_cb Callback providing an available image buffer.
+       * @param cursor Whether the cursor should be included in the captured image.
+       * @return Final capture status reported to the streaming pipeline.
+       */
       capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+        using enum platf::capture_e;
+
         auto next_frame = std::chrono::steady_clock::now();
 
         sleep_overshoot_logger.reset();
@@ -1681,18 +1817,18 @@ namespace platf {
           std::shared_ptr<platf::img_t> img_out;
           auto status = snapshot(pull_free_image_cb, img_out, 1000ms, *cursor);
           switch (status) {
-            case platf::capture_e::reinit:
-            case platf::capture_e::error:
-            case platf::capture_e::interrupted:
+            case reinit:
+            case capture_error:
+            case interrupted:
               return status;
-            case platf::capture_e::timeout:
+            case timeout:
               if (!push_captured_image_cb(std::move(img_out), false)) {
-                return platf::capture_e::ok;
+                return ok;
               }
               break;
-            case platf::capture_e::ok:
+            case ok:
               if (!push_captured_image_cb(std::move(img_out), true)) {
-                return platf::capture_e::ok;
+                return ok;
               }
               break;
             default:
@@ -1701,7 +1837,7 @@ namespace platf {
           }
         }
 
-        return capture_e::ok;
+        return ok;
       }
 
       /**
@@ -1789,12 +1925,12 @@ namespace platf {
        * @return Capture status reported to the streaming pipeline.
        */
       capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor) {
-        file_t fb_fd[4];
+        std::array<file_t, 4> fb_fd;
 
         egl::surface_descriptor_t sd;
 
         std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
-        auto status = refresh(fb_fd, &sd, frame_timestamp);
+        auto status = refresh(fb_fd.data(), &sd, frame_timestamp);
         if (status != capture_e::ok) {
           return status;
         }
@@ -1802,7 +1938,7 @@ namespace platf {
         auto rgb_opt = egl::import_source(display.get(), sd);
 
         if (!rgb_opt) {
-          return capture_e::error;
+          return capture_e::capture_error;
         }
 
         auto &rgb = *rgb_opt;
@@ -1920,7 +2056,7 @@ namespace platf {
         img->pixel_pitch = 4;
 
         img->sequence = 0;
-        std::fill_n(img->sd.fds, 4, -1);
+        img->sd.fds.fill(-1);
 
         return img;
       }
@@ -1936,7 +2072,17 @@ namespace platf {
         return 0;
       }
 
+      /**
+       * @brief Capture KMS frames until capture stops or the display needs reinitialization.
+       *
+       * @param push_captured_image_cb Callback receiving a captured image or a capture timeout.
+       * @param pull_free_image_cb Callback providing an available image buffer.
+       * @param cursor Whether the cursor should be included in the captured image.
+       * @return Final capture status reported to the streaming pipeline.
+       */
       capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) {
+        using enum platf::capture_e;
+
         auto next_frame = std::chrono::steady_clock::now();
 
         sleep_overshoot_logger.reset();
@@ -1947,18 +2093,18 @@ namespace platf {
           std::shared_ptr<platf::img_t> img_out;
           auto status = snapshot(pull_free_image_cb, img_out, 1000ms, *cursor);
           switch (status) {
-            case platf::capture_e::reinit:
-            case platf::capture_e::error:
-            case platf::capture_e::interrupted:
+            case reinit:
+            case capture_error:
+            case interrupted:
               return status;
-            case platf::capture_e::timeout:
+            case timeout:
               if (!push_captured_image_cb(std::move(img_out), false)) {
-                return platf::capture_e::ok;
+                return ok;
               }
               break;
-            case platf::capture_e::ok:
+            case ok:
               if (!push_captured_image_cb(std::move(img_out), true)) {
-                return platf::capture_e::ok;
+                return ok;
               }
               break;
             default:
@@ -1967,7 +2113,7 @@ namespace platf {
           }
         }
 
-        return capture_e::ok;
+        return ok;
       }
 
       /**
@@ -1979,7 +2125,7 @@ namespace platf {
        * @return Capture status reported to the streaming pipeline.
        */
       capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds /* timeout */, bool cursor) {
-        file_t fb_fd[4];
+        std::array<file_t, 4> fb_fd;
 
         if (!pull_free_image_cb(img_out)) {
           return platf::capture_e::interrupted;
@@ -1987,7 +2133,7 @@ namespace platf {
         auto img = (egl::img_descriptor_t *) img_out.get();
         img->reset();
 
-        auto status = refresh(fb_fd, &img->sd, img->frame_timestamp);
+        auto status = refresh(fb_fd.data(), &img->sd, img->frame_timestamp);
         if (status != capture_e::ok) {
           return status;
         }

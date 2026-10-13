@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -123,8 +124,8 @@ namespace nvhttp {
 
         if (!ec) {
           boost::asio::ip::tcp::no_delay option(true);
-          SimpleWeb::error_code ec;
-          session->connection->socket->lowest_layer().set_option(option, ec);
+          SimpleWeb::error_code option_error;
+          session->connection->socket->lowest_layer().set_option(option, option_error);
 
           session->connection->set_timeout(config.timeout_request);
           session->connection->socket->async_handshake(boost::asio::ssl::stream_base::server, [this, session](const SimpleWeb::error_code &ec) {
@@ -523,8 +524,8 @@ namespace nvhttp {
     launch_session->client_name = last_verified_client_name;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
-    unsigned char raw_payload[8];
-    RAND_bytes(raw_payload, sizeof(raw_payload));
+    std::array<unsigned char, 8> raw_payload;
+    RAND_bytes(raw_payload.data(), raw_payload.size());
     launch_session->av_ping_payload = util::hex_vec(raw_payload);
     RAND_bytes((unsigned char *) &launch_session->control_connect_data, sizeof(launch_session->control_connect_data));
 
@@ -1862,11 +1863,11 @@ namespace nvhttp {
       int verified = 0;
 
       auto fg = util::fail_guard([&]() {
-        char subject_name[256];
+        std::array<char, 256> subject_name;
 
-        X509_NAME_oneline(X509_get_subject_name(x509.get()), subject_name, sizeof(subject_name));
+        X509_NAME_oneline(X509_get_subject_name(x509.get()), subject_name.data(), subject_name.size());
 
-        BOOST_LOG(debug) << subject_name << " -- "sv << (verified ? "verified"sv : "denied"sv);
+        BOOST_LOG(debug) << subject_name.data() << " -- "sv << (verified ? "verified"sv : "denied"sv);
       });
 
       std::lock_guard lock {client_auth_mutex()};
@@ -1941,11 +1942,11 @@ namespace nvhttp {
     http_server.config.address = net::get_bind_address(address_family);
     http_server.config.port = port_http;
 
-    auto accept_and_run = [&](auto *http_server) {
+    auto accept_and_run = [&](auto *web_server) {
       try {
-        std::string name = "nvhttp::" + std::to_string(http_server->config.port);
+        std::string name = "nvhttp::" + std::to_string(web_server->config.port);
         platf::set_thread_name(name);
-        http_server->start();
+        web_server->start();
       } catch (boost::system::system_error &err) {
         // It's possible the exception gets thrown after calling http_server->stop() from a different thread
         if (shutdown_event->peek()) {

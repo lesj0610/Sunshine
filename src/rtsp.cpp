@@ -97,17 +97,20 @@ namespace rtsp_stream {
     std::uint32_t sequenceNumber;  ///< Sequence number.
 
     // This field is the AES GCM authentication tag
-    std::uint8_t tag[16];  ///< Authentication tag appended to the encrypted payload.
+    std::array<std::uint8_t, 16> tag;  ///< Authentication tag appended to the encrypted payload.
   };
 
 #pragma pack(pop)
+
+  static_assert(sizeof(encrypted_rtsp_header_t) == 24);
+  static_assert(offsetof(encrypted_rtsp_header_t, tag) == 8);
 
   class rtsp_server_t;
 
   /**
    * @brief Owning pointer for an RTSP message allocated by moonlight-common-c.
    */
-  using msg_t = util::safe_ptr<RTSP_MESSAGE, free_msg>;
+  using msg_t = util::safe_ptr<RTSP_MESSAGE, &free_msg>;
   /**
    * @brief RTSP command handler signature used by the server dispatch table.
    */
@@ -279,7 +282,7 @@ namespace rtsp_stream {
       iv[11] = 'R';  // RTSP
 
       std::vector<uint8_t> plaintext;
-      if (socket->session->rtsp_cipher->decrypt(std::string_view {(const char *) header->tag, sizeof(header->tag) + bytes}, plaintext, &iv)) {
+      if (socket->session->rtsp_cipher->decrypt(std::string_view {(const char *) header->tag.data(), sizeof(header->tag) + bytes}, plaintext, &iv)) {
         BOOST_LOG(error) << "Failed to verify RTSP message tag"sv;
 
         respond(socket->sock, *socket->session, nullptr, 400, "BAD REQUEST", 0, {});
@@ -409,11 +412,11 @@ namespace rtsp_stream {
       if (ec) {
         BOOST_LOG(error) << "RTSP: handle_read_plaintext(): Couldn't read from tcp socket: "sv << ec.message();
 
-        boost::system::error_code ec;
-        socket->sock.close(ec);
+        boost::system::error_code close_error;
+        socket->sock.close(close_error);
 
-        if (ec) {
-          BOOST_LOG(error) << "RTSP: handle_read_plaintext(): Couldn't close tcp socket: "sv << ec.message();
+        if (close_error) {
+          BOOST_LOG(error) << "RTSP: handle_read_plaintext(): Couldn't close tcp socket: "sv << close_error.message();
         }
 
         return;
@@ -565,8 +568,8 @@ namespace rtsp_stream {
         BOOST_LOG(debug) << "No pending session for incoming RTSP connection"sv;
 
         // If there is no session pending, close the connection immediately
-        boost::system::error_code ec;
-        socket->sock.close(ec);
+        boost::system::error_code close_error;
+        socket->sock.close(close_error);
       }
 
       // Queue another asynchronous accept for the next incoming connection
@@ -955,7 +958,7 @@ namespace rtsp_stream {
       header->sequenceNumber = util::endian::big<std::uint32_t>(session.rtsp_iv_counter);
 
       // Encrypt the RTSP message in place
-      session.rtsp_cipher->encrypt(std::string_view {(const char *) header->payload(), (std::size_t) payload_length}, header->tag, &iv);
+      session.rtsp_cipher->encrypt(std::string_view {(const char *) header->payload(), (std::size_t) payload_length}, header->tag.data(), &iv);
 
       // Send the full encrypted message
       send(sock, std::string_view {(char *) message.data(), message.size()});
@@ -992,12 +995,12 @@ namespace rtsp_stream {
   /**
    * @brief Handle RTSP OPTIONS requests.
    *
-   * @param server RTSP server instance handling the request.
+   * @param rtsp_server RTSP server instance handling the request.
    * @param sock Socket used to read or write the protocol message.
    * @param session Active streaming or pairing session for the request.
    * @param req Parsed RTSP request being handled.
    */
-  void cmd_option(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+  void cmd_option(rtsp_server_t *rtsp_server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
     OPTION_ITEM option {};
 
     // I know these string literals will not be modified
@@ -1012,12 +1015,12 @@ namespace rtsp_stream {
   /**
    * @brief Handle RTSP DESCRIBE requests.
    *
-   * @param server RTSP server instance.
+   * @param rtsp_server RTSP server instance.
    * @param sock Client socket.
    * @param session Launch session.
    * @param req RTSP request message.
    */
-  void cmd_describe(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+  void cmd_describe(rtsp_server_t *rtsp_server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
     OPTION_ITEM option {};
 
     // I know these string literals will not be modified
@@ -1076,7 +1079,7 @@ namespace rtsp_stream {
 
     for (int x = 0; x < audio::MAX_STREAM_CONFIG; ++x) {
       auto &stream_config = audio::stream_configs[x];
-      std::uint8_t mapping[platf::speaker::MAX_SPEAKERS];
+      std::array<std::uint8_t, platf::speaker::MAX_SPEAKERS> mapping;
 
       auto mapping_p = stream_config.mapping;
 
@@ -1086,10 +1089,10 @@ namespace rtsp_stream {
        * To work around this, rotate channels to the left from index '3'
        */
       if (x == audio::SURROUND51 || x == audio::SURROUND71) {
-        std::copy_n(mapping_p, stream_config.channelCount, mapping);
-        std::rotate(mapping + 3, mapping + 4, mapping + audio::MAX_STREAM_CONFIG);
+        std::copy_n(mapping_p, stream_config.channelCount, mapping.begin());
+        std::rotate(mapping.begin() + 3, mapping.begin() + 4, mapping.begin() + audio::MAX_STREAM_CONFIG);
 
-        mapping_p = mapping;
+        mapping_p = mapping.data();
       }
 
       ss << "a=fmtp:97 surround-params="sv << stream_config.channelCount << stream_config.streams << stream_config.coupledStreams;
@@ -1107,13 +1110,13 @@ namespace rtsp_stream {
   /**
    * @brief Handle RTSP SETUP requests and prepare transport state.
    *
-   * @param server RTSP server instance handling the request.
+   * @param rtsp_server RTSP server instance handling the request.
    * @param sock Socket used to read or write the protocol message.
    * @param session Active streaming or pairing session for the request.
    * @param req Parsed RTSP request being handled.
    */
-  void cmd_setup(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
-    OPTION_ITEM options[4] {};
+  void cmd_setup(rtsp_server_t *rtsp_server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+    std::array<OPTION_ITEM, 4> options {};
 
     auto &seqn = options[0];
     auto &session_option = options[1];
@@ -1174,12 +1177,12 @@ namespace rtsp_stream {
   /**
    * @brief Handle RTSP ANNOUNCE requests from the client.
    *
-   * @param server RTSP server instance handling the request.
+   * @param rtsp_server RTSP server instance handling the request.
    * @param sock Socket used to read or write the protocol message.
    * @param session Active streaming or pairing session for the request.
    * @param req Parsed RTSP request being handled.
    */
-  void cmd_announce(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+  void cmd_announce(rtsp_server_t *rtsp_server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
     OPTION_ITEM option {};
 
     // I know these string literals will not be modified
@@ -1323,9 +1326,9 @@ namespace rtsp_stream {
     // in the RTSP message matches a local interface's IP address. Fortunately, Moonlight always sends
     // 0.0.0.0 when it wants low quality, so it is easy to check without enumerating interfaces.
     if (config.audio.channels == 2) {
-      for (auto option = req->options; option != nullptr; option = option->next) {
-        if ("Host"sv == option->option) {
-          std::string_view content {option->content};
+      for (auto request_option = req->options; request_option != nullptr; request_option = request_option->next) {
+        if ("Host"sv == request_option->option) {
+          std::string_view content {request_option->content};
           BOOST_LOG(debug) << "Found Host: "sv << content;
           config.audio.flags[audio::config_t::HIGH_QUALITY] = (content.find("0.0.0.0"sv) == std::string::npos);
         }
@@ -1416,12 +1419,12 @@ namespace rtsp_stream {
     }
 
     auto stream_session = stream::session::alloc(config, session);
-    server->insert(stream_session);
+    rtsp_server->insert(stream_session);
 
     if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
-      server->remove(stream_session);
+      rtsp_server->remove(stream_session);
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
       return;
     }
@@ -1432,12 +1435,12 @@ namespace rtsp_stream {
   /**
    * @brief Handle RTSP PLAY requests and start streaming.
    *
-   * @param server RTSP server instance handling the request.
+   * @param rtsp_server RTSP server instance handling the request.
    * @param sock Socket used to read or write the protocol message.
    * @param session Active streaming or pairing session for the request.
    * @param req Parsed RTSP request being handled.
    */
-  void cmd_play(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+  void cmd_play(rtsp_server_t *rtsp_server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
     OPTION_ITEM option {};
 
     // I know these string literals will not be modified

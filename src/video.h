@@ -213,21 +213,21 @@ namespace video {
   void free_buffer(AVBufferRef *ref);
 
   /**
-   * @brief Owning pointer for an FFmpeg codec context.
+   * @brief Owning pointer for an FFmpeg codec context released with free_ctx().
    */
-  using avcodec_ctx_t = util::safe_ptr<AVCodecContext, free_ctx>;
+  using avcodec_ctx_t = util::safe_ptr<AVCodecContext, &free_ctx>;
   /**
-   * @brief Owning pointer for an FFmpeg frame.
+   * @brief Owning pointer for an FFmpeg frame released with free_frame().
    */
-  using avcodec_frame_t = util::safe_ptr<AVFrame, free_frame>;
+  using avcodec_frame_t = util::safe_ptr<AVFrame, &free_frame>;
   /**
-   * @brief Owning pointer for an FFmpeg buffer reference.
+   * @brief Owning pointer for an FFmpeg buffer reference released with free_buffer().
    */
-  using avcodec_buffer_t = util::safe_ptr<AVBufferRef, free_buffer>;
+  using avcodec_buffer_t = util::safe_ptr<AVBufferRef, &free_buffer>;
   /**
-   * @brief Owning pointer for an FFmpeg software-scaling context.
+   * @brief Owning pointer for an FFmpeg software-scaling context released with sws_freeContext().
    */
-  using sws_t = util::safe_ptr<SwsContext, sws_freeContext>;
+  using sws_t = util::safe_ptr<SwsContext, &sws_freeContext>;
   /**
    * @brief Shared event that transports captured images between capture and encode threads.
    */
@@ -377,24 +377,24 @@ namespace video {
     /**
      * @brief Construct NVENC platform format mappings.
      *
-     * @param dev_type Platform memory type.
-     * @param pix_fmt_8bit Platform 8-bit pixel format.
-     * @param pix_fmt_10bit Platform 10-bit pixel format.
-     * @param pix_fmt_yuv444_8bit Platform 8-bit YUV444 pixel format.
-     * @param pix_fmt_yuv444_10bit Platform 10-bit YUV444 pixel format.
+     * @param device_type Platform memory type.
+     * @param format_8bit Platform 8-bit pixel format.
+     * @param format_10bit Platform 10-bit pixel format.
+     * @param format_yuv444_8bit Platform 8-bit YUV444 pixel format.
+     * @param format_yuv444_10bit Platform 10-bit YUV444 pixel format.
      */
     encoder_platform_formats_nvenc(
-      const platf::mem_type_e &dev_type,
-      const platf::pix_fmt_e &pix_fmt_8bit,
-      const platf::pix_fmt_e &pix_fmt_10bit,
-      const platf::pix_fmt_e &pix_fmt_yuv444_8bit,
-      const platf::pix_fmt_e &pix_fmt_yuv444_10bit
+      const platf::mem_type_e &device_type,
+      const platf::pix_fmt_e &format_8bit,
+      const platf::pix_fmt_e &format_10bit,
+      const platf::pix_fmt_e &format_yuv444_8bit,
+      const platf::pix_fmt_e &format_yuv444_10bit
     ) {
-      encoder_platform_formats_t::dev_type = dev_type;
-      encoder_platform_formats_t::pix_fmt_8bit = pix_fmt_8bit;
-      encoder_platform_formats_t::pix_fmt_10bit = pix_fmt_10bit;
-      encoder_platform_formats_t::pix_fmt_yuv444_8bit = pix_fmt_yuv444_8bit;
-      encoder_platform_formats_t::pix_fmt_yuv444_10bit = pix_fmt_yuv444_10bit;
+      encoder_platform_formats_t::dev_type = device_type;
+      encoder_platform_formats_t::pix_fmt_8bit = format_8bit;
+      encoder_platform_formats_t::pix_fmt_10bit = format_10bit;
+      encoder_platform_formats_t::pix_fmt_yuv444_8bit = format_yuv444_8bit;
+      encoder_platform_formats_t::pix_fmt_yuv444_10bit = format_yuv444_10bit;
     }
   };
 

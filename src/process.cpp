@@ -5,6 +5,7 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <array>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -63,7 +64,7 @@ namespace proc {
     return std::make_unique<deinit_t>();
   }
 
-  void terminate_process_group(boost::process::v1::child &proc, boost::process::v1::group &group, std::chrono::seconds exit_timeout) {
+  void terminate_process_group(boost::process::v1::child &child_process, boost::process::v1::group &group, std::chrono::seconds exit_timeout) {
     if (group.valid() && platf::process_group_running((std::uintptr_t) group.native_handle())) {
       if (exit_timeout.count() > 0) {
         // Request processes in the group to exit gracefully
@@ -95,9 +96,9 @@ namespace proc {
       group.detach();
     }
 
-    if (proc.valid()) {
+    if (child_process.valid()) {
       // avoid zombie process
-      proc.detach();
+      child_process.detach();
     }
   }
 
@@ -629,18 +630,18 @@ namespace proc {
     }
 
     // Read file and update calculated SHA
-    char buf[1024 * 16];
+    std::array<char, 1024 * 16> buf;
     std::ifstream file(filename, std::ifstream::binary);
     while (file.good()) {
-      file.read(buf, sizeof(buf));
-      if (!EVP_DigestUpdate(ctx.get(), buf, file.gcount())) {
+      file.read(buf.data(), buf.size());
+      if (!EVP_DigestUpdate(ctx.get(), buf.data(), file.gcount())) {
         return std::nullopt;
       }
     }
     file.close();
 
-    unsigned char result[SHA256_DIGEST_LENGTH];
-    if (!EVP_DigestFinal_ex(ctx.get(), result, nullptr)) {
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> result;
+    if (!EVP_DigestFinal_ex(ctx.get(), result.data(), nullptr)) {
       return std::nullopt;
     }
 
