@@ -499,7 +499,7 @@ namespace virtual_display {
       static GUID to_guid(const uuid_util::uuid_t &id) {
         GUID guid {};
         static_assert(sizeof(guid) == sizeof(id.b8), "A GUID and a UUID must be the same 16 bytes");
-        std::memcpy(&guid, id.b8, sizeof(guid));
+        std::memcpy(&guid, id.b8.data(), sizeof(guid));
         return guid;
       }
 
