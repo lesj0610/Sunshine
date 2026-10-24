@@ -228,12 +228,10 @@ namespace input {
    * @brief Per-client gamepad slot and feedback state.
    */
   struct gamepad_t {
-    gamepad_t():
-        gamepad_state {},
-        back_timeout_id {},
-        id {-1},
-        back_button_state {button_state_e::NONE} {
-    }
+    /**
+     * @brief Initialize an unassigned gamepad slot with no pending button timeout.
+     */
+    gamepad_t() = default;
 
     ~gamepad_t() {
       if (id >= 0) {
@@ -247,18 +245,18 @@ namespace input {
       }
     }
 
-    platf::gamepad_state_t gamepad_state;  ///< Gamepad state.
+    platf::gamepad_state_t gamepad_state {};  ///< Gamepad state.
 
-    thread_pool_util::ThreadPool::task_id_t back_timeout_id;  ///< Back timeout ID.
+    thread_pool_util::ThreadPool::task_id_t back_timeout_id {};  ///< Back timeout ID.
 
-    int id;  ///< Global gamepad slot assigned to this client controller.
+    int id {-1};  ///< Global gamepad slot assigned to this client controller, or -1 when unassigned.
 
     // When emulating the HOME button, we may need to artificially release the back button.
     // Afterwards, the gamepad state on sunshine won't match the state on Moonlight.
     // To prevent Sunshine from sending erroneous input data to the active application,
     // Sunshine forces the button to be in a specific state until the gamepad state matches that of
     // Moonlight once more.
-    button_state_e back_button_state;  ///< Back button state.
+    button_state_e back_button_state {button_state_e::NONE};  ///< Back button state.
   };
 
   /**
@@ -294,7 +292,7 @@ namespace input {
     };
 
     /**
-     * @brief Construct input state from the mailbox and platform backend.
+     * @brief Construct input state with default controller slots and scroll accumulators.
      *
      * @param touch_port_event Event carrying the active touch port.
      * @param feedback_queue Queue used for controller feedback.
@@ -303,26 +301,19 @@ namespace input {
       safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event,
       platf::feedback_queue_t feedback_queue
     ):
-        shortcutFlags {},
-        gamepads(MAX_GAMEPADS),
-        client_context {platf::allocate_client_input_context(platf_input)},
         touch_port_event {std::move(touch_port_event)},
-        feedback_queue {std::move(feedback_queue)},
-        mouse_left_button_timeout {},
-        touch_port {{0, 0, 0, 0, 0, 0}, 0, 0, 0.0f, 0.0f, 1.0f, 1.0f, 0, 0},
-        accumulated_vscroll_delta {},
-        accumulated_hscroll_delta {} {
+        feedback_queue {std::move(feedback_queue)} {
     }
 
     // Keep track of alt+ctrl+shift key combo
-    int shortcutFlags;  ///< Shortcut flags.
+    int shortcutFlags {};  ///< Shortcut flags.
 
     modifier_state_t shift_keys;  ///< Client Shift keys contributing to the aggregate Shift flag.
     modifier_state_t control_keys;  ///< Client Control keys contributing to the aggregate Control flag.
     modifier_state_t alt_keys;  ///< Client Alt keys contributing to the aggregate Alt flag.
 
-    std::vector<gamepad_t> gamepads;  ///< Virtual gamepad slots tracked for the stream.
-    std::unique_ptr<platf::client_input_t> client_context;  ///< Client context.
+    std::vector<gamepad_t> gamepads {MAX_GAMEPADS};  ///< Virtual gamepad slots tracked for the stream.
+    std::unique_ptr<platf::client_input_t> client_context {platf::allocate_client_input_context(platf_input)};  ///< Client context.
 
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
@@ -331,12 +322,12 @@ namespace input {
     std::mutex input_queue_lock;  ///< Input queue lock.
     bool input_task_scheduled {};  ///< Whether one worker task owns packet dispatch for this stream; guarded by input_queue_lock.
 
-    thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;  ///< Mouse left button timeout.
+    thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout {};  ///< Mouse left button timeout.
 
-    input::touch_port_t touch_port;  ///< Touch coordinate bounds for the current stream.
+    input::touch_port_t touch_port {{0, 0, 0, 0, 0, 0}, 0, 0, 0.0f, 0.0f, 1.0f, 1.0f, 0, 0};  ///< Touch coordinate bounds for the current stream.
 
-    int32_t accumulated_vscroll_delta;  ///< Accumulated vscroll delta.
-    int32_t accumulated_hscroll_delta;  ///< Accumulated hscroll delta.
+    int32_t accumulated_vscroll_delta {};  ///< Accumulated vscroll delta.
+    int32_t accumulated_hscroll_delta {};  ///< Accumulated hscroll delta.
   };
 
   /**
@@ -686,10 +677,12 @@ namespace input {
   }
 
   /**
-   * @brief Write a debug log representation of the input packet.
+   * @brief Decode the input header and log the matching packet representation.
+   *
+   * @param payload Header at the start of the input packet.
    */
-  void print(void *payload) {
-    auto header = (PNV_INPUT_HEADER) payload;
+  void print(PNV_INPUT_HEADER payload) {
+    auto header = payload;
 
     switch (util::endian::little(header->magic)) {
       case MOUSE_MOVE_REL_MAGIC_GEN5:
@@ -956,9 +949,8 @@ namespace input {
      * when the last mouse coordinates were absolute
      */
     if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
-      auto f = [=]() {
-        auto left_released = mouse_press[BUTTON_LEFT];
-        if (left_released) {
+      auto f = [input, release]() {
+        if (auto left_released = mouse_press[BUTTON_LEFT]; left_released) {
           // Already released left button
           return;
         }
@@ -994,8 +986,7 @@ namespace input {
    * @return Remapped keycode when configured, otherwise the original keycode.
    */
   short map_keycode(short keycode) {
-    auto it = config::input.keybindings.find(keycode);
-    if (it != std::end(config::input.keybindings)) {
+    if (auto it = config::input.keybindings.find(keycode); it != std::end(config::input.keybindings)) {
       return it->second;
     }
 
@@ -1142,23 +1133,23 @@ namespace input {
    * @param key_code Moonlight keyboard packet key code.
    * @param release Whether the key or button event is a release.
    * @param flags Bit flags that modify the requested operation.
-   * @param synthetic_modifiers Synthetic modifiers.
+   * @param synthetic_modifiers Byte mask of modifiers to press around the key event.
    * @param extended Whether the client identified an extended key.
    */
-  void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, uint8_t synthetic_modifiers, bool extended) {
+  void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, std::byte synthetic_modifiers, bool extended) {
     // The LANG bits identify one specific physical key. A synthesized modifier is
     // a different key, so it must not inherit them.
     const auto modifier_flags = platf::keyboard::without_lang_flags(flags);
 
     if (!release) {
       // Press any synthetic modifiers required for this key
-      if (synthetic_modifiers & MODIFIER_SHIFT) {
+      if ((synthetic_modifiers & std::byte {MODIFIER_SHIFT}) != std::byte {0}) {
         emit_keyboard_update(VKEY_SHIFT, false, modifier_flags);
       }
-      if (synthetic_modifiers & MODIFIER_CTRL) {
+      if ((synthetic_modifiers & std::byte {MODIFIER_CTRL}) != std::byte {0}) {
         emit_keyboard_update(VKEY_CONTROL, false, modifier_flags);
       }
-      if (synthetic_modifiers & MODIFIER_ALT) {
+      if ((synthetic_modifiers & std::byte {MODIFIER_ALT}) != std::byte {0}) {
         emit_keyboard_update(VKEY_MENU, false, modifier_flags);
       }
     }
@@ -1167,13 +1158,13 @@ namespace input {
 
     if (!release) {
       // Raise any synthetic modifier keys we pressed
-      if (synthetic_modifiers & MODIFIER_SHIFT) {
+      if ((synthetic_modifiers & std::byte {MODIFIER_SHIFT}) != std::byte {0}) {
         emit_keyboard_update(VKEY_SHIFT, true, modifier_flags);
       }
-      if (synthetic_modifiers & MODIFIER_CTRL) {
+      if ((synthetic_modifiers & std::byte {MODIFIER_CTRL}) != std::byte {0}) {
         emit_keyboard_update(VKEY_CONTROL, true, modifier_flags);
       }
-      if (synthetic_modifiers & MODIFIER_ALT) {
+      if ((synthetic_modifiers & std::byte {MODIFIER_ALT}) != std::byte {0}) {
         emit_keyboard_update(VKEY_MENU, true, modifier_flags);
       }
     }
@@ -1184,9 +1175,9 @@ namespace input {
    *
    * @param key_code Moonlight keyboard packet key code.
    * @param flags Bit flags that modify the requested operation.
-   * @param synthetic_modifiers Synthetic modifiers.
+   * @param synthetic_modifiers Byte mask of modifiers to press around the repeated key event.
    */
-  void repeat_key(uint16_t key_code, uint8_t flags, uint8_t synthetic_modifiers) {
+  void repeat_key(uint16_t key_code, uint8_t flags, std::byte synthetic_modifiers) {
     // If key no longer pressed, stop repeating
     const auto state = key_press[make_kpid(key_code, flags)];
     if (!state.pressed) {
@@ -1237,16 +1228,16 @@ namespace input {
 
     // Set synthetic modifier flags if the keyboard packet is requesting modifier
     // keys that are not current pressed.
-    uint8_t synthetic_modifiers = 0;
+    std::byte synthetic_modifiers {0};
     if (!release && !is_modifier(keyCode)) {
       if (!(input->shortcutFlags & input_t::SHIFT) && (modifiers & MODIFIER_SHIFT)) {
-        synthetic_modifiers |= MODIFIER_SHIFT;
+        synthetic_modifiers |= std::byte {MODIFIER_SHIFT};
       }
       if (!(input->shortcutFlags & input_t::CTRL) && (modifiers & MODIFIER_CTRL)) {
-        synthetic_modifiers |= MODIFIER_CTRL;
+        synthetic_modifiers |= std::byte {MODIFIER_CTRL};
       }
       if (!(input->shortcutFlags & input_t::ALT) && (modifiers & MODIFIER_ALT)) {
-        synthetic_modifiers |= MODIFIER_ALT;
+        synthetic_modifiers |= std::byte {MODIFIER_ALT};
       }
     }
 
@@ -1350,7 +1341,7 @@ namespace input {
   }
 
   /**
-   * @brief Allocate a virtual gamepad for a client-relative controller slot.
+   * @brief Allocate a virtual gamepad or refresh feedback after a retained controller arrives.
    *
    * @param input Stream input state.
    * @param client_index Client-relative controller index.
@@ -1365,7 +1356,14 @@ namespace input {
 
     auto &gamepad = input->gamepads[client_index];
     if (gamepad.id >= 0) {
-      BOOST_LOG(warning) << "ControllerNumber already allocated ["sv << client_index << ']';
+      // Resume-time motion requests can arrive before the client assigns this
+      // controller slot. Replay them after its arrival, without recreating the
+      // virtual device, and clear feedback deduplication for the ready client.
+      if (platf::rebind_gamepad(platf_input, {gamepad.id, static_cast<std::uint8_t>(client_index)}, input->feedback_queue) != 0) {
+        BOOST_LOG(warning) << "Failed to rebind retained controller ["sv << client_index << ']';
+        return -1;
+      }
+      BOOST_LOG(info) << "Rebound retained controller feedback after arrival ["sv << client_index << ']';
       return gamepad.id;
     }
 
@@ -2140,7 +2138,7 @@ namespace input {
     // the input to the OS. This avoids potentially lengthy lock contention
     // in the control stream thread while input is being processed by the OS.
     {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
+      std::scoped_lock lg(input->input_queue_lock);
 
       // If all entries have already been processed, nothing to do
       if (input->input_queue.empty()) {
@@ -2174,7 +2172,7 @@ namespace input {
     }
 
     // Print the final input packet
-    input::print((void *) payload);
+    input::print(payload);
 
 #ifdef SUNSHINE_TESTS
     if (const auto &hook = input_packet_hook(); hook) {

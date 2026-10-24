@@ -5,9 +5,11 @@
 // standard includes
 #include <array>
 #include <bitset>
+#include <cctype>
 #include <fcntl.h>
 #include <filesystem>
 #include <thread>
+#include <utility>
 
 // lib includes
 #include <ffnvcodec/dynlink_loader.h>
@@ -170,7 +172,7 @@ namespace cuda {
         return -1;
       }
 
-      data = (void *) 0x1;
+      hardware = true;
 
       width = in_width;
       height = in_height;
@@ -347,6 +349,73 @@ namespace cuda {
     }
   };
 
+  namespace {
+    bool cuda_is_initialized() {
+      return static_cast<bool>(cdf);
+    }
+
+    CUresult cuda_get_device(CUdevice *device, int index) {
+      return cdf->cuDeviceGet(device, index);
+    }
+
+    CUresult cuda_get_pci_bus_id(char *pci_bus_id, int len, CUdevice device) {
+      return cdf->cuDeviceGetPCIBusId(pci_bus_id, len, device);
+    }
+
+    const cuda_pci_accessors_t cuda_pci_accessors {
+      .is_initialized = cuda_is_initialized,
+      .initialize = init,
+      .get_device = cuda_get_device,
+      .get_pci_bus_id = cuda_get_pci_bus_id,
+    };
+  }  // namespace
+
+  /**
+   * @brief Query the PCI bus id of a CUDA device.
+   * @param index CUDA device index to query.
+   * @return Lowercase PCI bus id (e.g. "00000000:0f:00.0"), or no value when
+   *         CUDA is unavailable or the query fails.
+   */
+  std::optional<std::string> device_pci_bus_id(int index) {
+    return device_pci_bus_id(index, cuda_pci_accessors);
+  }
+
+  /**
+   * @brief Query the PCI bus id of a CUDA device with injected driver operations.
+   * @param index CUDA device index to query.
+   * @param accessors Driver operations used to initialize CUDA and query the device.
+   * @return Lowercase PCI bus id (e.g. "00000000:0f:00.0"), or no value when
+   *         CUDA is unavailable or the query fails.
+   */
+  std::optional<std::string> device_pci_bus_id(int index, const cuda_pci_accessors_t &accessors) {
+    if (!accessors.is_initialized() && accessors.initialize() != 0) {
+      return std::nullopt;
+    }
+
+    CUdevice device;
+    const auto device_status = accessors.get_device(&device, index);
+    if (device_status != CUDA_SUCCESS) {
+      BOOST_LOG(error) << "Couldn't get CUDA device: "sv << device_status;
+      return std::nullopt;
+    }
+
+    // Room for both the legacy "DDDDDDDD:BB:DD.F" rendering and the short
+    // "DDDD:BB:DD.F" form current drivers return, plus NUL.
+    std::array<char, 32> pci_bus_id {};
+    const auto bus_id_status = accessors.get_pci_bus_id(pci_bus_id.data(), pci_bus_id.size(), device);
+    if (bus_id_status != CUDA_SUCCESS) {
+      BOOST_LOG(error) << "Couldn't get CUDA device PCI bus ID: "sv << bus_id_status;
+      return std::nullopt;
+    }
+
+    // Linux renders PCI addresses lowercase while CUDA uses uppercase.
+    std::string bus_id {pci_bus_id.data()};
+    std::transform(bus_id.begin(), bus_id.end(), bus_id.begin(), [](char c) {
+      return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    });
+    return bus_id;
+  }
+
   /**
    * @brief Opens the DRM device associated with the CUDA device index.
    * @param index CUDA device index to open.
@@ -363,7 +432,7 @@ namespace cuda {
     BOOST_LOG(debug) << "Found CUDA device with PCI bus ID: "sv << pci_bus_id.data();
 
     // Linux uses lowercase hexadecimal while CUDA uses uppercase
-    std::transform(pci_bus_id.begin(), pci_bus_id.end(), pci_bus_id.begin(), [](char c) {
+    std::ranges::transform(pci_bus_id, pci_bus_id.begin(), [](char c) {
       return std::tolower(c);
     });
 
@@ -418,7 +487,7 @@ namespace cuda {
      */
     int init(int in_width, int in_height, int in_offset_x, int in_offset_y) {
       // This must be non-zero to tell the video core that it's a hardware encoding device.
-      data = (void *) 0x1;
+      hardware = true;
 
       // TODO: Support more than one CUDA device
       file = std::move(open_drm_fd_for_cuda_device(0));
@@ -697,11 +766,16 @@ namespace cuda {
     static PNVFBCCREATEINSTANCE createInstance {};
     static NVFBC_API_FUNCTION_LIST func {.dwVersion = NVFBC_VERSION};
 
-    static constexpr inline NVFBC_BOOL nv_bool(bool b) {
+    /**
+     * @brief Convert a C++ boolean to the corresponding NvFBC flag.
+     * @param b Boolean state to convert.
+     * @return NVFBC_TRUE when b is true, otherwise NVFBC_FALSE.
+     */
+    static constexpr NVFBC_BOOL nv_bool(bool b) {
       return b ? NVFBC_TRUE : NVFBC_FALSE;
     }
 
-    static void *library_handle {nullptr};  ///< Loaded NvFBC library retained while its function table is in use.
+    static dyn::library_t *library_handle {nullptr};  ///< Loaded NvFBC library retained while its function table is in use.
 
     /**
      * @brief Load NvFBC and create the CUDA capture helper.
@@ -752,11 +826,11 @@ namespace cuda {
     class ctx_t {
     public:
       /**
-       * @brief Create an NvFBC session context for a native capture handle.
+       * @brief Explicitly create an NvFBC session context for a native capture handle.
        *
        * @param session_handle Native library or object handle used by the operation.
        */
-      ctx_t(NVFBC_SESSION_HANDLE session_handle) {
+      explicit ctx_t(NVFBC_SESSION_HANDLE session_handle) {
         NVFBC_BIND_CONTEXT_PARAMS params {NVFBC_BIND_CONTEXT_PARAMS_VER};
 
         if (func.nvFBCBindContext(session_handle, &params)) {
@@ -1063,7 +1137,7 @@ namespace cuda {
               }
               break;
             default:
-              BOOST_LOG(error) << "Unrecognized capture status ["sv << (int) status << ']';
+              BOOST_LOG(error) << "Unrecognized capture status ["sv << std::to_underlying(status) << ']';
               return status;
           }
         }
