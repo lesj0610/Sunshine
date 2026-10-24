@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <utility>
 
 namespace stream {
   using namespace std::literals;
@@ -27,6 +28,13 @@ namespace stream {
     constexpr double INCREASE = 1.15;  ///< Step up once the network keeps up.
     constexpr int FLOOR_PERCENT = 20;  ///< Lowest bitrate, as a share of the requested one.
     constexpr int MIN_FLOOR_KBPS = 1000;  ///< Lowest bitrate, however low the requested one.
+
+    /**
+     * @brief Whether an FEC block was sent after another.
+     */
+    bool sent_after(std::uint32_t block, std::uint32_t other) {
+      return static_cast<std::int32_t>(block - other) > 0;
+    }
   }  // namespace
 
   bitrate_controller_t::bitrate_controller_t(int max_kbps, clock::time_point now):
@@ -40,12 +48,43 @@ namespace stream {
       m_last_congestion {now} {
   }
 
-  void bitrate_controller_t::frame_received(int expected_packets, int missing_packets) {
-    if (expected_packets <= 0) {
+  void bitrate_controller_t::packets_sent(sent_t sent) {
+    m_sent_packets += static_cast<int>(sent.packets - m_sent.packets);
+    m_sent = sent;
+    if (m_pending_missing_packets && !sent_after(m_pending_block, m_sent.block)) {
+      m_missing_packets += std::exchange(m_pending_missing_packets, 0);
+    }
+  }
+
+  void bitrate_controller_t::frame_received(sent_t sent, std::uint32_t frame_index, int block_index, int expected_packets, int missing_packets) {
+    // Catching up first leaves the block still going out as the only one
+    // a report can be on that does not count as sent yet
+    packets_sent(sent);
+
+    const int missing {std::clamp(missing_packets, 0, std::max(expected_packets, 0))};
+    if (missing == 0) {
       return;
     }
-    m_expected_packets += expected_packets;
-    m_missing_packets += std::clamp(missing_packets, 0, expected_packets);
+    const auto block {block_id(frame_index, block_index)};
+    // A client can report a block it gave up on twice
+    if (std::exchange(m_last_reported_block, block) == block) {
+      return;
+    }
+    // A report can come in while the rest of its block is still going out,
+    // before the block counts as sent, so it waits to count with it. Blocks
+    // go out one at a time, so the reports that wait are all on that block.
+    // Reports on blocks sent at the end of a window come in the next one,
+    // and those on blocks sent before that are too late to tell anything.
+    if (sent_after(block, m_sent.block)) {
+      if (!m_pending_missing_packets || sent_after(block, m_pending_block)) {
+        m_pending_block = block;
+      }
+      m_pending_missing_packets += missing;
+    } else if (sent_after(block, m_window_block)) {
+      m_missing_packets += missing;
+    } else if (sent_after(block, m_previous_block)) {
+      m_previous_missing_packets += missing;
+    }
   }
 
   void bitrate_controller_t::frame_lost() {
@@ -65,17 +104,38 @@ namespace stream {
       // Starting a stream asks for a keyframe while the network settles,
       // which says nothing about whether it can carry the stream
       m_window_start = now;
-      m_expected_packets = m_missing_packets = m_lost_frames = 0;
+      m_window_block = m_previous_block = m_sent.block;
+      m_sent_packets = m_missing_packets = m_pending_missing_packets = m_previous_sent_packets = m_previous_missing_packets = m_lost_frames = 0;
+      m_previous_lossy = false;
       return std::nullopt;
     }
     if (now - m_window_start < WINDOW) {
       return std::nullopt;
     }
 
-    const double loss_percent {m_expected_packets ? 100.0 * m_missing_packets / m_expected_packets : 0.0};
+    // Clients only report frames that lost packets, so loss is measured
+    // against every packet sent, in the window each FEC block was sent in.
+    // Reports on blocks sent at the end of the last window come in this one,
+    // so that window is judged again with them, unless it was judged lossy already.
+    const auto percent {[](int missing_packets, int sent_packets) {
+      return sent_packets ? 100.0 * missing_packets / sent_packets : 0.0;
+    }};
+    const double window_loss_percent {percent(m_missing_packets, m_sent_packets)};
+    const double previous_loss_percent {m_previous_lossy ? 0.0 : percent(m_previous_missing_packets, m_previous_sent_packets)};
+    const double loss_percent {std::max(window_loss_percent, previous_loss_percent)};
     const int lost_frames {m_lost_frames};
     m_window_start = now;
-    m_expected_packets = m_missing_packets = m_lost_frames = 0;
+    m_lost_frames = 0;
+    // A window without blocks, as when the stream pauses, leaves the one
+    // before it to take the reports that still come in
+    if (m_sent.block != m_window_block) {
+      m_previous_block = std::exchange(m_window_block, m_sent.block);
+      m_previous_sent_packets = std::exchange(m_sent_packets, 0);
+      m_previous_missing_packets = std::exchange(m_missing_packets, 0);
+      m_previous_lossy = window_loss_percent >= LOSS_PERCENT;
+    } else if (previous_loss_percent >= LOSS_PERCENT) {
+      m_previous_lossy = true;
+    }
 
     std::optional<std::chrono::milliseconds> base_rtt;
     if (!m_rtt_samples.empty()) {

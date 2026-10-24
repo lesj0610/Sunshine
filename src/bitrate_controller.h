@@ -6,6 +6,7 @@
 
 // standard includes
 #include <chrono>
+#include <cstdint>
 #include <deque>
 #include <optional>
 #include <utility>
@@ -42,18 +43,47 @@ namespace stream {
     };
 
     /**
+     * @brief Video sent to the client so far.
+     */
+    struct sent_t {
+      std::uint32_t block;  ///< The last FEC block sent, as block_id() gives it.
+      std::uint32_t packets;  ///< Data and parity packets sent, wrapping around.
+    };
+
+    /**
+     * @brief Number FEC blocks in the order they are sent.
+     *
+     * @param frame_index The block's frame.
+     * @param block_index The block, of the up to 4 a frame is sent in.
+     * @return The number, wrapping around.
+     */
+    static constexpr std::uint32_t block_id(std::uint32_t frame_index, int block_index) {
+      return frame_index << 2 | (block_index & 3);
+    }
+
+    /**
      * @param max_kbps The bitrate the client asked for, which is never exceeded.
      * @param now When the stream started.
      */
     bitrate_controller_t(int max_kbps, clock::time_point now);
 
     /**
+     * @brief Catch up with the video sent to the client.
+     *
+     * @param sent Video sent so far.
+     */
+    void packets_sent(sent_t sent);
+
+    /**
      * @brief Count a frame the client reported on.
      *
-     * @param expected_packets Data and parity packets sent for it.
+     * @param sent Video sent so far, as the report comes in.
+     * @param frame_index The frame.
+     * @param block_index The FEC block of it the report is on.
+     * @param expected_packets Data and parity packets sent for that block.
      * @param missing_packets Those that did not arrive.
      */
-    void frame_received(int expected_packets, int missing_packets);
+    void frame_received(sent_t sent, std::uint32_t frame_index, int block_index, int expected_packets, int missing_packets);
 
     /**
      * @brief Count a frame the client had to ask to recover from.
@@ -94,8 +124,17 @@ namespace stream {
     clock::time_point m_last_change;
     clock::time_point m_last_congestion;
 
-    int m_expected_packets = 0;
+    sent_t m_sent {};
+    std::uint32_t m_window_block = 0;  ///< The last FEC block sent before this window.
+    std::uint32_t m_previous_block = 0;  ///< The last FEC block sent before the window before it.
+    int m_sent_packets = 0;
     int m_missing_packets = 0;
+    std::uint32_t m_pending_block = 0;  ///< The FEC block still going out that reports wait for.
+    std::optional<std::uint32_t> m_last_reported_block;
+    int m_pending_missing_packets = 0;
+    int m_previous_sent_packets = 0;
+    int m_previous_missing_packets = 0;
+    bool m_previous_lossy = false;  ///< Whether the window before this one was judged lossy already.
     int m_lost_frames = 0;
 
     std::deque<std::pair<clock::time_point, std::chrono::milliseconds>> m_rtt_samples;

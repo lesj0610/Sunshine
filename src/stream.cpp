@@ -6,6 +6,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -48,7 +49,7 @@ extern "C" {
 #include "virtual_display.h"
 
 constexpr std::uint16_t SS_FRAME_FEC_STATUS_PTYPE = 0x5502;  ///< Client report on how much of a frame arrived (Sunshine protocol extension).
-constexpr std::size_t SS_FRAME_FEC_STATUS_MIN_SIZE = 18;  ///< Bytes of that report up to the packet counts, which are big-endian.
+constexpr std::size_t SS_FRAME_FEC_STATUS_MIN_SIZE = 20;  ///< Bytes of that report up to the FEC block index; its counts are big-endian.
 constexpr std::uint32_t ADAPTIVE_BITRATE_PING_INTERVAL_MS = 100;  ///< How often the host pings while fitting the bitrate to the network.
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
@@ -552,6 +553,7 @@ namespace stream {
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
       safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a bitrate for the encoder, in Kbps.
       std::optional<bitrate_controller_t> bitrate_controller;  ///< Fits the bitrate to the network, when that is enabled.
+      std::atomic<bitrate_controller_t::sent_t> sent;  ///< Video sent so far, while adaptive bitrate is enabled.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
     } video;  ///< Video worker thread state for the active stream.
@@ -1366,6 +1368,7 @@ namespace stream {
       rtt = std::chrono::milliseconds {session->control.peer->roundTripTime};
     }
 
+    controller->packets_sent(session->video.sent.load(std::memory_order_relaxed));
     const auto change {controller->update(std::chrono::steady_clock::now(), rtt)};
     if (!change) {
       return;
@@ -1402,8 +1405,8 @@ namespace stream {
       const auto field {[&payload](std::size_t offset) {
         return (static_cast<std::uint8_t>(payload[offset]) << 8) | static_cast<std::uint8_t>(payload[offset + 1]);
       }};
-      // Data and parity packets sent, and those missing before the last one that arrived
-      session->video.bitrate_controller->frame_received(field(10) + field(12), field(8));
+      // The frame and its FEC block, the block's data and parity packets sent, and those missing before the last one that arrived
+      session->video.bitrate_controller->frame_received(session->video.sent.load(std::memory_order_relaxed), static_cast<std::uint32_t>(field(0)) << 16 | field(2), static_cast<std::uint8_t>(payload[19]), field(10) + field(12), field(8));
     });
 
     server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
@@ -2118,6 +2121,14 @@ namespace stream {
               ratecontrol_frame_packets_sent += current_batch_size;
               next_shard_to_send = x + 1;
             }
+          }
+
+          if (config::video.adaptive_bitrate) {
+            // Only this thread writes it, and the control thread reads both fields together
+            auto sent {session->video.sent.load(std::memory_order_relaxed)};
+            sent.block = bitrate_controller_t::block_id(static_cast<std::uint32_t>(packet->frame_index()), blockIndex);
+            sent.packets += static_cast<std::uint32_t>(shards.size());
+            session->video.sent.store(sent, std::memory_order_relaxed);
           }
 
           // remember this in case the next frame comes immediately
