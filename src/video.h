@@ -25,6 +25,10 @@ extern "C" {
 
 struct AVPacket;
 
+namespace stream {
+  struct session_t;
+}
+
 namespace video {
 
   /**
@@ -438,7 +442,9 @@ namespace video {
         _CONVERT(VUI_PARAMETERS);
         _CONVERT(MAX_FLAGS);
       }
-#undef _CONVERT
+#ifndef DOXYGEN
+  #undef _CONVERT
+#endif
 
       return {"unknown"};
     }
@@ -640,19 +646,19 @@ namespace video {
       KITTY_DEFAULT_CONSTR_MOVE(replace_t)
 
       /**
-       * @brief Store an encoded-byte replacement rule.
+       * @brief Copy the non-owning byte views for an encoded-byte replacement rule.
        *
        * @param old Byte sequence to replace in encoded packets.
        * @param _new Replacement byte sequence inserted into encoded packets.
        */
       replace_t(std::string_view old, std::string_view _new) noexcept:
-          old {std::move(old)},
-          _new {std::move(_new)} {
+          old {old},
+          _new {_new} {
       }
     };
 
     std::vector<replace_t> *replacements = nullptr;  ///< Optional encoded-byte substitutions applied before packetization.
-    void *channel_data = nullptr;  ///< Platform or protocol state carried with this packet.
+    stream::session_t *channel_data = nullptr;  ///< Stream session that receives this packet.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
   };
@@ -806,6 +812,8 @@ namespace video {
   extern int active_av1_mode;
   extern bool last_encoder_probe_supported_ref_frames_invalidation;
   extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
+  extern std::array<bool, 3> last_encoder_probe_supported_dynamic_range_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
+  extern std::array<bool, 3> last_encoder_probe_supported_dynamic_range_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
 
   /**
    * @brief Resolve a client-requested dynamic range against probed encoder capabilities.
@@ -817,16 +825,29 @@ namespace video {
   config_t resolve_dynamic_range(const encoder_t &encoder, config_t config);
 
   /**
+   * @brief Clear all published encoder probe results.
+   */
+  void reset_encoder_probe_results();
+
+  /**
+   * @brief Publish the capabilities of a probed encoder for client advertisement.
+   * @details A codec that did not pass its probe publishes no capabilities.
+   *
+   * @param encoder Encoder whose probed codec capabilities should be published.
+   */
+  void record_encoder_probe_results(const encoder_t &encoder);
+
+  /**
    * @brief Capture and encode video for a streaming session.
    *
    * @param mail Session mail bus.
    * @param config Client-requested video configuration, normalized before capture begins.
-   * @param channel_data Opaque channel data passed to packets.
+   * @param channel_data Stream session carried with each encoded packet.
    */
   void capture(
     safe::mail_t mail,
     config_t config,
-    void *channel_data
+    stream::session_t *channel_data
   );
 
   /**

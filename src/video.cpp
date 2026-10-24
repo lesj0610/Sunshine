@@ -329,9 +329,9 @@ namespace video {
     av_image_fill_black(active_frame->data, linesize.data(), static_cast<AVPixelFormat>(active_frame->format), active_frame->color_range, active_frame->width, active_frame->height);
   }
 
-  int avcodec_software_encode_device_t::init(int in_width, int in_height, AVFrame *in_frame, AVPixelFormat format, bool hardware) {
+  int avcodec_software_encode_device_t::init(int in_width, int in_height, AVFrame *in_frame, AVPixelFormat format, bool hardware_frame) {
     // If the device used is hardware, yet the image resides on main memory
-    if (hardware) {
+    if (hardware_frame) {
       sw_frame.reset(av_frame_alloc());
 
       sw_frame->width = in_frame->width;
@@ -548,11 +548,11 @@ namespace video {
   class nvenc_encode_session_t: public encode_session_t {
   public:
     /**
-     * @brief Initialize an NVENC encode session and take ownership of its device.
+     * @brief Explicitly initialize an NVENC encode session and take ownership of its device.
      *
      * @param encode_device Encode device.
      */
-    nvenc_encode_session_t(std::unique_ptr<platf::nvenc_encode_device_t> encode_device):
+    explicit nvenc_encode_session_t(std::unique_ptr<platf::nvenc_encode_device_t> encode_device):
         device(std::move(encode_device)) {
     }
 
@@ -645,7 +645,7 @@ namespace video {
 
     config_t config;  ///< Stream or encoder configuration captured for the worker.
     int frame_nr;  ///< Next capture-frame number assigned to encoded packets.
-    void *channel_data;  ///< Platform-specific channel data forwarded to packet senders.
+    stream::session_t *channel_data;  ///< Stream session forwarded to packet senders.
 
     std::optional<config_change_progress_t> progress {};  ///< A resize being carried out, until it is answered.
     config_t previous {};  ///< The config to go back to if that resize fails.
@@ -699,14 +699,14 @@ namespace video {
   /**
    * @brief Start the synchronous multi-client capture thread.
    *
-   * @param ctx Native context object used by the operation or callback.
+   * @param ctx Unused state required by the shared capture lifetime callback signature.
    * @return 0 when the capture thread is started.
    */
   int start_capture_sync(capture_thread_sync_ctx_t &ctx);
   /**
-   * @brief Stop capture sync processing.
+   * @brief Leave synchronous capture cleanup to the capture thread.
    *
-   * @param ctx Native context object used by the operation or callback.
+   * @param ctx Unused state required by the shared capture lifetime callback signature.
    */
   void end_capture_sync(capture_thread_sync_ctx_t &ctx);
   /**
@@ -1052,9 +1052,8 @@ namespace video {
         {"enforce_hrd"s, &config::video.amd.amd_enforce_hrd},
         {"max_au_size"s, &config::video.amd.amd_max_au_size},
         {"level"s, [](const config_t &cfg) {
-           auto size = cfg.width * cfg.height;
            // For 4K and below, try to use level 5.1 or 5.2 if possible
-           if (size <= 8912896) {
+           if (auto size = cfg.width * cfg.height; size <= 8912896) {
              if (size * cfg.framerate <= 534773760) {
                return "5.1"s;
              } else if (size * cfg.framerate <= 1069547520) {
@@ -1492,6 +1491,8 @@ namespace video {
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
+  std::array<bool, 3> last_encoder_probe_supported_dynamic_range_for_codec = {};  ///< 10-bit 4:2:0 support discovered for each probed codec.
+  std::array<bool, 3> last_encoder_probe_supported_dynamic_range_yuv444_for_codec = {};  ///< 10-bit YUV444 support discovered for each probed codec.
 
   /**
    * @brief Recreate a display capture object after a capture failure.
@@ -1571,6 +1572,7 @@ namespace video {
 
   /**
    * @brief Run the shared display capture thread for asynchronous encoding.
+   * @details Capture callbacks share this thread's session queues and reusable image pool.
    *
    * @param capture_ctx_queue Capture context queue.
    * @param display_wp Weak pointer holder for the active display.
@@ -1587,7 +1589,7 @@ namespace video {
   ) {
     std::vector<capture_ctx_t> capture_ctxs;
 
-    auto fg = util::fail_guard([&]() {
+    auto fg = util::fail_guard([&capture_ctx_queue, &capture_ctxs]() {
       capture_ctx_queue->stop();
 
       // Stop all sessions listening to this thread
@@ -1629,7 +1631,7 @@ namespace video {
 
     std::vector<std::optional<std::chrono::steady_clock::time_point>> imgs_used_timestamps;
     const std::chrono::seconds trim_timeot = 3s;
-    auto trim_imgs = [&]() {
+    auto trim_imgs = [&imgs, &imgs_used_timestamps, &trim_timeot]() {
       // count allocated and used within current pool
       size_t allocated_count = 0;
       size_t used_count = 0;
@@ -1677,7 +1679,7 @@ namespace video {
       }
     };
 
-    auto pull_free_image_callback = [&](std::shared_ptr<platf::img_t> &img_out) -> bool {
+    auto pull_free_image_callback = [&capture_ctx_queue, &imgs, &disp, &trim_imgs](std::shared_ptr<platf::img_t> &img_out) {
       img_out.reset();
       while (capture_ctx_queue->running()) {
         // pick first allocated but unused
@@ -1728,7 +1730,7 @@ namespace video {
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
-      auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
+      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
             capture_ctx = capture_ctxs.erase(capture_ctx);
@@ -1855,11 +1857,11 @@ namespace video {
    * @param frame_nr Monotonic frame index assigned by the video pipeline.
    * @param session Active FFmpeg encoder session.
    * @param packets Output queue that receives encoded packets.
-   * @param channel_data Platform or protocol state attached to each packet.
+   * @param channel_data Stream session that receives each encoded packet.
    * @param frame_timestamp Capture timestamp associated with the encoded frame.
    * @return 0 when packets are queued; nonzero when encoding or packetization fails.
    */
-  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, stream::session_t *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     auto &frame = session.device->frame;
     frame->pts = frame_nr;
 
@@ -1939,11 +1941,11 @@ namespace video {
    * @param frame_nr Monotonic frame index assigned by the video pipeline.
    * @param session Active NVENC encoder session.
    * @param packets Output queue that receives the encoded packet.
-   * @param channel_data Platform or protocol state attached to the packet.
+   * @param channel_data Stream session that receives the encoded packet.
    * @param frame_timestamp Capture timestamp associated with the encoded frame.
    * @return 0 when packets are queued; nonzero when NVENC encoding fails.
    */
-  int encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, stream::session_t *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     auto encoded_frame = session.encode_frame(frame_nr);
     if (encoded_frame.data.empty()) {
       BOOST_LOG(error) << "NvENC returned empty packet";
@@ -1973,7 +1975,7 @@ namespace video {
    * @param frame_timestamp Frame timestamp.
    * @return 0 when the frame is encoded and queued; nonzero on encoder failure.
    */
-  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, stream::session_t *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
     if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
       return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
     } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
@@ -2199,29 +2201,29 @@ namespace video {
       auto handle_option = [&options, &config](const encoder_t::option_t &option) {
         std::visit(
           util::overloaded {
-            [&](int v) {
+            [&options, &option](int v) {
               av_dict_set_int(&options, option.name.c_str(), v, 0);
             },
-            [&](int *v) {
+            [&options, &option](int *v) {
               av_dict_set_int(&options, option.name.c_str(), *v, 0);
             },
-            [&](std::optional<int> *v) {
-              if (*v) {
+            [&options, &option](std::optional<int> *v) {
+              if (v->has_value()) {
                 av_dict_set_int(&options, option.name.c_str(), **v, 0);
               }
             },
-            [&](const std::function<int()> &v) {
+            [&options, &option](const std::function<int()> &v) {
               av_dict_set_int(&options, option.name.c_str(), v(), 0);
             },
-            [&](const std::string &v) {
+            [&options, &option](const std::string &v) {
               av_dict_set(&options, option.name.c_str(), v.c_str(), 0);
             },
-            [&](std::string *v) {
+            [&options, &option](std::string *v) {
               if (!v->empty()) {
                 av_dict_set(&options, option.name.c_str(), v->c_str(), 0);
               }
             },
-            [&](const std::function<const std::string(const config_t &cfg)> &v) {
+            [&options, &option, &config](const std::function<const std::string(const config_t &cfg)> &v) {
               av_dict_set(&options, option.name.c_str(), v(config).c_str(), 0);
             }
           },
@@ -2352,7 +2354,7 @@ namespace video {
 
     std::unique_ptr<platf::avcodec_encode_device_t> encode_device_final;
 
-    if (!encode_device->data) {
+    if (!encode_device->hardware) {
       auto software_encode_device = std::make_unique<avcodec_software_encode_device_t>();
 
       if (software_encode_device->init(width, height, frame.get(), sw_fmt, hardware)) {
@@ -2432,7 +2434,7 @@ namespace video {
    * @param encode_device Platform encode device.
    * @param reinit_event Signal raised while the encoder/display is reinitializing.
    * @param encoder Selected encoder.
-   * @param channel_data Opaque channel data passed to packets.
+   * @param channel_data Stream session carried with each encoded packet.
    * @param started Called once the encode session exists and is about to encode.
    * @param encoded Called after each frame is encoded, with whether it came from an image captured from disp.
    */
@@ -2446,7 +2448,7 @@ namespace video {
     std::unique_ptr<platf::encode_device_t> encode_device,
     safe::signal_t &reinit_event,
     const encoder_t &encoder,
-    void *channel_data,
+    stream::session_t *channel_data,
     const std::function<void()> &started,
     const std::function<void(bool)> &encoded
   ) {
@@ -2801,7 +2803,7 @@ namespace video {
     ctx.touch_port_events->raise(make_port(disp, ctx.config));
 
     // Update client with our current HDR display state
-    hdr_info_t hdr_info = std::make_unique<hdr_info_raw_t>(false);
+    auto hdr_info = std::make_unique<hdr_info_raw_t>(false);
     if (colorspace_is_hdr(encode_device->colorspace)) {
       if (disp->get_hdr_metadata(hdr_info->metadata)) {
         hdr_info->enabled = true;
@@ -2946,7 +2948,7 @@ namespace video {
 
     auto ec = platf::capture_e::ok;
     while (encode_session_ctx_queue.running()) {
-      auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&captured_image, bool frame_captured) -> bool {
+      auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&captured_image, bool frame_captured) {
         while (encode_session_ctx_queue.peek()) {
           auto encode_session_ctx = encode_session_ctx_queue.pop();
           if (!encode_session_ctx) {
@@ -3033,7 +3035,7 @@ namespace video {
         return true;
       };
 
-      auto pull_free_image_callback = [&img](std::shared_ptr<platf::img_t> &img_out) -> bool {
+      auto pull_free_image_callback = [&img](std::shared_ptr<platf::img_t> &img_out) {
         img_out = img;
         img_out->frame_timestamp.reset();
         return true;
@@ -3062,10 +3064,10 @@ namespace video {
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
 
     auto &ctx = ref->encode_session_ctx_queue;
-    auto lg = util::fail_guard([&]() {
+    auto lg = util::fail_guard([&ctx, &synced_session_ctxs]() {
       ctx.stop();
 
-      for (auto &session_ctx : synced_session_ctxs) {
+      for (const auto &session_ctx : synced_session_ctxs) {
         session_ctx->shutdown_event->raise(true);
         session_ctx->join_event->raise(true);
       }
@@ -3090,17 +3092,17 @@ namespace video {
    *
    * @param mail Session mail bus.
    * @param config Video configuration.
-   * @param channel_data Opaque channel data passed to packets.
+   * @param channel_data Stream session carried with each encoded packet.
    */
   void capture_async(
     safe::mail_t mail,
     config_t &config,
-    void *channel_data
+    stream::session_t *channel_data
   ) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
 
     auto images = std::make_shared<img_event_t::element_type>();
-    auto lg = util::fail_guard([&]() {
+    auto lg = util::fail_guard([&images, &shutdown_event]() {
       images->stop();
       shutdown_event->raise(true);
     });
@@ -3215,7 +3217,7 @@ namespace video {
       touch_port_event->raise(make_port(display.get(), config));
 
       // Update client with our current HDR display state
-      hdr_info_t hdr_info = std::make_unique<hdr_info_raw_t>(false);
+      auto hdr_info = std::make_unique<hdr_info_raw_t>(false);
       if (colorspace_is_hdr(encode_device->colorspace)) {
         if (display->get_hdr_metadata(hdr_info->metadata)) {
           hdr_info->enabled = true;
@@ -3266,12 +3268,12 @@ namespace video {
    *
    * @param mail Session mail bus.
    * @param config Client-requested video configuration, normalized before capture begins.
-   * @param channel_data Opaque channel data passed to packets.
+   * @param channel_data Stream session carried with each encoded packet.
    */
   void capture(
     safe::mail_t mail,
     config_t config,
-    void *channel_data
+    stream::session_t *channel_data
   ) {
     config = resolve_dynamic_range(*chosen_encoder, config);
 
@@ -3570,6 +3572,35 @@ namespace video {
     return true;
   }
 
+  void reset_encoder_probe_results() {
+    last_encoder_probe_supported_ref_frames_invalidation = false;
+    last_encoder_probe_supported_yuv444_for_codec = {};
+    last_encoder_probe_supported_dynamic_range_for_codec = {};
+    last_encoder_probe_supported_dynamic_range_yuv444_for_codec = {};
+  }
+
+  void record_encoder_probe_results(const encoder_t &encoder) {
+    last_encoder_probe_supported_ref_frames_invalidation = (encoder.flags & REF_FRAMES_INVALIDATION);
+    last_encoder_probe_supported_yuv444_for_codec[0] = encoder.h264[encoder_t::PASSED] &&
+                                                       encoder.h264[encoder_t::YUV444];
+    last_encoder_probe_supported_yuv444_for_codec[1] = encoder.hevc[encoder_t::PASSED] &&
+                                                       encoder.hevc[encoder_t::YUV444];
+    last_encoder_probe_supported_yuv444_for_codec[2] = encoder.av1[encoder_t::PASSED] &&
+                                                       encoder.av1[encoder_t::YUV444];
+    last_encoder_probe_supported_dynamic_range_for_codec[0] = encoder.h264[encoder_t::PASSED] &&
+                                                              encoder.h264[encoder_t::DYNAMIC_RANGE];
+    last_encoder_probe_supported_dynamic_range_for_codec[1] = encoder.hevc[encoder_t::PASSED] &&
+                                                              encoder.hevc[encoder_t::DYNAMIC_RANGE];
+    last_encoder_probe_supported_dynamic_range_for_codec[2] = encoder.av1[encoder_t::PASSED] &&
+                                                              encoder.av1[encoder_t::DYNAMIC_RANGE];
+    last_encoder_probe_supported_dynamic_range_yuv444_for_codec[0] = encoder.h264[encoder_t::PASSED] &&
+                                                                     encoder.h264[encoder_t::DYNAMIC_RANGE_YUV444];
+    last_encoder_probe_supported_dynamic_range_yuv444_for_codec[1] = encoder.hevc[encoder_t::PASSED] &&
+                                                                     encoder.hevc[encoder_t::DYNAMIC_RANGE_YUV444];
+    last_encoder_probe_supported_dynamic_range_yuv444_for_codec[2] = encoder.av1[encoder_t::PASSED] &&
+                                                                     encoder.av1[encoder_t::DYNAMIC_RANGE_YUV444];
+  }
+
   int probe_encoders() {
     if (!allow_encoder_probing()) {
       // Error already logged
@@ -3588,7 +3619,7 @@ namespace video {
     chosen_encoder = nullptr;
     active_hevc_mode = config::video.hevc_mode;
     active_av1_mode = config::video.av1_mode;
-    last_encoder_probe_supported_ref_frames_invalidation = false;
+    reset_encoder_probe_results();
 
     auto adjust_encoder_constraints_hevc = [&](encoder_t *encoder) {
       // If we can't satisfy both the encoder and codec requirement, prefer the encoder over codec support
@@ -3738,13 +3769,7 @@ namespace video {
 
     auto &encoder = *chosen_encoder;
 
-    last_encoder_probe_supported_ref_frames_invalidation = (encoder.flags & REF_FRAMES_INVALIDATION);
-    last_encoder_probe_supported_yuv444_for_codec[0] = encoder.h264[encoder_t::PASSED] &&
-                                                       encoder.h264[encoder_t::YUV444];
-    last_encoder_probe_supported_yuv444_for_codec[1] = encoder.hevc[encoder_t::PASSED] &&
-                                                       encoder.hevc[encoder_t::YUV444];
-    last_encoder_probe_supported_yuv444_for_codec[2] = encoder.av1[encoder_t::PASSED] &&
-                                                       encoder.av1[encoder_t::YUV444];
+    record_encoder_probe_results(encoder);
 
     BOOST_LOG(debug) << "------  h264 ------"sv;
     for (int x = 0; x < encoder_t::MAX_FLAGS; ++x) {
@@ -3812,12 +3837,6 @@ namespace video {
     return 0;
   }
 
-  // Linux only declaration
-  /**
-   * @brief Callback signature for VA-API AVCodec hardware input initialization.
-   */
-  using vaapi_init_avcodec_hardware_input_buffer_fn = int (*)(platf::avcodec_encode_device_t *encode_device, AVBufferRef **hw_device_buf);
-
   /**
    * @brief Initialize AVCodec hardware input buffers for VA-API.
    */
@@ -3825,8 +3844,8 @@ namespace video {
     avcodec_buffer_t hw_device_buf;
 
     // If an egl hwdevice
-    if (encode_device->data) {
-      if (((vaapi_init_avcodec_hardware_input_buffer_fn) encode_device->data)(encode_device, &hw_device_buf)) {
+    if (encode_device->init_hw_device) {
+      if (encode_device->init_hw_device(encode_device, &hw_device_buf)) {
         return -1;
       }
 
@@ -3846,13 +3865,11 @@ namespace video {
   }
 
 #ifdef SUNSHINE_BUILD_VULKAN
-  using vulkan_init_avcodec_hardware_input_buffer_fn = int (*)(platf::avcodec_encode_device_t *encode_device, AVBufferRef **hw_device_buf);
-
   util::Either<avcodec_buffer_t, int> vulkan_init_avcodec_hardware_input_buffer(platf::avcodec_encode_device_t *encode_device) {
     avcodec_buffer_t hw_device_buf;
 
-    if (encode_device && encode_device->data) {
-      if (((vulkan_init_avcodec_hardware_input_buffer_fn) encode_device->data)(encode_device, &hw_device_buf)) {
+    if (encode_device && encode_device->init_hw_device) {
+      if (encode_device->init_hw_device(encode_device, &hw_device_buf)) {
         return -1;
       }
       return hw_device_buf;
@@ -3920,7 +3937,7 @@ namespace video {
 /**
  * @brief No-op lock callback used when FFmpeg requires a D3D11VA lock function.
  */
-void do_nothing(void *) {
+void do_nothing(void *) {  // NOSONAR(cpp:S5008): FFmpeg's D3D11VA lock callbacks require a void pointer for user data.
 }
 
 namespace video {
@@ -3933,7 +3950,7 @@ namespace video {
 
     std::fill_n((std::uint8_t *) ctx, sizeof(AVD3D11VADeviceContext), 0);
 
-    auto device = static_cast<ID3D11Device *>(encode_device->data);
+    auto device = encode_device->d3d11_device;
 
     device->AddRef();
     ctx->device = device;
@@ -3986,16 +4003,18 @@ namespace video {
 
   /**
    * @brief Start capture sync.
+   * @details The shared lifetime callback supplies unused state; the thread accesses the shared capture queue directly.
    */
-  int start_capture_sync(capture_thread_sync_ctx_t &ctx) {
+  int start_capture_sync(capture_thread_sync_ctx_t &) {
     std::jthread {&captureThreadSync}.detach();
     return 0;
   }
 
   /**
-   * @brief Stop capture sync processing.
+   * @brief Leave synchronous capture cleanup to the capture thread.
    */
-  void end_capture_sync(capture_thread_sync_ctx_t &ctx) {
+  void end_capture_sync(capture_thread_sync_ctx_t &) {
+    // The capture thread stops its queue and signals its sessions when it exits.
   }
 
   /**
