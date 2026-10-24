@@ -51,6 +51,7 @@ extern "C" {
 constexpr std::uint16_t SS_FRAME_FEC_STATUS_PTYPE = 0x5502;  ///< Client report on how much of a frame arrived (Sunshine protocol extension).
 constexpr std::size_t SS_FRAME_FEC_STATUS_MIN_SIZE = 20;  ///< Bytes of that report up to the FEC block index; its counts are big-endian.
 constexpr std::uint32_t ADAPTIVE_BITRATE_PING_INTERVAL_MS = 100;  ///< How often the host pings while fitting the bitrate to the network.
+constexpr auto ADAPTIVE_BITRATE_INTERVAL = 100ms;  ///< How often the bitrate is fitted to the network, which is often enough to follow it.
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.
@@ -554,6 +555,7 @@ namespace stream {
       safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a bitrate for the encoder, in Kbps.
       std::optional<bitrate_controller_t> bitrate_controller;  ///< Fits the bitrate to the network, when that is enabled.
       std::atomic<bitrate_controller_t::sent_t> sent;  ///< Video sent so far, while adaptive bitrate is enabled.
+      std::chrono::steady_clock::time_point bitrate_fitted;  ///< When the bitrate was last fitted to the network.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
     } video;  ///< Video worker thread state for the active stream.
@@ -1392,9 +1394,6 @@ namespace stream {
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
-
-      // Every 100ms, which is often enough to follow the network
-      adapt_bitrate(session);
     });
 
     server->map(SS_FRAME_FEC_STATUS_PTYPE, [](session_t *session, const std::string_view &payload) {
@@ -1405,8 +1404,9 @@ namespace stream {
       const auto field {[&payload](std::size_t offset) {
         return (static_cast<std::uint8_t>(payload[offset]) << 8) | static_cast<std::uint8_t>(payload[offset + 1]);
       }};
-      // The frame and its FEC block, the block's data and parity packets sent, and those missing before the last one that arrived
-      session->video.bitrate_controller->frame_received(session->video.sent.load(std::memory_order_relaxed), static_cast<std::uint32_t>(field(0)) << 16 | field(2), static_cast<std::uint8_t>(payload[19]), field(10) + field(12), field(8));
+      // The frame and its FEC block, the block's data and parity packets sent, those missing before the last one that arrived,
+      // and the sequence numbers of that one and of the first not to arrive in order
+      session->video.bitrate_controller->frame_received(session->video.sent.load(std::memory_order_relaxed), static_cast<std::uint32_t>(field(0)) << 16 | field(2), static_cast<std::uint8_t>(payload[19]), field(10) + field(12), field(8), static_cast<std::uint32_t>(field(4)) << 16 | field(6));
     });
 
     server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
@@ -1674,6 +1674,12 @@ namespace stream {
             }
 
             send_local_cursor(session);
+
+            // On the host's own clock, as a client keeps its session without pinging
+            if (now - session->video.bitrate_fitted >= ADAPTIVE_BITRATE_INTERVAL) {
+              session->video.bitrate_fitted = now;
+              adapt_bitrate(session);
+            }
           }
 
           ++pos;

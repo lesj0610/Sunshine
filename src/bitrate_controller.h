@@ -83,8 +83,10 @@ namespace stream {
      * @param block_index The FEC block of it the report is on.
      * @param expected_packets Data and parity packets sent for that block.
      * @param missing_packets Those that did not arrive.
+     * @param sequence_numbers The RTP sequence numbers of the last of them that arrived and of the first
+     *                         not to arrive in order, as the high and low halves, which tell the packets it is on.
      */
-    void frame_received(sent_t sent, std::uint32_t frame_index, int block_index, int expected_packets, int missing_packets);
+    void frame_received(sent_t sent, std::uint32_t frame_index, int block_index, int expected_packets, int missing_packets, std::uint32_t sequence_numbers);
 
     /**
      * @brief Count a frame the client had to ask to recover from.
@@ -137,6 +139,7 @@ namespace stream {
     int m_previous_missing_packets = 0;
     bool m_previous_lossy = false;  ///< Whether the window before this one was judged lossy already.
     int m_lost_frames = 0;
+    std::optional<std::uint32_t> m_last_sequence_numbers;  ///< Those of the last report.
 
     std::deque<std::pair<clock::time_point, std::chrono::milliseconds>> m_rtt_samples;
     std::optional<std::chrono::milliseconds> m_previous_rtt;

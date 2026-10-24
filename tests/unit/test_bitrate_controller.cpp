@@ -27,9 +27,17 @@ namespace {
      * @param block_index The FEC block of it the report is on.
      * @param expected_packets Data and parity packets sent for that block.
      * @param missing_packets Those that did not arrive.
+     * @param sequence_numbers Those of the packets of the block it is on.
+     */
+    void report(std::uint32_t frame_index, int block_index, int expected_packets, int missing_packets, std::uint32_t sequence_numbers) {
+      controller.frame_received(sent, frame_index, block_index, expected_packets, missing_packets, sequence_numbers);
+    }
+
+    /**
+     * @brief Hand over a report on a frame, as the client sends it for that block.
      */
     void report(std::uint32_t frame_index, int block_index, int expected_packets, int missing_packets) {
-      controller.frame_received(sent, frame_index, block_index, expected_packets, missing_packets);
+      report(frame_index, block_index, expected_packets, missing_packets, bitrate_controller_t::block_id(frame_index, block_index));
     }
 
     /**
@@ -264,6 +272,18 @@ TEST(BitrateControllerTest, WaitsOnlyForTheBlockGoingOut) {
     }
     EXPECT_EQ(network.run(1s, 0, 20ms), std::vector<int> {7000});
   }
+}
+
+TEST(BitrateControllerTest, IgnoresAFinishedBlockReportedAgainUnderTheNextOne) {
+  // 8 of a window of 500 packets go missing, and the client recovers that
+  // block, loses the next one entirely and reports it with what it had of the first
+  network_t network;
+  network.run(2900ms, 0, 20ms);
+  network.run(400ms, 0, 20ms);
+
+  network.report(network.frame_index - 1, 0, 100, 8, 0x01230120);
+  network.report(network.frame_index, 0, 100, 8, 0x01230120);
+  EXPECT_TRUE(network.run(100ms, 0, 20ms).empty());
 }
 
 TEST(BitrateControllerTest, KeepsSteppingDownWhenALateReportPrecedesHeavyLoss) {

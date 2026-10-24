@@ -57,10 +57,17 @@ namespace stream {
     }
   }
 
-  void bitrate_controller_t::frame_received(sent_t sent, std::uint32_t frame_index, int block_index, int expected_packets, int missing_packets) {
+  void bitrate_controller_t::frame_received(sent_t sent, std::uint32_t frame_index, int block_index, int expected_packets, int missing_packets, std::uint32_t sequence_numbers) {
     // Catching up first leaves the block still going out as the only one
     // a report can be on that does not count as sent yet
     packets_sent(sent);
+
+    // A client that finishes a block and then loses the next one entirely
+    // reports that one with what it had of the one it finished, which it
+    // reported already
+    if (std::exchange(m_last_sequence_numbers, sequence_numbers) == sequence_numbers) {
+      return;
+    }
 
     const int missing {std::clamp(missing_packets, 0, std::max(expected_packets, 0))};
     if (missing == 0) {
