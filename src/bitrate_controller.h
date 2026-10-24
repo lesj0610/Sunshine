@@ -139,7 +139,7 @@ namespace stream {
     int m_previous_missing_packets = 0;
     bool m_previous_lossy = false;  ///< Whether the window before this one was judged lossy already.
     int m_lost_frames = 0;
-    std::optional<std::uint32_t> m_last_sequence_numbers;  ///< Those of the last report.
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> m_last_report;  ///< The FEC block and sequence numbers of the last report.
 
     std::deque<std::pair<clock::time_point, std::chrono::milliseconds>> m_rtt_samples;
     std::optional<std::chrono::milliseconds> m_previous_rtt;

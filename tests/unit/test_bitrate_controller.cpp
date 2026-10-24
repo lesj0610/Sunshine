@@ -276,14 +276,29 @@ TEST(BitrateControllerTest, WaitsOnlyForTheBlockGoingOut) {
 
 TEST(BitrateControllerTest, IgnoresAFinishedBlockReportedAgainUnderTheNextOne) {
   // 8 of a window of 500 packets go missing, and the client recovers that
-  // block, loses the next one entirely and reports it with what it had of the first
+  // block, loses the next one entirely, of the same frame or the next, and
+  // reports it with what it had of the first
+  for (const bool same_frame : {true, false}) {
+    network_t network;
+    network.run(2900ms, 0, 20ms);
+    network.run(400ms, 0, 20ms);
+
+    const auto frame_index {network.frame_index - 1};
+    network.report(frame_index, 0, 100, 8, 0x01230120);
+    network.report(same_frame ? frame_index : frame_index + 1, same_frame ? 1 : 0, 100, 8, 0x01230120);
+    EXPECT_TRUE(network.run(100ms, 0, 20ms).empty());
+  }
+
+  // The sequence numbers come around again on another block 65536 packets later
   network_t network;
   network.run(2900ms, 0, 20ms);
-  network.run(400ms, 0, 20ms);
+  network.run(300ms, 0, 20ms);
 
-  network.report(network.frame_index - 1, 0, 100, 8, 0x01230120);
   network.report(network.frame_index, 0, 100, 8, 0x01230120);
-  EXPECT_TRUE(network.run(100ms, 0, 20ms).empty());
+  network.run(7s, 0, 20ms, 0, 1000);
+  network.run(600ms, 0, 20ms);
+  network.report(network.frame_index, 0, 100, 15, 0x01230120);
+  EXPECT_EQ(network.run(100ms, 0, 20ms), std::vector<int> {7000});
 }
 
 TEST(BitrateControllerTest, KeepsSteppingDownWhenALateReportPrecedesHeavyLoss) {

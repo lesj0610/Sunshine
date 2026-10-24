@@ -51,7 +51,7 @@ extern "C" {
 constexpr std::uint16_t SS_FRAME_FEC_STATUS_PTYPE = 0x5502;  ///< Client report on how much of a frame arrived (Sunshine protocol extension).
 constexpr std::size_t SS_FRAME_FEC_STATUS_MIN_SIZE = 20;  ///< Bytes of that report up to the FEC block index; its counts are big-endian.
 constexpr std::uint32_t ADAPTIVE_BITRATE_PING_INTERVAL_MS = 100;  ///< How often the host pings while fitting the bitrate to the network.
-constexpr auto ADAPTIVE_BITRATE_INTERVAL = 100ms;  ///< How often the bitrate is fitted to the network, which is often enough to follow it.
+constexpr auto ADAPTIVE_BITRATE_INTERVAL = 100ms;  ///< The least time between fitting the bitrate to the network, which is often enough to follow it.
 
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.

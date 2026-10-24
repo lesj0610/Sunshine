@@ -64,8 +64,11 @@ namespace stream {
 
     // A client that finishes a block and then loses the next one entirely
     // reports that one with what it had of the one it finished, which it
-    // reported already
-    if (std::exchange(m_last_sequence_numbers, sequence_numbers) == sequence_numbers) {
+    // reported already. Reports on blocks further apart can repeat sequence
+    // numbers once those come around again.
+    const auto block {block_id(frame_index, block_index)};
+    const auto last {std::exchange(m_last_report, std::pair {block, sequence_numbers})};
+    if (last && last->second == sequence_numbers && (block == last->first + 1 || block == (last->first | 3) + 1)) {
       return;
     }
 
@@ -73,7 +76,6 @@ namespace stream {
     if (missing == 0) {
       return;
     }
-    const auto block {block_id(frame_index, block_index)};
     // A client can report a block it gave up on more than once
     if ((m_pending_missing_packets && block == m_pending_block) || std::ranges::find(m_reported_blocks, block) != m_reported_blocks.end()) {
       return;
