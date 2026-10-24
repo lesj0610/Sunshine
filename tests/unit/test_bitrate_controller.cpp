@@ -214,14 +214,34 @@ TEST(BitrateControllerTest, CountsReportsOnBlocksSentAndGoingOutApart) {
 }
 
 TEST(BitrateControllerTest, CountsABlockReportedTwiceOnce) {
+  // 9 of a window of 500 packets go missing, and the client reports a block
+  // again, right away or after another one
+  for (const bool right_away : {true, false}) {
+    network_t network;
+    network.run(2900ms, 0, 20ms);
+    network.run(400ms, 0, 20ms);
+
+    const auto frame_index {network.frame_index};
+    network.report(frame_index - 1, 0, 100, 8);
+    if (right_away) {
+      network.report(frame_index - 1, 0, 100, 8);
+    }
+    network.report(frame_index, 0, 100, 1);
+    if (!right_away) {
+      network.report(frame_index - 1, 0, 100, 8);
+    }
+    EXPECT_TRUE(network.run(100ms, 0, 20ms).empty());
+  }
+
+  // The same, while the block is still going out
   network_t network;
   network.run(2900ms, 0, 20ms);
+  network.run(300ms, 0, 20ms);
 
-  // 8 of a window of 500 packets go missing, in a block the client reports twice
-  network.run(400ms, 0, 20ms);
-  network.report(network.frame_index, 0, 100, 8);
-  network.report(network.frame_index, 0, 100, 8);
-  EXPECT_TRUE(network.run(100ms, 0, 20ms).empty());
+  network.report(network.frame_index + 1, 0, 100, 8);
+  network.report(network.frame_index, 0, 100, 1);
+  network.report(network.frame_index + 1, 0, 100, 8);
+  EXPECT_TRUE(network.run(200ms, 0, 20ms).empty());
 }
 
 TEST(BitrateControllerTest, KeepsSteppingDownWhenALateReportPrecedesHeavyLoss) {

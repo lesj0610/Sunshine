@@ -53,6 +53,7 @@ namespace stream {
     m_sent = sent;
     if (m_pending_missing_packets && !sent_after(m_pending_block, m_sent.block)) {
       m_missing_packets += std::exchange(m_pending_missing_packets, 0);
+      m_reported_blocks.push_back(m_pending_block);
     }
   }
 
@@ -66,8 +67,8 @@ namespace stream {
       return;
     }
     const auto block {block_id(frame_index, block_index)};
-    // A client can report a block it gave up on twice
-    if (std::exchange(m_last_reported_block, block) == block) {
+    // A client can report a block it gave up on more than once
+    if ((m_pending_missing_packets && block == m_pending_block) || std::ranges::find(m_reported_blocks, block) != m_reported_blocks.end()) {
       return;
     }
     // A report can come in while the rest of its block is still going out,
@@ -82,8 +83,10 @@ namespace stream {
       m_pending_missing_packets += missing;
     } else if (sent_after(block, m_window_block)) {
       m_missing_packets += missing;
+      m_reported_blocks.push_back(block);
     } else if (sent_after(block, m_previous_block)) {
       m_previous_missing_packets += missing;
+      m_reported_blocks.push_back(block);
     }
   }
 
@@ -107,6 +110,7 @@ namespace stream {
       m_window_block = m_previous_block = m_sent.block;
       m_sent_packets = m_missing_packets = m_pending_missing_packets = m_previous_sent_packets = m_previous_missing_packets = m_lost_frames = 0;
       m_previous_lossy = false;
+      m_reported_blocks.clear();
       return std::nullopt;
     }
     if (now - m_window_start < WINDOW) {
@@ -136,6 +140,10 @@ namespace stream {
     } else if (previous_loss_percent >= LOSS_PERCENT) {
       m_previous_lossy = true;
     }
+    // Reports on blocks sent before that no longer count, the second time either
+    std::erase_if(m_reported_blocks, [this](std::uint32_t block) {
+      return !sent_after(block, m_previous_block);
+    });
 
     std::optional<std::chrono::milliseconds> base_rtt;
     if (!m_rtt_samples.empty()) {

@@ -10,6 +10,7 @@
 #include <deque>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace stream {
 
@@ -130,7 +131,7 @@ namespace stream {
     int m_sent_packets = 0;
     int m_missing_packets = 0;
     std::uint32_t m_pending_block = 0;  ///< The FEC block still going out that reports wait for.
-    std::optional<std::uint32_t> m_last_reported_block;
+    std::vector<std::uint32_t> m_reported_blocks;  ///< The FEC blocks counted, of the window before this one on.
     int m_pending_missing_packets = 0;
     int m_previous_sent_packets = 0;
     int m_previous_missing_packets = 0;
