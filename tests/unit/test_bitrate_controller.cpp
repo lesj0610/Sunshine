@@ -233,15 +233,37 @@ TEST(BitrateControllerTest, CountsABlockReportedTwiceOnce) {
     EXPECT_TRUE(network.run(100ms, 0, 20ms).empty());
   }
 
-  // The same, while the block is still going out
-  network_t network;
-  network.run(2900ms, 0, 20ms);
-  network.run(300ms, 0, 20ms);
+  // The same, while the block is still going out, and once more after it is
+  // sent, with a report on the block before it or after it in between
+  for (const int other : {-1, 1}) {
+    network_t network;
+    network.run(2900ms, 0, 20ms);
+    network.run(300ms, 0, 20ms);
 
-  network.report(network.frame_index + 1, 0, 100, 8);
-  network.report(network.frame_index, 0, 100, 1);
-  network.report(network.frame_index + 1, 0, 100, 8);
-  EXPECT_TRUE(network.run(200ms, 0, 20ms).empty());
+    const auto frame_index {network.frame_index + 1};
+    network.report(frame_index, 0, 100, 8);
+    network.report(frame_index + other, 0, 100, 1);
+    network.report(frame_index, 0, 100, 8);
+    EXPECT_TRUE(network.run(100ms, 0, 20ms).empty());
+    network.report(frame_index, 0, 100, 8);
+    EXPECT_TRUE(network.run(100ms, 0, 20ms).empty());
+  }
+}
+
+TEST(BitrateControllerTest, WaitsOnlyForTheBlockGoingOut) {
+  // Of reports on blocks not sent yet, only those on the block going out can
+  // be on video sent, whichever comes in first
+  for (const bool later_first : {false, true}) {
+    network_t network;
+    network.run(2900ms, 0, 20ms);
+    network.run(300ms, 0, 20ms);
+
+    const auto frame_index {network.frame_index + 1};
+    for (const auto &[ahead, missing] : {std::pair {later_first ? 4 : 0, later_first ? 50 : 15}, std::pair {later_first ? 0 : 4, later_first ? 15 : 50}}) {
+      network.report(frame_index + ahead, 0, 100, missing);
+    }
+    EXPECT_EQ(network.run(1s, 0, 20ms), std::vector<int> {7000});
+  }
 }
 
 TEST(BitrateControllerTest, KeepsSteppingDownWhenALateReportPrecedesHeavyLoss) {

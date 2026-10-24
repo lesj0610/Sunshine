@@ -73,14 +73,15 @@ namespace stream {
     }
     // A report can come in while the rest of its block is still going out,
     // before the block counts as sent, so it waits to count with it. Blocks
-    // go out one at a time, so the reports that wait are all on that block.
+    // go out one at a time and in order, so that block comes before any
+    // other not sent yet, and a report on a later one is not on video sent.
     // Reports on blocks sent at the end of a window come in the next one,
     // and those on blocks sent before that are too late to tell anything.
     if (sent_after(block, m_sent.block)) {
-      if (!m_pending_missing_packets || sent_after(block, m_pending_block)) {
+      if (!m_pending_missing_packets || sent_after(m_pending_block, block)) {
         m_pending_block = block;
+        m_pending_missing_packets = missing;
       }
-      m_pending_missing_packets += missing;
     } else if (sent_after(block, m_window_block)) {
       m_missing_packets += missing;
       m_reported_blocks.push_back(block);
