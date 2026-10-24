@@ -1730,7 +1730,7 @@ namespace video {
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
-      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
+      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &retarget_event, &artificial_reinit](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
             capture_ctx = capture_ctxs.erase(capture_ctx);
