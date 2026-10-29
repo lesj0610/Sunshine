@@ -9,6 +9,9 @@
 #include <cstddef>
 #include <random>
 
+// local includes
+#include "utility.h"
+
 /**
  * @brief UUID utilities.
  */

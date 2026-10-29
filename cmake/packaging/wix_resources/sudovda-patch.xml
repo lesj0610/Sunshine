@@ -1,0 +1,24 @@
+<CPackWiXPatch>
+  <!-- Virtual display driver, AMD64 builds only (windows_wix.cmake adds this patch there).
+
+       The feature is off by default. It is installed when it is ticked in the feature tree, or,
+       unattended, when asked for by name with SUNSHINE_VIRTUAL_DISPLAY_DRIVER=1 (or ADDLOCAL).
+       Without that, an unattended install does not trust the driver's certificate. -->
+  <CPackWiXFragment Id="CM_C_sudovda">
+    <Level Value="1" Condition="SUNSHINE_VIRTUAL_DISPLAY_DRIVER = &quot;1&quot;" />
+  </CPackWiXFragment>
+
+  <!-- The driver is installed when its feature is added and removed when the feature is taken
+       away, which covers a first install, a change of features, and an uninstall. Choosing the
+       feature is the consent, so the script runs with -Silent and never asks: under the MSI
+       nobody could answer. A failure never fails the Sunshine install. -->
+  <CPackWiXFragment Id="#PRODUCT">
+    <CustomAction Id="CA_SudoVdaInstall" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\install-sudovda.ps1&quot; -Silent" Execute="deferred" Return="ignore" Impersonate="no" />
+    <CustomAction Id="CA_SudoVdaUninstall" Directory="INSTALL_ROOT" ExeCommand="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALL_ROOT]scripts\uninstall-sudovda.ps1&quot;" Execute="deferred" Return="ignore" Impersonate="no" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CA_SudoVdaInstall" After="InstallFiles" Condition="(&amp;CM_C_sudovda = 3) AND NOT (!CM_C_sudovda = 3)" />
+      <Custom Action="CA_SudoVdaUninstall" Before="RemoveFiles" Condition="(&amp;CM_C_sudovda = 2) AND (!CM_C_sudovda = 3)" />
+    </InstallExecuteSequence>
+  </CPackWiXFragment>
+</CPackWiXPatch>
