@@ -285,7 +285,7 @@ namespace virtual_display {
       case error_e::already_leased:
         return "another session is already using the virtual display";
       case error_e::busy:
-        return "the virtual display driver has not answered an earlier request yet";
+        return "the virtual display driver has not finished an earlier request yet";
       case error_e::not_leased:
         return "no session is streaming a virtual display";
     }

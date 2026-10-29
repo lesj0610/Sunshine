@@ -46,7 +46,7 @@ namespace virtual_display {
     not_ready,  ///< Windows did not bring the display up in time.
     mode_unavailable,  ///< The display came up but does not offer the requested mode.
     already_leased,  ///< Another session already holds the lease.
-    busy,  ///< A driver call has not come back, so nothing may be asked of it yet.
+    busy,  ///< A driver call has not come back, or a display was not removed, so no session may start yet.
     not_leased  ///< A replacement was asked for, but no session holds the lease.
   };
 
@@ -215,7 +215,7 @@ namespace virtual_display {
      * @brief Remove a display this process created.
      *
      * @param id The identifier it was created with.
-     * @return True if the driver removed it.
+     * @return True if the driver removed it, or no longer had it.
      */
     virtual bool remove(const uuid_util::uuid_t &id) = 0;
 

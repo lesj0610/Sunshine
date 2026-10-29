@@ -209,6 +209,12 @@ namespace virtual_display {
           m_targets.erase(id.string());
         }
 
+        if (!result.ok && result.error == ERROR_NOT_FOUND) {
+          // The driver holds no display by this identifier, so it is already gone.
+          BOOST_LOG(warning) << "Virtual display driver no longer had the display it was asked to remove"sv;
+          return true;
+        }
+
         if (!result.ok) {
           BOOST_LOG(error) << "Virtual display driver would not remove a display (error "sv << result.error << ')';
         }
