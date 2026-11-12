@@ -381,7 +381,8 @@ namespace virtual_display {
             // No driver is running: it was never installed, or its device
             // node was left without it, which Windows still lists as a device.
             BOOST_LOG(error) << "The virtual display driver is not running: no SudoVDA device interface is present. "
-                                "Choose the virtual display driver in the Sunshine installer, or run "
+                                "To install it, run the Sunshine installer again, choose Change, and select "
+                                "Drivers > Virtual Display Driver. If it is selected there already, run "
                                 "install-sudovda.bat in the Sunshine scripts folder as administrator."sv;
           } else {
             BOOST_LOG(error) << "Could not open the virtual display driver's device interface (error "sv

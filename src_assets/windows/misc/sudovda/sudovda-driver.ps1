@@ -8,9 +8,8 @@
     driver. Nothing runs when it is loaded.
 
     Every install step is checked, and a failure undoes the steps already taken
-    rather than leaving the machine half configured. Nothing here fails the
-    Sunshine install: Sunshine works without a virtual display, so failures are
-    reported and returned instead of thrown.
+    rather than leaving the machine half configured. Failures are reported and
+    returned instead of thrown; the caller decides what one means.
 #>
 
 # How Windows knows the device. nefconc creates the device node from the

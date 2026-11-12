@@ -746,19 +746,40 @@ Describe "Invoke-SudoVdaUninstall" {
 }
 
 Describe "install-sudovda.ps1" {
-    It "passes its result on as the process exit code" {
-        $scripts = Join-Path $TestDrive "Sunshine\scripts"
-        New-Item -ItemType Directory -Path $scripts -Force | Out-Null
-        $source = Split-Path -Parent $sourcePath
-        foreach ($name in @("install-sudovda.ps1", "sudovda-driver.ps1")) {
-            Copy-Item -LiteralPath (Join-Path $source $name) -Destination $scripts
-        }
-        $shell = (Get-Process -Id $PID).Path
+    BeforeAll {
+        $script:source = Split-Path -Parent $sourcePath
+        $script:shell = (Get-Process -Id $PID).Path
+    }
 
-        # No drivers folder next to it: an incomplete package, which is a failure.
-        & $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts "install-sudovda.ps1") -Silent *> $null
+    It "passes its result on as the process exit code<Label>" -ForEach @(
+        @{ Label = ""; Arguments = @("-Silent") }
+        @{ Label = " under the installer"; Arguments = @("-Silent", "-Installer") }
+    ) {
+        $scripts = Join-Path $TestDrive ("scripts-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+        foreach ($name in @("install-sudovda.ps1", "sudovda-driver.ps1")) {
+            Copy-Item -LiteralPath (Join-Path $script:source $name) -Destination $scripts
+        }
+
+        # No drivers folder next to it: an incomplete package, which is a
+        # failure, and under the installer one that fails the install.
+        & $script:shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts "install-sudovda.ps1") @Arguments *> $null
 
         $LASTEXITCODE | Should -Be 1
+    }
+
+    It "exits 0 under the installer when a restart finishes the install" {
+        $scripts = Join-Path $TestDrive ("scripts-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $scripts -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $script:source "install-sudovda.ps1") -Destination $scripts
+        Set-Content -LiteralPath (Join-Path $scripts "sudovda-driver.ps1") -Value @(
+            '$SudoVdaRebootRequired = 3010'
+            'function Invoke-SudoVdaInstall { param([string] $RootDir, [switch] $Silent) $null = $RootDir, $Silent; return $SudoVdaRebootRequired }'
+        )
+
+        & $script:shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts "install-sudovda.ps1") -Silent -Installer *> $null
+
+        $LASTEXITCODE | Should -Be 0
     }
 }
 
