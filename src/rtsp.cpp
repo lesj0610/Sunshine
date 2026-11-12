@@ -4,8 +4,9 @@
  */
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
+#include "compat/moonlight.h"
+
 extern "C" {
-#include <moonlight-common-c/src/Limelight-internal.h>
 #include <moonlight-common-c/src/Rtsp.h>
 }
 
@@ -1040,7 +1041,7 @@ namespace rtsp_stream {
        */
       if (x == audio::SURROUND51 || x == audio::SURROUND71) {
         std::copy_n(mapping_p, stream_config.channelCount, mapping.begin());
-        std::rotate(mapping.begin() + 3, mapping.begin() + 4, mapping.begin() + audio::MAX_STREAM_CONFIG);
+        std::rotate(mapping.begin() + 3, mapping.begin() + 4, mapping.begin() + stream_config.channelCount);
 
         mapping_p = mapping.data();
       }
