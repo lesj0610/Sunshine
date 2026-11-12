@@ -28,7 +28,13 @@ jobs:
       release_commit: ${{ steps.release-setup.outputs.release_commit }}
       release_generate_release_notes: ${{ steps.release-setup.outputs.release_generate_release_notes }}
       release_tag: ${{ steps.release-setup.outputs.release_tag }}
-      release_version: ${{ steps.release-setup.outputs.release_version }}
+      # A pull request build is versioned by the CI run, not by the pull
+      # request number, so installers built from one pull request keep going
+      # up and an upgrade never sees an older version than the one installed.
+      release_version: >-
+        ${{ github.event_name == 'pull_request'
+        && format('0.0.{0}', github.run_number)
+        || steps.release-setup.outputs.release_version }}
     permissions:
       contents: write
     runs-on: ubuntu-latest
