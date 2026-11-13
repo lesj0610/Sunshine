@@ -86,6 +86,11 @@ set(CPACK_WIX_EXTRA_SOURCES
 set(CPACK_WIX_PATCH_FILE
         "${WIX_BUILD_PARENT_DIRECTORY}/patch.xml"
 )
+# The virtual display driver's feature and custom actions, only where the driver
+# is packaged (see windows.cmake).
+if(SUNSHINE_BUNDLE_SUDOVDA)
+    list(APPEND CPACK_WIX_PATCH_FILE "${WIX_BUILD_PARENT_DIRECTORY}/sudovda-patch.xml")
+endif()
 # CPack's default WiX template blocks downgrades. Sunshine users commonly switch
 # between release and PR builds, so allow any build to replace the installed one.
 # https://docs.firegiant.com/wix/schema/wxs/majorupgrade/#allowdowngrades

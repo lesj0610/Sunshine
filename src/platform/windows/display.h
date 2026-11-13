@@ -4,6 +4,10 @@
  */
 #pragma once
 
+// standard includes
+#include <cstdint>
+#include <span>
+
 // platform includes
 #include <d3d11.h>
 #include <d3d11_4.h>
@@ -209,6 +213,14 @@ namespace platf::dxgi {
    * @return Transfer handling for the FP16 conversion shaders.
    */
   fp16_transfer_e select_fp16_transfer(DXGI_FORMAT format, bool hdr, bool gamma_encoded_sdr);
+
+  /**
+   * @brief Pass a new pointer shape on to clients that draw the pointer themselves.
+   *
+   * @param shape_info Shape information from GetFramePointerShape().
+   * @param data The shape from GetFramePointerShape().
+   */
+  void report_pointer_shape(const DXGI_OUTDUPL_POINTER_SHAPE_INFO &shape_info, std::span<const std::uint8_t> data);
 
   class hwdevice_t;
 

@@ -5,6 +5,7 @@
 // local includes
 #include "display.h"
 #include "misc.h"
+#include "src/local_cursor.h"
 #include "src/logging.h"
 
 namespace platf {
@@ -243,12 +244,15 @@ namespace platf::dxgi {
 
         return capture_e::capture_error;
       }
+
+      report_pointer_shape(cursor.shape_info, img_data);
     }
 
     if (frame_info.LastMouseUpdateTime.QuadPart) {
       cursor.x = frame_info.PointerPosition.Position.x;
       cursor.y = frame_info.PointerPosition.Position.y;
       cursor.visible = frame_info.PointerPosition.Visible;
+      local_cursor::set_visible(cursor.visible);
     }
 
     if (frame_update_flag) {

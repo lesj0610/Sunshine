@@ -1,0 +1,18 @@
+Third-party code compiled into sunshine.exe by this fork
+========================================================
+
+SudoVDA driver interface header (sudovda-ioctl.h)
+-------------------------------------------------
+Used by: sunshine.exe, to talk to the SudoVDA virtual display driver
+Author:  SudoMaker
+Source:  https://github.com/SudoMaker/SudoVDA
+         Common/Include/sudovda-ioctl.h at a4b09fa2aa731a964d0cb5d139cb1e6240e4da12
+Change:  a newline added at the end of the file, nothing else
+
+The SudoVDA repository has no licence file. Its README states:
+
+MIT and CC0 or Public Domain (for changes I made, please consult Microsoft for their license), choose the least restrictive option.
+
+This file is installed with Sunshine whether or not the driver is. The driver
+itself is a separate, optional part of the AMD64 installer; when it is
+installed, its own notices are in drivers\sudovda\THIRD_PARTY_NOTICES.txt.
